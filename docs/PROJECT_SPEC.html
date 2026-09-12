@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NetSum Project Spec</title>
+<style>
+  @page { margin: 2.2cm 2cm; }
+  body {
+    font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+    color: #1a1a1a; line-height: 1.55; font-size: 13px;
+    max-width: 780px; margin: 0 auto; padding: 20px 0;
+  }
+  h1 { font-size: 22px; border-bottom: 3px solid #0891b2; padding-bottom: 10px; margin-top: 0; }
+  h1 + p.subtitle { color: #475569; font-size: 14px; font-style: italic; margin-top: -6px; }
+  h2 { font-size: 16px; color: #0e7490; border-bottom: 1px solid #cbd5e1; padding-bottom: 4px; margin-top: 34px; }
+  h3 { font-size: 13.5px; color: #334155; margin-top: 22px; }
+  p { margin: 10px 0; }
+  code { background: #f1f5f9; padding: 1px 5px; border-radius: 3px; font-family: "SF Mono", Menlo, monospace; font-size: 12px; color: #b91c1c; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 6px; overflow-x: auto; font-size: 11px; line-height: 1.5; }
+  pre code { background: none; color: inherit; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 12px; }
+  th, td { border: 1px solid #cbd5e1; padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f9ff; color: #0e7490; font-weight: 600; }
+  tr:nth-child(even) td { background: #f8fafc; }
+  strong { color: #0f172a; }
+  blockquote { border-left: 3px solid #0891b2; margin: 12px 0; padding: 4px 16px; color: #475569; background: #f0f9ff; }
+  hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .footer { margin-top: 40px; padding-top: 14px; border-top: 1px solid #e2e8f0; color: #94a3b8; font-size: 10.5px; }
+</style>
+</head>
+<body>
+
+<h1>NetSum: In-Network Gradient Aggregation on Commodity Linux via XDP/eBPF</h1>
+<p class="subtitle">A CN + OS + Distributed-Systems Lab Project — Full Specification</p>
+
+<hr>
+
+<h2>1. Pitch</h2>
+<p>Distributed training synchronizes gradients across workers on every step, and that synchronization traffic — not compute — is the bottleneck once you have more than a handful of workers. The 2021 NSDI Best Paper <strong>ATP</strong> (<em>"In-network Aggregation for Multi-tenant Learning"</em>, Lao, Le, Mahajan, Chiang, Vahdat, Zhu — NSDI 2021) and its 2024 IEEE/ACM Transactions on Networking follow-up (<em>"Accelerating Distributed Training With Collaborative In-Network Aggregation"</em>) solved this by summing gradient chunks <strong>inside a programmable switch</strong>, on the wire, before they ever reach a parameter server — cutting aggregator-side traffic and completion time. The catch: that result needs a Barefoot/Intel Tofino programmable switch, hardware almost no student (or most companies) will ever touch.</p>
+<p><strong>NetSum reproduces ATP's actual mechanism — streaming, multi-tenant, fairness-aware gradient aggregation — on a commodity Linux box using XDP/eBPF instead of a programmable switch.</strong> No specialized hardware, no P4, no simulator: a real Linux kernel fast-path program parses gradient-chunk packets, accumulates partial sums in-kernel, and forwards only the fully-aggregated result on to the parameter server — architecturally identical to what ATP's switch does, just running on a $0 commodity NIC instead of a $10,000+ ASIC.</p>
+<p>This is simultaneously:</p>
+<ul>
+<li><strong>A real Computer Networks project</strong> — in-network computing, a specific verified NSDI Best Paper as the reproduction target, a rigorous multi-baseline benchmark.</li>
+<li><strong>A real Operating Systems project</strong> — kernel-space packet processing via eBPF/XDP, BPF map design under real concurrency constraints (multi-core RX steering), the BPF verifier's restrictions (no floating point, bounded loops, <code>bpf_spin_lock</code> for safe concurrent state), all in the actual Linux kernel datapath, not a model of it.</li>
+<li><strong>A real distributed-systems / SDE-systems project</strong> — a wire protocol, fixed-point numerical design under real overflow constraints, and a controlled, honest benchmark isolating exactly what the kernel fast path buys over the same algorithm in userspace.</li>
+</ul>
+
+<h2>2. Research Foundation — What This Reproduces, Precisely</h2>
+<h3>2.1 The anchor paper</h3>
+<p><strong>ATP: In-network Aggregation for Multi-tenant Learning</strong> — ChonLam Lao, Yanfang Le, Kshiteej Mahajan, Yixi Chen, Wenfei Wu, Aditya Akella, Michael Swift — <strong>NSDI 2021, Best Paper Award</strong>.</p>
+<p>Core idea: place a streaming aggregation function on a programmable switch (P4/Tofino) sitting on the path between workers and a parameter server. As gradient-chunk packets from different workers for the same (job, round, chunk) arrive at the switch, it accumulates a running sum in switch memory; once every worker's contribution for that slot has arrived, the switch emits <strong>one</strong> aggregated packet onward. This cuts aggregator-uplink traffic by roughly the worker fan-in factor and removes the aggregation step from the parameter server's CPU entirely.</p>
+<p>ATP's headline contribution beyond a bare "sum packets on a switch" idea (already explored by its predecessor <strong>SwitchML</strong>, NSDI 2021, same venue) is explicitly <strong>multi-tenant fairness</strong>: the switch's aggregation memory (slot table) is a scarce, shared resource, and ATP's real contribution is an admission/eviction policy so that multiple concurrent training jobs sharing one switch get fair, starvation-free access to aggregation slots instead of one greedy job monopolizing them. This is stated directly in the paper's own title.</p>
+
+<h3>2.2 The 2024 follow-up (secondary reference, not the primary target)</h3>
+<p><strong>Accelerating Distributed Training With Collaborative In-Network Aggregation</strong> (IEEE/ACM Transactions on Networking, 2024, DOI 10.1109/TNET.2024.3387948) extends ATP/SwitchML-style aggregation to <strong>multiple switches</strong> cooperating, and its actual differentiator is handling <strong>asynchronous, out-of-order gradient arrival across switches</strong> — a distinct problem from ATP's single-switch fairness question. NetSum cites this as a real, verified, related extension and an explicit stretch-goal direction (§7), not as the source of the fairness mechanism itself — that correction matters and was caught during adversarial review of this spec.</p>
+
+<h3>2.3 What NetSum specifically reproduces vs. extends</h3>
+<table>
+<tr><th>ATP (switch/P4)</th><th>NetSum (commodity Linux/XDP)</th></tr>
+<tr><td>Tofino ASIC, P4 program</td><td>Ordinary NIC, XDP/eBPF program (<code>clang</code> + <code>libbpf</code>)</td></tr>
+<tr><td>Switch memory for slot table</td><td><code>BPF_MAP_TYPE_HASH</code> keyed by <code>(job_id, round, chunk_id)</code></td></tr>
+<tr><td>In-switch admission/eviction policy for fairness</td><td>Slot-table admission policy in the XDP program, same fairness goal</td></tr>
+<tr><td>Measured: completion time, fairness, switch memory use</td><td>Measured: completion time, Jain's fairness index, <strong>plus</strong> a from-scratch kernel-vs-userspace comparison ATP's own paper never needed</td></tr>
+</table>
+<p>The kernel-vs-userspace comparison is NetSum's own genuine addition beyond reproduction — it answers a question ATP's hardware context can't: <em>how much of the benefit is "in-network aggregation" as an idea, versus specifically "in a programmable switch's ASIC"?</em> Commodity XDP lets us isolate that for the first time in a student-buildable setup.</p>
+
+<h2>3. System Architecture</h2>
+<pre>
+ worker-0 ─┐                                                    ┌─ parameter
+ worker-1 ─┤  UDP, fixed-point gradient chunks, one per (job,   │   server
+   ...     ┼─ round, chunk_id, worker_id) ──────────────────────►  (userspace,
+ worker-N ─┘                                                    │   receives only
+                                                                 │   fully-summed
+                    ┌────────────────────────────────┐          │   chunks)
+                    │        aggregator host          │          │
+                    │  ┌────────────────────────────┐│          │
+    ingress NIC ────┼─►│ XDP program (kernel space) ││──────────┘
+                    │  │  1. parse gradient header   ││   XDP_TX: only the
+                    │  │  2. bpf_spin_lock'd partial- ││   FINAL summed packet
+                    │  │     sum accumulate in a     ││   is forwarded; partial
+                    │  │     BPF_MAP_TYPE_HASH slot  ││   contributions never
+                    │  │  3. on last contribution:    ││   leave the kernel
+                    │  │     rewrite + XDP_TX onward  ││
+                    │  │  4. else: XDP_DROP (fully    ││
+                    │  │     absorbed, not forwarded) ││
+                    │  └────────────────────────────┘│
+                    └────────────────────────────────┘
+</pre>
+
+<h3>3.1 Wire protocol (designed from scratch, documented, versioned)</h3>
+<p>Fixed-size UDP payload header (no floating point — the BPF verifier forbids it in kernel space, which forces a real fixed-point design, directly analogous to itch-lob-engine's integer-tick price ladder):</p>
+<pre><code>struct grad_hdr {
+    uint32_t job_id;       // tenant / training job identifier
+    uint32_t round;        // training step / iteration number
+    uint32_t chunk_id;     // which slice of the gradient vector
+    uint16_t worker_id;    // 0..N-1
+    uint16_t num_workers;  // fan-in expected for this job this round
+    uint16_t chunk_len;    // number of fixed-point values that follow
+    uint16_t flags;        // reserved
+};
+// followed by chunk_len x int32_t fixed-point values (Q16.16)</code></pre>
+<p>Gradients are quantized to <strong>Q16.16 fixed-point</strong> before sending (worker-side, in userspace — the quantization/dequantization error itself becomes a measured, reported quantity, not an unstated approximation). Summing Q16.16 values is exact integer addition; overflow bounds are computed from <code>num_workers × max_gradient_value</code> and checked explicitly, not assumed away.</p>
+
+<h3>3.2 Correct concurrent accumulation (the flaw this spec fixes)</h3>
+<p>An earlier draft of this idea proposed <code>BPF_MAP_TYPE_PERCPU_ARRAY</code> for the partial-sum table. That is wrong: multi-queue NICs steer packets from different workers for the <em>same</em> aggregation slot to <em>different</em> CPU cores via RSS hashing, so per-CPU slots never converge into one true sum without an extra cross-core reduction step. NetSum instead uses a single <strong><code>BPF_MAP_TYPE_HASH</code></strong> whose value struct embeds a <code>struct bpf_spin_lock</code>, giving correct, race-free accumulation regardless of which core a given worker's packet lands on.</p>
+
+<h3>3.3 Exit path: one clear answer, not two conflated ones</h3>
+<p>An earlier draft said the aggregated packet exits via <em>both</em> <code>XDP_TX</code> and "AF_XDP zero-copy" as if interchangeable. They are not — <code>XDP_TX</code> retransmits a packet from entirely inside the kernel/driver fast path; <code>AF_XDP</code> is a <em>userspace</em> socket API, and its true zero-copy mode additionally requires NIC driver support NetSum's veth/Docker-netns testbed will not have. <strong>NetSum uses <code>XDP_TX</code> exclusively</strong> for the aggregation-and-forward hot path. AF_XDP zero-copy is named explicitly as an out-of-scope stretch goal, gated on access to real NIC hardware, not part of the core deliverable.</p>
+
+<h2>4. Testbed</h2>
+<ul>
+<li><strong>Environment:</strong> a real Linux kernel is mandatory — XDP/eBPF do not exist on macOS/Darwin. Use a Linux VM (a <code>multipass</code>/UTM Ubuntu 24.04 VM, or an OrbStack/Docker Linux VM with <code>--privileged</code>) with kernel ≥ 5.15 for stable <code>bpf_spin_lock</code> + <code>BPF_MAP_TYPE_HASH</code> support.</li>
+<li><strong>Topology:</strong> N worker processes (2–16) in separate network namespaces or containers, connected via <code>veth</code> pairs to a bridge, feeding one aggregator host running the XDP program on its bridge-facing interface, itself connected to a parameter-server process.</li>
+<li><strong>Traffic generation:</strong> synthetic fixed-point gradient chunks at a configurable rate/size (no real training loop required for the core deliverable — named honestly as synthetic).</li>
+<li><strong>Baselines</strong> (both required):
+  <ol>
+  <li><strong>No aggregation</strong> — every worker sends directly to the parameter server, which sums in userspace.</li>
+  <li><strong>Userspace aggregation, same algorithm</strong> — an ordinary <code>AF_INET</code> socket program implementing byte-for-byte the same slot/accumulate/emit logic, on the same host. This isolates exactly what moving the identical algorithm into the kernel fast path buys.</li>
+  </ol>
+</li>
+</ul>
+
+<h2>5. Evaluation Plan</h2>
+<table>
+<tr><th>Metric</th><th>How measured</th><th>Why it matters</th></tr>
+<tr><td>End-to-end aggregation-round completion time</td><td>Timestamp first-worker-send → parameter-server-receive, vs. worker count (2→16) and chunk size</td><td>ATP's own headline metric</td></tr>
+<tr><td>Aggregator-uplink traffic reduction</td><td>Bytes in vs. bytes out at the aggregator, vs. no-aggregation baseline</td><td>ATP's own headline metric</td></tr>
+<tr><td>Per-packet processing latency</td><td>XDP path vs. userspace-AF_INET path, same host, same algorithm</td><td>NetSum's own addition — isolates the kernel-fast-path effect</td></tr>
+<tr><td>Multi-tenant fairness</td><td>Jain's fairness index across 2–4 concurrent jobs sharing the aggregator's slot table</td><td>Reproduces ATP's actual headline contribution</td></tr>
+<tr><td>Quantization error</td><td>Q16.16 round-trip error vs. original float gradients, reported honestly</td><td>A real, measurable cost the switch-only ATP lineage never had to report</td></tr>
+<tr><td>Correctness under adversarial loss/reorder</td><td>Drop/reorder a controlled fraction of packets via <code>tc netem</code>, report slot-table timeout behavior</td><td>The failure mode a rushed implementation would most likely get wrong</td></tr>
+</table>
+<p>Every number reported must come from a script that actually ran, output committed alongside the code.</p>
+
+<h2>6. Build Plan (Semester Timeline)</h2>
+<table>
+<tr><th>Weeks</th><th>Deliverable</th></tr>
+<tr><td>1–2</td><td>Wire protocol finalized + implemented; synthetic worker/parameter-server processes in plain UDP (no aggregation yet)</td></tr>
+<tr><td>3–4</td><td>Userspace <code>AF_INET</code> aggregator (baseline #2) — get the algorithm right before it has to survive the BPF verifier</td></tr>
+<tr><td>5–7</td><td>XDP program: header parsing, <code>BPF_MAP_TYPE_HASH</code> + <code>bpf_spin_lock</code> accumulation, <code>XDP_TX</code> emit path, <code>XDP_DROP</code> for absorbed partials</td></tr>
+<tr><td>8</td><td>Correctness test suite: hand-crafted packet sequences (out-of-order arrival, duplicate send, missing worker) before trusting any performance number</td></tr>
+<tr><td>9–10</td><td>Multi-tenant fairness: slot-table admission policy for 2–4 concurrent jobs, Jain's-index harness</td></tr>
+<tr><td>11</td><td>Full benchmark sweep: all 3 configurations × worker count × chunk size, netem-injected loss/reorder runs</td></tr>
+<tr><td>12–13</td><td>Write-up: architecture, corrected design decisions, full results with plots, honest discussion of costs and benefits</td></tr>
+<tr><td>14 (buffer)</td><td>Stretch goals if ahead of schedule</td></tr>
+</table>
+
+<h2>7. Explicit Stretch Goals</h2>
+<ul>
+<li><strong>Real NIC, driver-mode XDP + true AF_XDP zero-copy</strong> — only meaningful with mlx5/i40e-class hardware; out of scope for the core deliverable.</li>
+<li><strong>Multi-switch/asynchronous aggregation</strong> — following the 2024 ToN follow-up's actual contribution, extending to two cooperating aggregator hosts.</li>
+<li><strong>A real (even if tiny) training loop</strong> — plugging NetSum's transport under an actual PyTorch <code>DistributedDataParallel</code>-style gradient sync.</li>
+</ul>
+
+<h2>8. Why This Is Not a Generic / Saturated CN Lab Project</h2>
+<ul>
+<li>Explicitly <strong>not</strong> the saturated "P4/Tofino SwitchML clone" pattern — near-zero student implementations exist on commodity eBPF/XDP instead of P4/bmv2.</li>
+<li>Explicitly <strong>not</strong> a from-scratch, unfounded algorithm — every mechanism traces to a specific, verified, real paper, with an honest "inspired-by, commodity-hardware adaptation" framing rather than an oversold "faithful reproduction" claim.</li>
+<li>Forces genuine, verifiable systems engineering absent from generic student CN projects: BPF-verifier-constrained fixed-point arithmetic, real multi-core concurrency correctness, and a controlled kernel-vs-userspace comparison.</li>
+</ul>
+
+<h2>9. Resume / Interview Story</h2>
+<p><strong>SDE-systems interview:</strong> "I implemented an ATP-style in-network gradient aggregator using eBPF/XDP on commodity Linux instead of a Tofino switch — this meant designing a fixed-point wire protocol, handling real multi-core race conditions with <code>bpf_spin_lock</code> after finding that a naive per-CPU-map design silently produced wrong sums, and building a controlled benchmark that isolates exactly how much the in-kernel fast path buys over the identical algorithm in userspace."</p>
+<p><strong>Research-oriented conversation:</strong> "I reproduced ATP's (NSDI 2021 Best Paper) core multi-tenant fairness mechanism on commodity hardware instead of a programmable switch, which let me answer a question the original paper's ASIC context couldn't: how much of the benefit is the in-network-aggregation idea versus the switch hardware specifically."</p>
+
+<h2>10. Known Risks and Mitigations</h2>
+<table>
+<tr><th>Risk</th><th>Mitigation</th></tr>
+<tr><td>BPF verifier rejects a program shape</td><td>Budget week 5–7 explicitly for verifier iteration; keep accumulation logic simple, no unbounded loops</td></tr>
+<tr><td>Multi-core RX steering behaves differently across environments</td><td>The <code>BPF_MAP_TYPE_HASH</code> + <code>bpf_spin_lock</code> design is correct regardless of core count</td></tr>
+<tr><td>Fairness admission-policy design is the least-specified part of ATP's public description</td><td>Start from a simple, defensible policy (round-robin slot eviction); treat sophistication as a refinement, not a blocker</td></tr>
+<tr><td>XDP/eBPF toolchain setup friction</td><td>De-risked before week 1 by verifying a working compile-and-load toolchain first (see <code>docs/DEV_ENVIRONMENT.md</code>)</td></tr>
+</table>
+
+<div class="footer">NetSum project specification — generated as part of a research-grounded CN/OS/SDE lab project proposal.</div>
+
+</body>
+</html>
