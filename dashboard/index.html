@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetSum — results dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #eef4f2; --surface-1: #ffffff; --surface-2: #e6efec;
+    --text-primary: #0a1712; --text-secondary: #3d564c; --text-muted: #74897f;
+    --grid: #dfe9e5; --baseline: #c2d2cb; --border: rgba(10,40,30,0.12);
+    --series-1: #0e7a5f; --series-2: #b45309; --series-3: #1d4ed8;
+    --good: #15803d; --critical: #b91c1c;
+    --accent: #0d9488; --accent-glow: rgba(13,148,136,0.20);
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+    --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #050b09; --surface-1: #0b1613; --surface-2: #101f1a;
+      --text-primary: #e6f5f0; --text-secondary: #93bdad; --text-muted: #5a8577;
+      --grid: #14251f; --baseline: #274539; --border: rgba(45,212,178,0.14);
+      --series-1: #2dd4bf; --series-2: #fb923c; --series-3: #60a5fa;
+      --good: #4ade80; --critical: #f87171;
+      --accent: #2dd4bf; --accent-glow: rgba(45,212,178,0.28);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #050b09; --surface-1: #0b1613; --surface-2: #101f1a;
+    --text-primary: #e6f5f0; --text-secondary: #93bdad; --text-muted: #5a8577;
+    --grid: #14251f; --baseline: #274539; --border: rgba(45,212,178,0.14);
+    --series-1: #2dd4bf; --series-2: #fb923c; --series-3: #60a5fa;
+    --good: #4ade80; --critical: #f87171;
+    --accent: #2dd4bf; --accent-glow: rgba(45,212,178,0.28);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--page); color: var(--text-primary); font-family: var(--font-sans); }
+  body {
+    padding: 24px 20px 64px;
+    background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 34px 34px; background-attachment: fixed;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; position: relative; }
+  .wrap::before {
+    content: ""; position: absolute; top: -24px; left: -20px; right: -20px; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent) 15%, var(--accent) 85%, transparent); opacity: 0.55;
+  }
+  header.page { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 6px; flex-wrap: wrap; }
+  h1 { font-family: var(--font-mono); font-size: 20px; font-weight: 600; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .prompt { color: var(--accent); }
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); flex: none; animation: pulse 2.2s ease-out infinite; }
+  .live-dot + .live-label { font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; color: var(--text-muted); text-transform: uppercase; margin-left: -4px; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(45,212,178,.5); } 70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+  @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
+  .tagline { font-size: 14px; margin: 0 0 8px; max-width: 74ch; line-height: 1.5; font-weight: 500; }
+  .sub { color: var(--text-secondary); font-size: 12.5px; margin: 0; max-width: 74ch; line-height: 1.5; }
+  code { font-family: var(--font-mono); background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 0.92em; color: var(--accent); }
+  a { color: var(--accent); }
+  .header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .last-updated { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+  .btn { font-family: var(--font-mono); border: 1px solid var(--border); background: var(--surface-1); color: var(--text-secondary);
+    border-radius: 999px; padding: 6px 14px; font-size: 12px; cursor: pointer; transition: .18s; }
+  .btn:hover { color: var(--accent); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+  .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 20px 0 8px; }
+  .stat-tile { background: var(--surface-1); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; padding: 14px 16px; transition: .18s; }
+  .stat-tile:hover { transform: translateY(-1px); box-shadow: 0 0 0 1px var(--accent-glow), 0 8px 20px -12px var(--accent-glow); }
+  .stat-tile .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; font-family: var(--font-mono); }
+  .stat-tile .value { font-family: var(--font-mono); font-size: 25px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat-tile .note { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  section.panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 20px 22px 22px; margin-top: 22px; }
+  section.panel .eyebrow { font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin: 0 0 6px; }
+  section.panel h2 { font-size: 16px; margin: 0 0 2px; }
+  section.panel .desc { font-size: 12.5px; color: var(--text-secondary); margin: 0 0 16px; line-height: 1.5; max-width: 92ch; }
+  .chart-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
+  @media (max-width: 800px) { .chart-grid { grid-template-columns: 1fr; } }
+  .chart-card { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px 8px; }
+  .chart-card h3 { font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; margin: 0 0 10px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .05em; }
+  .chart-card svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 2px 0; font-size: 12px; color: var(--text-secondary); font-family: var(--font-mono); }
+  .legend .item { display: flex; align-items: center; gap: 6px; }
+  .legend .swatch { width: 10px; height: 10px; border-radius: 2px; }
+  .bar-rect { transition: .12s; }
+  .bar-rect:hover { opacity: .85; filter: drop-shadow(0 0 6px var(--accent-glow)); }
+  .axis-tick, .msg-tick, .axis-label { fill: var(--text-muted); font-size: 10.5px; font-family: var(--font-mono); }
+  .gridline { stroke: var(--grid); stroke-width: 1; }
+  .baseline-axis { stroke: var(--baseline); stroke-width: 1; }
+  .whisker { stroke: var(--text-muted); stroke-width: 1.5; }
+  .tooltip { position: fixed; pointer-events: none; z-index: 50; font-family: var(--font-mono); background: var(--text-primary); color: var(--page);
+    font-size: 11.5px; padding: 6px 9px; border-radius: 6px; max-width: 240px; opacity: 0; transform: translate(-50%,-100%); transition: opacity .08s; white-space: nowrap; }
+  .tooltip.show { opacity: .96; }
+  .checklist { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+  .checklist li { padding: 6px 0; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: flex-start; }
+  .checklist li:last-child { border-bottom: none; }
+  .checklist .tick { flex: none; font-family: var(--font-mono); }
+  .checklist .tick.done { color: var(--good); }
+  .checklist .tick.pending { color: var(--text-muted); }
+  .empty-state, .loading-state { padding: 28px 20px; text-align: center; color: var(--text-muted); font-size: 13px; font-family: var(--font-mono);
+    border: 1px solid var(--border); border-radius: 8px; background: var(--surface-1); }
+  .empty-state { border-style: dashed; }
+  .loading-state { animation: lpulse 1.3s ease-in-out infinite; }
+  @keyframes lpulse { 0%,100%{opacity:.55} 50%{opacity:1} }
+  footer.page { margin-top: 30px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 12px; line-height: 1.6; font-family: var(--font-mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="page">
+    <div>
+      <h1><span class="prompt">$</span> netsum — results dashboard <span class="live-dot" aria-hidden="true"></span><span class="live-label">live</span></h1>
+      <p class="tagline">
+        In-network gradient aggregation on commodity Linux via XDP/eBPF, reproducing
+        <a href="https://www.usenix.org/conference/nsdi21/presentation/lao">ATP</a> (NSDI 2021 Best Paper)
+        without a programmable switch. This page charts real measurements from the two working
+        benchmark baselines — no-aggregation vs. userspace aggregation — and correctness-suite status.
+      </p>
+      <p class="sub">
+        Renders <code>bench/results.csv</code> directly, client-side, no build step. Regenerate with
+        <code>python3 scripts/benchmark.py</code>, then reload this page. See
+        <a href="../docs/PROJECT_SPEC.md">the full project spec</a> for the research grounding and design.
+      </p>
+    </div>
+    <div class="header-actions">
+      <span class="last-updated" id="lastUpdated"></span>
+      <button class="btn" id="refreshBtn" type="button">↻ Refresh</button>
+      <button class="btn" id="themeToggle" type="button">Toggle theme</button>
+    </div>
+  </header>
+
+  <div class="stat-row" id="statRow">
+    <div class="loading-state" style="grid-column:1/-1;">Loading summary stats…</div>
+  </div>
+
+  <section class="panel">
+    <p class="eyebrow">// 01 · packet reduction</p>
+    <h2>Aggregator-uplink traffic: no-aggregation vs. userspace aggregation</h2>
+    <p class="desc">
+      In <code>noagg</code>, every worker's contribution reaches the parameter server individually.
+      In <code>useragg</code>, the aggregator absorbs every partial contribution (never forwarded — the
+      same <code>XDP_DROP</code>-shaped behavior the eventual kernel program uses) and emits exactly
+      one summed packet once the slot is complete. This is ATP's core mechanism, reproduced here in
+      userspace before the kernel version exists.
+    </p>
+    <div class="chart-grid">
+      <div class="chart-card">
+        <h3>Uplink packets reaching the receiver, by worker count</h3>
+        <div id="packetsChart"><div class="loading-state">Loading…</div></div>
+      </div>
+      <div class="chart-card">
+        <h3>Packet reduction ratio (useragg ÷ noagg)</h3>
+        <div id="reductionChart"><div class="loading-state">Loading…</div></div>
+      </div>
+    </div>
+    <div class="legend" id="packetsLegend"></div>
+  </section>
+
+  <section class="panel">
+    <p class="eyebrow">// 02 · completion latency</p>
+    <h2>Aggregation-round completion latency</h2>
+    <p class="desc">
+      Median latency (first contribution seen → slot complete), with the observed min–max range as
+      whiskers — measured on this dev machine's loopback interface, not a controlled multi-host
+      testbed, so absolute numbers include real OS-scheduling jitter (visibly worse at higher worker
+      counts). <strong>useragg is not expected to beat noagg here</strong> — it adds one extra network
+      hop (worker → aggregator → parameter server) for the same total per-packet processing work;
+      proving a latency win is the eventual XDP kernel-path's job, which this baseline exists to be
+      compared against once it's runnable (see <code>docs/DEV_ENVIRONMENT.md</code>).
+    </p>
+    <div id="latencyChart"><div class="loading-state">Loading…</div></div>
+    <div class="legend" id="latencyLegend"></div>
+  </section>
+
+  <section class="panel">
+    <p class="eyebrow">// 03 · project status</p>
+    <h2>What's built, tested, and pending</h2>
+    <p class="desc">Every checked item below is backed by a real, runnable command in this repo — nothing here is aspirational.</p>
+    <ul class="checklist" id="statusList">
+      <li><span class="tick done">[x]</span><span>Wire protocol (<code>protocol/grad_proto.h</code>) — Q16.16 fixed-point, network byte order, shared by every component</span></li>
+      <li><span class="tick done">[x]</span><span>Worker + parameter server (baseline #1, no-aggregation) — <code>make &amp;&amp; python3 tests/test_correctness.py</code>, 6/6 passing</span></li>
+      <li><span class="tick done">[x]</span><span>Userspace aggregator (baseline #2) — same slot/accumulate/emit algorithm the XDP program will run, packet-reduction verified (N→1)</span></li>
+      <li><span class="tick done">[x]</span><span>Two real bugs found and fixed during testing: duplicate-worker double-counting, and a select()-vs-buffered-I/O race in the test harness itself</span></li>
+      <li><span class="tick done">[x]</span><span>XDP/eBPF kernel program (<code>xdp_agg/xdp_agg.c</code>) — compiles to valid eBPF bytecode (<code>make bpf</code>); a real BPF-stack-limit bug was caught and fixed at this stage</span></li>
+      <li><span class="tick pending">[ ]</span><span>XDP program load-tested against the real in-kernel verifier and run on a live interface — needs a real Linux kernel (see <code>docs/DEV_ENVIRONMENT.md</code> for why this dev machine can't do it directly)</span></li>
+      <li><span class="tick pending">[ ]</span><span>Multi-tenant fairness (Jain's index across concurrent jobs) and the full netem loss/reorder correctness sweep</span></li>
+    </ul>
+  </section>
+
+  <footer class="page">
+    Data source: <code>bench/results.csv</code>, committed under <code>bench/</code> — this page performs
+    no computation the repo doesn't already do, it only parses and charts what's there.
+  </footer>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+(function () {
+  "use strict";
+  var root = document.documentElement;
+  var toggle = document.getElementById("themeToggle");
+  var saved = localStorage.getItem("netsum-theme");
+  if (saved) root.setAttribute("data-theme", saved);
+  toggle.addEventListener("click", function () {
+    var current = root.getAttribute("data-theme");
+    var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var effectiveDark = current ? current === "dark" : prefersDark;
+    var next = effectiveDark ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    localStorage.setItem("netsum-theme", next);
+  });
+
+  function parseCSV(text) {
+    var lines = text.replace(/\r\n/g, "\n").split("\n").filter(function (l) { return l.trim().length > 0; });
+    if (lines.length === 0) return { header: [], rows: [] };
+    var header = lines[0].split(",");
+    return { header: header, rows: lines.slice(1).map(function (line) {
+      var cells = line.split(","); var obj = {};
+      header.forEach(function (h, i) { obj[h] = cells[i]; });
+      return obj;
+    }) };
+  }
+  function fetchCSV(path) {
+    return fetch(path).then(function (r) { if (!r.ok) throw new Error(path + " -> HTTP " + r.status); return r.text(); }).then(parseCSV);
+  }
+  function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+  function fmtInt(n) { return Math.round(n).toLocaleString("en-US"); }
+  function median(arr) { var s = arr.slice().sort(function(a,b){return a-b;}); var m = Math.floor(s.length/2); return s.length % 2 ? s[m] : (s[m-1]+s[m])/2; }
+
+  var tooltip = document.getElementById("tooltip");
+  function showTooltip(evt, html) { tooltip.innerHTML = html; tooltip.classList.add("show"); moveTooltip(evt); }
+  function moveTooltip(evt) { tooltip.style.left = evt.clientX + "px"; tooltip.style.top = (evt.clientY - 10) + "px"; }
+  function hideTooltip() { tooltip.classList.remove("show"); }
+
+  var SVGNS = "http://www.w3.org/2000/svg";
+  function svgEl(tag, attrs) { var el = document.createElementNS(SVGNS, tag); for (var k in attrs) el.setAttribute(k, attrs[k]); return el; }
+  function niceTicks(maxVal, count) {
+    if (maxVal <= 0) return [0, 1];
+    var rough = maxVal / count, mag = Math.pow(10, Math.floor(Math.log10(rough))), norm = rough / mag, step;
+    if (norm < 1.5) step = mag; else if (norm < 3) step = 2*mag; else if (norm < 7) step = 5*mag; else step = 10*mag;
+    var ticks = [], t = 0; while (t < maxVal + step) { ticks.push(t); t += step; } return ticks;
+  }
+
+  function emptyStateHTML(title, detail) {
+    return '<div class="empty-state"><div><strong>' + title + '</strong></div><div style="margin-top:4px;">' + detail + '</div></div>';
+  }
+
+  // ---------- grouped bar chart (log-scale-friendly, with optional whiskers) ----------
+  function groupedBarChart(container, opts) {
+    var categories = opts.categories, series = opts.series;
+    var unit = opts.unit || "", width = opts.width || 520, height = opts.height || 240;
+    var margin = { top: 20, right: 12, bottom: 26, left: 50 };
+    var plotW = width - margin.left - margin.right, plotH = height - margin.top - margin.bottom;
+    var maxVal = 0;
+    series.forEach(function (s) { s.values.forEach(function (v) { if (v > maxVal) maxVal = v; });
+      if (s.whiskers) s.whiskers.forEach(function (w) { if (w && w.max > maxVal) maxVal = w.max; }); });
+    var ticks = niceTicks(maxVal, 4), axisMax = ticks[ticks.length - 1] || 1;
+    function y(v) { return margin.top + plotH - (v / axisMax) * plotH; }
+    var svg = svgEl("svg", { viewBox: "0 0 " + width + " " + height, role: "img" });
+    if (unit) { var ul = svgEl("text", { class: "axis-label", x: margin.left, y: margin.top - 8 }); ul.textContent = unit; svg.appendChild(ul); }
+    ticks.forEach(function (t) {
+      var yy = y(t);
+      svg.appendChild(svgEl("line", { class: "gridline", x1: margin.left, x2: width - margin.right, y1: yy, y2: yy }));
+      var lbl = svgEl("text", { class: "axis-tick", x: margin.left - 8, y: yy + 3, "text-anchor": "end" });
+      lbl.textContent = fmtInt(t); svg.appendChild(lbl);
+    });
+    svg.appendChild(svgEl("line", { class: "baseline-axis", x1: margin.left, x2: width - margin.right, y1: margin.top + plotH, y2: margin.top + plotH }));
+    var groupW = plotW / categories.length, nSeries = series.length, barGap = 3, groupPad = groupW * 0.14;
+    var barW = Math.min(30, (groupW - groupPad * 2 - barGap * (nSeries - 1)) / nSeries);
+    categories.forEach(function (cat, ci) {
+      var groupX0 = margin.left + ci * groupW;
+      series.forEach(function (s, si) {
+        var v = s.values[ci], barsTotalW = nSeries * barW + (nSeries - 1) * barGap;
+        var startX = groupX0 + (groupW - barsTotalW) / 2, x = startX + si * (barW + barGap);
+        var yTop = y(v), h = margin.top + plotH - yTop; if (h < 0) h = 0;
+        var rect = svgEl("rect", { class: "bar-rect", x: x, y: yTop, width: barW, height: h, rx: 3, fill: s.color });
+        rect.addEventListener("mousemove", function (evt) { showTooltip(evt, "<b>" + s.name + "</b> — " + cat + "<br>" + fmtInt(v) + " " + unit); });
+        rect.addEventListener("mouseleave", hideTooltip);
+        svg.appendChild(rect);
+        var w = s.whiskers && s.whiskers[ci];
+        if (w) {
+          var cx = x + barW / 2, yMin = y(w.min), yMax = y(w.max);
+          svg.appendChild(svgEl("line", { class: "whisker", x1: cx, x2: cx, y1: yMin, y2: yMax }));
+          svg.appendChild(svgEl("line", { class: "whisker", x1: cx - 4, x2: cx + 4, y1: yMin, y2: yMin }));
+          svg.appendChild(svgEl("line", { class: "whisker", x1: cx - 4, x2: cx + 4, y1: yMax, y2: yMax }));
+        }
+      });
+      var tl = svgEl("text", { class: "msg-tick", x: groupX0 + groupW / 2, y: margin.top + plotH + 16, "text-anchor": "middle" });
+      tl.textContent = cat; svg.appendChild(tl);
+    });
+    container.innerHTML = ""; container.appendChild(svg);
+  }
+
+  function legendFor(container, series) {
+    container.innerHTML = "";
+    series.forEach(function (s) {
+      var item = document.createElement("div"); item.className = "item";
+      var sw = document.createElement("span"); sw.className = "swatch"; sw.style.background = s.color; item.appendChild(sw);
+      var label = document.createElement("span"); label.textContent = s.name; item.appendChild(label);
+      container.appendChild(item);
+    });
+  }
+
+  function addStatTiles(stats, source) {
+    var row = document.getElementById("statRow");
+    var placeholder = row.querySelector(".loading-state"); if (placeholder) placeholder.remove();
+    row.querySelectorAll('.stat-tile[data-source="' + source + '"]').forEach(function (el) { el.remove(); });
+    stats.forEach(function (s) {
+      var tile = document.createElement("div"); tile.className = "stat-tile"; tile.setAttribute("data-source", source);
+      tile.innerHTML = '<div class="label">' + s.label + '</div><div class="value">' + s.value + '</div>' + (s.note ? '<div class="note">' + s.note + '</div>' : "");
+      row.appendChild(tile);
+    });
+  }
+
+  function loadBenchSection() {
+    fetchCSV("../bench/results.csv").then(function (data) {
+      var rows = data.rows;
+      if (rows.length === 0) {
+        ["packetsChart", "reductionChart", "latencyChart"].forEach(function (id) {
+          document.getElementById(id).innerHTML = emptyStateHTML("No benchmark data yet", "Run <code>python3 scripts/benchmark.py</code> from the repo root, then reload.");
+        });
+        return;
+      }
+      var workerCounts = Array.from(new Set(rows.map(function (r) { return num(r.num_workers); }))).sort(function(a,b){return a-b;});
+      var byConfig = {};
+      rows.forEach(function (r) {
+        byConfig[r.config] = byConfig[r.config] || {};
+        var nw = num(r.num_workers);
+        byConfig[r.config][nw] = byConfig[r.config][nw] || { latencies: [], uplink: null };
+        byConfig[r.config][nw].latencies.push(num(r.latency_us));
+        byConfig[r.config][nw].uplink = num(r.uplink_packets);
+      });
+
+      var catLabels = workerCounts.map(function (n) { return n + "w"; });
+      var colorFor = { noagg: "var(--series-1)", useragg: "var(--series-2)" };
+      var nameFor = { noagg: "No aggregation", useragg: "Userspace aggregation" };
+      var configs = Object.keys(byConfig).sort();
+
+      var packetSeries = configs.map(function (c) {
+        return { name: nameFor[c] || c, color: colorFor[c] || "var(--series-3)",
+                 values: workerCounts.map(function (nw) { return byConfig[c][nw] ? byConfig[c][nw].uplink : 0; }) };
+      });
+      groupedBarChart(document.getElementById("packetsChart"), { categories: catLabels, series: packetSeries, unit: "packets", width: 520, height: 230 });
+      legendFor(document.getElementById("packetsLegend"), packetSeries);
+
+      if (byConfig.noagg && byConfig.useragg) {
+        var reduction = workerCounts.map(function (nw) {
+          var a = byConfig.noagg[nw], b = byConfig.useragg[nw];
+          return a && b && b.uplink ? a.uplink / b.uplink : 0;
+        });
+        groupedBarChart(document.getElementById("reductionChart"), {
+          categories: catLabels,
+          series: [{ name: "noagg / useragg packets", color: "var(--accent)", values: reduction }],
+          unit: "x fewer packets", width: 520, height: 230,
+        });
+      }
+
+      var latSeries = configs.map(function (c) {
+        return {
+          name: nameFor[c] || c, color: colorFor[c] || "var(--series-3)",
+          values: workerCounts.map(function (nw) { return byConfig[c][nw] ? median(byConfig[c][nw].latencies) : 0; }),
+          whiskers: workerCounts.map(function (nw) {
+            var d = byConfig[c][nw]; if (!d) return null;
+            return { min: Math.min.apply(null, d.latencies), max: Math.max.apply(null, d.latencies) };
+          }),
+        };
+      });
+      groupedBarChart(document.getElementById("latencyChart"), { categories: catLabels, series: latSeries, unit: "us (median, min-max whiskers)", width: 1080, height: 260 });
+      legendFor(document.getElementById("latencyLegend"), latSeries);
+
+      var maxNw = workerCounts[workerCounts.length - 1];
+      var stats = [];
+      if (byConfig.noagg && byConfig.noagg[maxNw] && byConfig.useragg && byConfig.useragg[maxNw]) {
+        var ratio = byConfig.noagg[maxNw].uplink / byConfig.useragg[maxNw].uplink;
+        stats.push({ label: "Packet reduction at " + maxNw + " workers", value: ratio.toFixed(1) + "×",
+                     note: byConfig.noagg[maxNw].uplink + " → " + byConfig.useragg[maxNw].uplink + " packets" });
+        stats.push({ label: "Median latency, " + maxNw + " workers (noagg)", value: fmtInt(median(byConfig.noagg[maxNw].latencies)) + " us" });
+        stats.push({ label: "Median latency, " + maxNw + " workers (useragg)", value: fmtInt(median(byConfig.useragg[maxNw].latencies)) + " us" });
+      }
+      stats.push({ label: "Worker counts benchmarked", value: workerCounts.join(", "), note: rows.length + " total runs recorded" });
+      addStatTiles(stats, "bench");
+    }).catch(function (err) {
+      ["packetsChart", "reductionChart", "latencyChart"].forEach(function (id) {
+        document.getElementById(id).innerHTML = emptyStateHTML("Couldn't load benchmark data", err.message);
+      });
+      console.error(err);
+    });
+  }
+
+  addStatTiles([
+    { label: "Correctness tests", value: "6 / 6", note: "python3 tests/test_correctness.py" },
+    { label: "XDP program", value: "compiles", note: "make bpf — real eBPF bytecode, not yet load-tested" },
+  ], "static");
+
+  loadBenchSection();
+
+  var refreshBtn = document.getElementById("refreshBtn");
+  var lastUpdatedEl = document.getElementById("lastUpdated");
+  function markUpdated() {
+    var now = new Date();
+    lastUpdatedEl.textContent = "updated " + now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+  refreshBtn.addEventListener("click", function () { loadBenchSection(); markUpdated(); });
+  markUpdated();
+})();
+</script>
+</body>
+</html>

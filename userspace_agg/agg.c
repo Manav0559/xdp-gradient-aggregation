@@ -39,6 +39,15 @@ typedef struct {
      * the slot with a wrong sum -- the exact failure mode
      * tests/test_correctness.py's duplicate-worker case checks for. */
     uint8_t seen_worker[MAX_TRACKED_WORKERS];
+    /* first-contribution-to-last-contribution timing: THIS is where the
+     * real accumulation latency lives in the useragg benchmark
+     * configuration, not at the parameter server -- the parameter server
+     * in "agg" mode receives exactly one already-summed packet per slot,
+     * so its own first-seen-to-complete gap measures nothing meaningful
+     * (an early version of the benchmark harness measured latency there
+     * and got near-zero numbers for every worker count, which was the
+     * tell that something was being measured in the wrong place). */
+    long first_seen_micros;
 } slot_t;
 
 static slot_t g_slots[SLOT_TABLE_CAPACITY];
@@ -82,6 +91,12 @@ static slot_t *find_or_create_slot(uint32_t job_id, uint32_t round, uint32_t chu
  * (fixed-size, no growth) will have too. */
 static void free_slot(slot_t *s) {
     s->in_use = 0;
+}
+
+static long now_micros(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long)tv.tv_sec * 1000000L + tv.tv_usec;
 }
 
 int main(int argc, char **argv) {
@@ -153,6 +168,7 @@ int main(int argc, char **argv) {
         if (slot->contributions_received == 0) {
             slot->chunk_len = chunk_len;
             slot->num_workers_expected = num_workers;
+            slot->first_seen_micros = now_micros();
         }
 
         if (slot->seen_worker[worker_id]) {
@@ -176,10 +192,23 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* Last contribution just arrived: emit exactly one aggregated
-         * packet downstream -- mirrors XDP_TX in the eventual kernel
-         * program, and is the only place this process's slot state
-         * crosses back onto the wire. */
+        /* Last contribution just arrived: this is the real "aggregation
+         * completed" event the benchmark harness needs a timestamp for --
+         * logged in the same "[complete] ... latency_us=" shape
+         * paramserver.c uses (same regex parses both), so
+         * scripts/benchmark.py can pull the true accumulation latency from
+         * here instead of the parameter server, which in "agg" mode only
+         * ever sees a single already-summed packet and so measures nothing
+         * meaningful of its own. */
+        long completed_micros = now_micros();
+        fprintf(stderr,
+            "[complete] job=%u round=%u chunk=%u contributions=%u sum[0]=%.6f latency_us=%ld\n",
+            job_id, round, chunk_id, slot->contributions_received,
+            netsum_to_double(slot->sum[0]), completed_micros - slot->first_seen_micros);
+
+        /* Emit exactly one aggregated packet downstream -- mirrors XDP_TX
+         * in the eventual kernel program, and is the only place this
+         * process's slot state crosses back onto the wire. */
         struct grad_hdr *out_hdr = (struct grad_hdr *)out_packet;
         int32_t *out_values = (int32_t *)(out_packet + NETSUM_HDR_SIZE);
         out_hdr->job_id = htonl(job_id);
