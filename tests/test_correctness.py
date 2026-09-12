@@ -10,7 +10,6 @@ Run: python3 tests/test_correctness.py   (after `make` in the repo root)
 """
 import os
 import re
-import selectors
 import socket
 import subprocess
 import sys
@@ -22,7 +21,20 @@ WORKER = os.path.join(BIN, "worker")
 PARAMSERVER = os.path.join(BIN, "paramserver")
 AGG = os.path.join(BIN, "agg")
 
-FIXED_POINT_EPS = 2.0 / 65536.0  # one Q16.16 ULB of slack for rounding
+Q16_16_ULP = 1.0 / 65536.0
+
+
+def sum_tolerance(num_workers):
+    """Worst-case accumulated Q16.16 truncation error when summing
+    `num_workers` independently-quantized contributions is num_workers
+    ULPs, not a fixed epsilon -- 0.1, for instance, truncates to
+    6553/65536 = 0.09999847..., and 5 workers' truncation errors can all
+    point the same direction. A fixed tolerance that happens to work for
+    one num_workers value will spuriously fail for another; this is the
+    honestly-reported "quantization error" cost the project spec names as
+    a real, measured quantity, not something to paper over with a looser
+    fixed constant."""
+    return num_workers * Q16_16_ULP + 1e-9
 
 
 def free_port():
@@ -36,26 +48,57 @@ def free_port():
 class Server:
     """Launches a server binary, blocks until its "listening" readiness
     line appears on stderr (not a sleep-and-hope), and captures every
-    subsequent stderr line for the test to assert against."""
+    subsequent stderr line for the test to assert against.
+
+    Reads via raw, non-blocking os.read() on the pipe's file descriptor,
+    NOT via the stderr TextIOWrapper's own readline() -- an earlier version
+    of this harness mixed `selectors.select()` (which watches the raw OS
+    pipe) with buffered readline() calls, and lost lines: a single
+    readline() call can pull an entire multi-line chunk out of the OS pipe
+    into Python's internal text-buffer in one underlying read() syscall,
+    return just the first line, and leave the rest sitting in that
+    userspace buffer -- invisible to select(), which only sees the
+    (now-truly-empty) OS-level pipe and correctly reports nothing new,
+    while a real second line silently waits unread until the test's
+    deadline expires. Reading raw bytes ourselves and splitting on
+    newlines avoids the mismatch entirely -- a small, real lesson about
+    not layering two different buffering models on top of each other over
+    the same fd, worth keeping as a comment for exactly that reason.
+    """
 
     def __init__(self, argv):
-        self.proc = subprocess.Popen(
-            argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1
-        )
+        self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self._fd = self.proc.stderr.fileno()
+        os.set_blocking(self._fd, False)
+        self._buf = b""
         self.lines = []
-        self._sel = selectors.DefaultSelector()
-        self._sel.register(self.proc.stderr, selectors.EVENT_READ)
         self._wait_for_ready()
+
+    def _pump(self):
+        """Reads whatever is currently available (non-blocking) and moves
+        any complete lines into self.lines. Returns True if any bytes were
+        read this call, False if the pipe was empty (EAGAIN) or closed."""
+        try:
+            chunk = os.read(self._fd, 65536)
+        except BlockingIOError:
+            return False
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        self._buf += chunk
+        while b"\n" in self._buf:
+            line, self._buf = self._buf.split(b"\n", 1)
+            self.lines.append(line.decode(errors="replace") + "\n")
+        return True
 
     def _wait_for_ready(self, timeout=5.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            line = self.proc.stderr.readline()
-            if not line:
-                continue
-            self.lines.append(line)
-            if "listening" in line:
+            self._pump()
+            if any("listening" in l for l in self.lines):
                 return
+            time.sleep(0.01)
         raise TimeoutError("server never printed a readiness line: " + "".join(self.lines))
 
     def drain_for(self, seconds):
@@ -65,12 +108,8 @@ class Server:
         test_missing_worker_never_completes needs to observe)."""
         deadline = time.time() + seconds
         while time.time() < deadline:
-            events = self._sel.select(timeout=max(0.0, deadline - time.time()))
-            if not events:
-                continue
-            line = self.proc.stderr.readline()
-            if line:
-                self.lines.append(line)
+            if not self._pump():
+                time.sleep(0.01)
 
     def stop(self):
         self.proc.terminate()
@@ -117,7 +156,7 @@ def test_noagg_basic_sum():
     _, _, _, contributions, total, _ = completes[0]
     assert int(contributions) == num_workers
     expected = num_workers * fixed_value
-    assert abs(float(total) - expected) < FIXED_POINT_EPS, f"expected {expected}, got {total}"
+    assert abs(float(total) - expected) < sum_tolerance(num_workers), f"expected {expected}, got {total}"
     print("PASS: test_noagg_basic_sum")
 
 
@@ -141,7 +180,7 @@ def test_agg_basic_sum():
     _, _, _, contributions, total, _ = completes[0]
     assert int(contributions) == 1, "paramserver in agg mode should see exactly 1 (already-summed) contribution"
     expected = num_workers * fixed_value
-    assert abs(float(total) - expected) < FIXED_POINT_EPS, f"expected {expected}, got {total}"
+    assert abs(float(total) - expected) < sum_tolerance(num_workers), f"expected {expected}, got {total}"
     assert "packets in, " in agg.text() and f"{num_workers} packets in" in agg.text().replace(
         f"{num_workers} packets in", f"{num_workers} packets in"
     ) or True  # summary line format checked loosely; core assertion is the paramserver sum above
@@ -190,7 +229,7 @@ def test_duplicate_worker_dropped_not_double_counted():
         f"duplicate must not be double-counted: expected {num_workers} distinct contributions, got {contributions}"
     )
     expected = num_workers * fixed_value  # NOT (num_workers+1) * fixed_value
-    assert abs(float(total) - expected) < FIXED_POINT_EPS, (
+    assert abs(float(total) - expected) < sum_tolerance(num_workers), (
         f"duplicate send corrupted the sum: expected {expected} ({num_workers} workers), got {total}"
     )
     print("PASS: test_duplicate_worker_dropped_not_double_counted")
@@ -215,21 +254,29 @@ def test_out_of_order_arrival_still_completes_correctly():
     _, _, _, contributions, total, _ = completes[0]
     assert int(contributions) == num_workers
     expected = num_workers * fixed_value
-    assert abs(float(total) - expected) < FIXED_POINT_EPS
+    assert abs(float(total) - expected) < sum_tolerance(num_workers)
     print("PASS: test_out_of_order_arrival_still_completes_correctly")
 
 
 def test_aggregator_reduces_packet_count():
     ps_port = free_port()
     agg_port = free_port()
+    num_workers = 8
     ps = Server([PARAMSERVER, str(ps_port), "agg"])
-    agg = Server([AGG, str(agg_port), "127.0.0.1", str(ps_port)])
+    # max_packets=num_workers so the aggregator's own process exits (and
+    # prints its exit-time summary line) once it has seen exactly the
+    # packets this test sends -- without an explicit bound it loops
+    # forever awaiting more packets, since UDP gives it no "that's everyone"
+    # signal of its own.
+    agg = Server([AGG, str(agg_port), "127.0.0.1", str(ps_port), str(num_workers)])
     try:
-        num_workers = 8
         for wid in range(num_workers):
             run_worker("127.0.0.1", agg_port, job_id=6, worker_id=wid, num_workers=num_workers,
                        num_rounds=1, chunk_len=1, fixed_value=1.0)
-        agg.drain_for(0.5)
+        deadline = time.time() + 2.0
+        while agg.proc.poll() is None and time.time() < deadline:
+            agg.drain_for(0.1)
+        agg.drain_for(0.2)  # final pump after exit, to catch the last buffered summary line
     finally:
         agg.stop()
         ps.stop()
