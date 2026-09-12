@@ -5,3 +5,4 @@ __pycache__/
 *.o
 xdp_agg/*.o
 xdp_agg/*.ll
+.claude/
