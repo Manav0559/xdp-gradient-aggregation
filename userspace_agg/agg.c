@@ -85,9 +85,9 @@ static void free_slot(slot_t *s) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 5) {
+    if (argc < 4) {
         fprintf(stderr,
-            "usage: %s <listen_port> <downstream_ip> <downstream_port> <max_packets=0>\n",
+            "usage: %s <listen_port> <downstream_ip> <downstream_port> [max_packets=0]\n",
             argv[0]);
         return 1;
     }
