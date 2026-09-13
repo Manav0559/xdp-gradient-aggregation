@@ -1,0 +1,264 @@
+name: XDP real-kernel load test
+
+# Closes the single biggest open gap in this repo: xdp_agg/xdp_agg.c has
+# only ever been compiled to BPF bytecode with `clang -target bpf` on a
+# macOS dev machine (codegen success) -- it has never been run through a
+# real Linux kernel's in-kernel BPF *verifier*, which proves categorically
+# stronger properties (pointer-provenance bounds, loop-termination, map
+# safety) that codegen alone cannot check. ubuntu-latest GitHub Actions
+# runners are real Linux boxes with a real verifier -- this workflow loads
+# xdp_agg.o onto a veth pair via that real verifier, sends real UDP
+# gradient packets through it (including the exact adversarial inputs an
+# earlier adversarial code review found real bugs in), and asserts on the
+# real, measured result -- not a simulation of one.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  xdp-loadtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show real kernel + verifier evidence environment
+        run: |
+          uname -a
+          cat /proc/version
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc libbpf-dev libelf-dev python3
+          sudo modprobe veth || true
+          # bpftool: prefer the standalone package (Ubuntu 22.04+); fall back
+          # to the linux-tools meta-packages if it isn't available under
+          # this runner's exact kernel flavor.
+          sudo apt-get install -y bpftool || \
+            sudo apt-get install -y linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" || true
+          if ! command -v bpftool >/dev/null 2>&1; then
+            find /usr/lib/linux-tools* -name bpftool 2>/dev/null | head -1
+          fi
+          command -v bpftool || echo "bpftool not on PATH yet, will resolve via full path below"
+          bpftool version || sudo $(find /usr/lib/linux-tools* -name bpftool | head -1) version
+
+      - name: Build BPF object (real verifier target) and userspace binaries
+        run: |
+          make bpf
+          make
+          llvm-objdump -h xdp_agg/xdp_agg.o
+          ls -la xdp_agg/xdp_agg.o bin/
+
+      - name: Build config-map loader helper (libbpf bpf_obj_get/bpf_map_update_elem)
+        run: |
+          gcc -O2 -Wall -Wextra -o /tmp/netsum_cfg_loader ci/netsum_cfg_loader.c -lbpf
+          /tmp/netsum_cfg_loader 2>&1 | head -1 || true  # prints usage, exit 1 expected here
+
+      - name: Set up veth pair + network namespace (real wire, not loopback)
+        run: |
+          set -euo pipefail
+          # See the workflow header: veth0 stays in the root netns (XDP is
+          # attached here); veth1 moves into ns1. Sending FROM ns1 TO
+          # veth0's address genuinely transmits over the wire instead of
+          # short-circuiting via loopback delivery, which is what makes
+          # this a real ingress test of the XDP hook.
+          sudo ip link add veth0 type veth peer name veth1
+          sudo ip netns add ns1
+          sudo ip link set veth1 netns ns1
+          sudo ip addr add 10.200.1.1/24 dev veth0
+          sudo ip link set veth0 up
+          sudo ip netns exec ns1 ip addr add 10.200.1.2/24 dev veth1
+          sudo ip netns exec ns1 ip link set veth1 up
+          sudo ip netns exec ns1 ip link set lo up
+          echo "--- veth0 (root ns) ---"
+          ip addr show veth0
+          echo "--- veth1 (ns1) ---"
+          sudo ip netns exec ns1 ip addr show veth1
+
+      - name: Load xdp_agg.o through the real kernel verifier (capture the log)
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /sys/fs/bpf/netsum
+          set +e
+          sudo bpftool -d prog load xdp_agg/xdp_agg.o /sys/fs/bpf/netsum/prog \
+              type xdp pinmaps /sys/fs/bpf/netsum > /tmp/verifier.log 2>&1
+          LOAD_RC=$?
+          set -e
+          echo "================ verifier / loader log (rc=$LOAD_RC) ================"
+          cat /tmp/verifier.log
+          echo "======================================================================="
+          echo "--- dmesg tail (extra evidence, verifier messages sometimes land here too) ---"
+          sudo dmesg | tail -n 60 > /tmp/dmesg_after_load.log || true
+          cat /tmp/dmesg_after_load.log || true
+          if [ $LOAD_RC -ne 0 ]; then
+            echo "FAIL: the real Linux BPF verifier rejected xdp_agg.o -- see log above"
+            exit 1
+          fi
+          echo "--- bpftool prog show (loaded_at/tag/xlated+jited sizes = proof it's really loaded) ---"
+          sudo bpftool prog show pinned /sys/fs/bpf/netsum/prog | tee /tmp/prog_show.log
+          echo "--- pinned maps ---"
+          ls -la /sys/fs/bpf/netsum
+
+      - name: Attach the verified program to veth0's real ingress path
+        run: |
+          set -euo pipefail
+          if sudo ip link set dev veth0 xdpgeneric pinned /sys/fs/bpf/netsum/prog 2>/tmp/attach.log; then
+            echo "attached in xdpgeneric (SKB) mode"
+            echo "XDP_MODE=xdpgeneric" >> "$GITHUB_ENV"
+          else
+            echo "xdpgeneric attach failed:"; cat /tmp/attach.log
+            echo "falling back to plain 'xdp' (auto-negotiates generic if native unsupported)"
+            sudo ip link set dev veth0 xdp pinned /sys/fs/bpf/netsum/prog
+            echo "XDP_MODE=xdp" >> "$GITHUB_ENV"
+          fi
+          ip -d link show veth0 | tee /tmp/link_show_veth0.log
+
+      - name: Populate config_map with veth1's real MAC/IP + paramserver port
+        run: |
+          set -euo pipefail
+          VETH1_MAC=$(sudo ip netns exec ns1 ip link show veth1 | awk '/link\/ether/ {print $2}')
+          echo "veth1 MAC: $VETH1_MAC"
+          echo "VETH1_MAC=$VETH1_MAC" >> "$GITHUB_ENV"
+          # NETSUM_PORT (9876) is fixed and is where `worker` sends gradient
+          # traffic TO (filtered on by xdp_agg.c itself); ps_port here is the
+          # separate, configurable port the COMPLETED/forwarded packet gets
+          # retargeted to, which is where `paramserver` listens below.
+          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000
+          sudo bpftool map dump pinned /sys/fs/bpf/netsum/config_map
+
+      - name: Start paramserver inside ns1 (receives XDP_TX'd completions)
+        run: |
+          set -euo pipefail
+          sudo ip netns exec ns1 ./bin/paramserver 9000 agg > /tmp/ps.log 2>&1 &
+          disown || true
+          for i in $(seq 1 50); do
+            grep -q "listening" /tmp/ps.log 2>/dev/null && break
+            sleep 0.1
+          done
+          grep -q "listening" /tmp/ps.log || { echo "paramserver never became ready"; cat /tmp/ps.log; exit 1; }
+          cat /tmp/ps.log
+
+      - name: "Scenario A: real multi-worker round completes and sums correctly through the real kernel"
+        run: |
+          set -euo pipefail
+          for i in 0 1 2; do
+            sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 100 "$i" 3 1 4 1.0 0.25
+          done
+          sleep 1
+          python3 ci/assert_paramserver.py /tmp/ps.log 100 require 3 0.75
+
+      - name: "Scenario B (adversarial): chunk_len mismatch between workers is rejected, not silently summed"
+        run: |
+          set -euo pipefail
+          # Regression test for the critical out-of-bounds-write finding
+          # xdp_agg.c's header comment documents: worker 0 establishes the
+          # slot with chunk_len=4; worker 1's hand-crafted packet claims a
+          # different chunk_len=2 for the SAME slot. The slot->chunk_len
+          # check must reject it -- the slot must never complete.
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 101 0 2 1 4 1.0 1.0
+          sleep 0.3
+          sudo ip netns exec ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 101 0 0 1 2 2 65536 65536
+          sleep 1
+          python3 ci/assert_paramserver.py /tmp/ps.log 101 forbid
+
+      - name: "Scenario C (adversarial): truncated packet is dropped, not summed as stale bytes"
+        run: |
+          set -euo pipefail
+          # Mirrors tests/test_correctness.py's
+          # test_truncated_packet_not_summed_as_stale_bytes: a packet that
+          # declares chunk_len=4 but carries zero payload bytes must fail
+          # xdp_agg.c's (values + chunk_len) > data_end bounds check and be
+          # dropped outright -- never reaching the slot/accumulate logic.
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 102 1 2 1 4 1.0 1.0
+          sleep 0.3
+          sudo ip netns exec ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 102 0 0 0 2 4
+          sleep 1
+          python3 ci/assert_paramserver.py /tmp/ps.log 102 forbid
+
+      - name: "Scenario D1 (adversarial): num_workers=0 is rejected before a slot is ever created"
+        run: |
+          set -euo pipefail
+          sudo ip netns exec ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 103 0 0 0 0 1 65536
+          sleep 1
+          python3 ci/assert_paramserver.py /tmp/ps.log 103 forbid
+
+      - name: "Scenario D2 (adversarial): oversized num_workers is rejected, not a permanent slot leak"
+        run: |
+          set -euo pipefail
+          sudo ip netns exec ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 104 0 0 0 1000 1 65536
+          sleep 1
+          python3 ci/assert_paramserver.py /tmp/ps.log 104 forbid
+
+      - name: "Scenario E (adversarial): missing config_map drops the completion AND counts it"
+        run: |
+          set -euo pipefail
+          # Regression test for the "silent, unacknowledged data loss" fix:
+          # temporarily empty config_map, then complete a real 2-worker
+          # round. The completed aggregation must be dropped (never
+          # forwarded -- paramserver sees nothing) AND
+          # drop_stats[STAT_DROPPED_NO_CONFIG=0] must be bumped, proving
+          # this isn't just silent packet loss on the real kernel path.
+          sudo bpftool map delete pinned /sys/fs/bpf/netsum/config_map key hex 00 00 00 00
+          sudo bpftool map dump pinned /sys/fs/bpf/netsum/config_map || echo "(confirmed: config_map is empty)"
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 105 0 2 1 1 1.0 0.5
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 105 1 2 1 1 1.0 0.5
+          sleep 1
+          python3 ci/assert_paramserver.py /tmp/ps.log 105 forbid
+          sudo bpftool -j map dump pinned /sys/fs/bpf/netsum/drop_stats > /tmp/drop_stats.json
+          cat /tmp/drop_stats.json
+          python3 ci/check_drop_stat.py /tmp/drop_stats.json 0
+          # Restore config for the recovery scenario below.
+          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000
+
+      - name: "Scenario F: recovery -- normal completion works again after config_map is restored"
+        run: |
+          set -euo pipefail
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 106 0 2 1 1 1.0 0.5
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 106 1 2 1 1 1.0 0.5
+          sleep 1
+          python3 ci/assert_paramserver.py /tmp/ps.log 106 require 2 1.0
+
+      - name: Collect final evidence (paramserver log, verifier log, map state)
+        if: always()
+        run: |
+          set +e
+          echo "--- full paramserver log ---"
+          cat /tmp/ps.log
+          echo "--- final drop_stats ---"
+          sudo bpftool map dump pinned /sys/fs/bpf/netsum/drop_stats > /tmp/drop_stats_final.json 2>&1
+          cat /tmp/drop_stats_final.json
+          echo "--- final slot_map (should be empty -- every slot completes or is deleted) ---"
+          sudo bpftool map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_final.json 2>&1
+          cat /tmp/slot_map_final.json
+          exit 0
+
+      - name: Upload verifier + run evidence as build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdp-loadtest-evidence
+          if-no-files-found: ignore
+          path: |
+            /tmp/verifier.log
+            /tmp/dmesg_after_load.log
+            /tmp/prog_show.log
+            /tmp/attach.log
+            /tmp/link_show_veth0.log
+            /tmp/ps.log
+            /tmp/drop_stats.json
+            /tmp/drop_stats_final.json
+            /tmp/slot_map_final.json
+
+      - name: Tear down netns/veth/pinned objects
+        if: always()
+        run: |
+          set +e
+          sudo pkill -f "bin/paramserver"
+          sudo ip link set dev veth0 xdpgeneric off 2>/dev/null
+          sudo ip link set dev veth0 xdp off 2>/dev/null
+          sudo ip netns del ns1
+          sudo ip link del veth0
+          sudo rm -rf /sys/fs/bpf/netsum
+          exit 0
