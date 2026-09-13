@@ -93,9 +93,30 @@ other job's slots, are unaffected. `tests/test_correctness.py`'s
 not just that the mechanism compiles: a greedy job (`job_id=900`) opens 3
 concurrent incomplete slots against a quota of 2 — exactly one is rejected —
 while a second, unrelated job (`job_id=901`) completes normally regardless.
-Not yet done: porting the same quota into the XDP kernel program, and a
-formal Jain's-fairness-index measurement sweep across concurrent jobs (see
-`docs/PROJECT_SPEC.md` §5).
+**Now also ported into the XDP kernel program itself** (`job_quota_map`,
+`struct netsum_config`'s new `max_slots_per_job` field, `STAT_DROPPED_FAIRNESS_QUOTA`)
+and verified on a real loaded kernel in the same CI job described above: a
+greedy job's 3rd concurrent slot is genuinely rejected (`drop_stats[1]`
+increments to exactly 1, `job_quota_map[900].concurrent_slots` reads back as
+exactly 2 via `bpftool map dump`) while a second, unrelated job completes
+normally. A **formal Jain's-fairness-index sweep** (`scripts/fairness_sweep.py`,
+charted on the dashboard) now also quantifies this: 3 concurrently-contending
+jobs with uneven demand (16/4/8) show Jain's index climbing from 0.778 at
+`quota=0` (unlimited) toward 1.0 as the quota tightens to 1–4, confirming the
+mechanism's real effect, not just that one greedy job's excess gets rejected
+once.
+
+A **netem-driven adversarial sweep** (same CI job, `tc qdisc ... netem`
+against the real loaded program) confirms a full round still aggregates
+correctly under 20% packet loss (via redundant sends) and under real
+delay+reordering (confirming the slot/accumulate logic is correctly
+order-independent) — and empirically confirms a known, honest gap: when one
+worker's packet is permanently, deterministically dropped, its slot is
+never reclaimed (`bpftool map dump pinned .../slot_map` still shows it stuck
+afterward) — `xdp_agg.c` has no TTL/reaper of its own yet (only the
+userspace baseline does). Not yet done: a kernel-side TTL/reaper (needs
+`bpf_timer`, Linux 5.15+) to close that gap, and real per-packet XDP
+latency numbers via `BPF_PROG_TEST_RUN` (see `docs/PROJECT_SPEC.md` §5).
 
 ### Slot-table TTL / reaper (the crashed-worker case the quota doesn't cover)
 
@@ -147,6 +168,19 @@ continuously-checked proof of the parity claim instead of a one-time human
 read-through. The one deliberately out-of-scope nuance (a stateful
 `slot->chunk_len` consistency check neither extracted function can model
 without a live slot table) is documented in `fuzz/README.md`, not hidden.
+
+### Latency distribution rigor (percentiles, not just mean/min/max)
+
+`scripts/benchmark.py` now runs 30 trials per (config, worker-count) cell
+(up from 10) and reports p50/p95/p99, a bootstrap 95% confidence interval on
+the median, and a permutation test with Cliff's delta effect size comparing
+`noagg` vs. `useragg` at each worker count — plain Python throughout, no new
+dependency. Real result: none of the 4 worker counts show a statistically
+significant difference (all p > 0.05), consistent with this project's own
+"`useragg` is not expected to beat `noagg` here" framing (see the dashboard's
+latency panel) — a claim that previously rested on a bare mean comparison
+over a handful of trials now rests on an actual significance test. Data in
+`bench/results_percentiles.csv`, charted on the dashboard.
 
 Real bugs were found and fixed during this build (not just written and assumed
 correct) — this is the honest, complete list, not a curated subset:
