@@ -49,11 +49,20 @@ jobs:
           # Plain `clang -target bpf` on Linux doesn't know the host's
           # multiarch include path, so glibc's stdint.h -> bits/libc-header-
           # start.h (which lives under /usr/include/<triplet>/, not
-          # /usr/include/ directly) fails to resolve. -idirafter fixes this
-          # without touching the Makefile's macOS-first BPF_CC logic.
+          # /usr/include/ directly) fails to resolve. -idirafter fixes that.
+          # Second-order issue once that resolves: glibc's gnu/stubs.h picks
+          # its 32- vs 64-bit stub header based on whether __x86_64__ is
+          # defined, which clang does NOT define for the freestanding "bpf"
+          # target (correctly -- it isn't x86_64) -- so it falls into the
+          # 32-bit branch, which needs gnu/stubs-32.h, not installed on a
+          # 64-bit-only runner. -D__x86_64__ is a preprocessor-only define
+          # here (it does not change actual BPF codegen/ISA, only which
+          # glibc header branch is textually selected) that makes it take
+          # the 64-bit branch instead, which does exist and matches the
+          # 64-bit int/long/pointer widths the BPF VM actually uses.
           MULTIARCH=$(gcc -print-multiarch)
           echo "host multiarch: $MULTIARCH"
-          make bpf BPF_CC="clang -idirafter /usr/include/${MULTIARCH}"
+          make bpf BPF_CC="clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH}"
           make
           llvm-objdump -h xdp_agg/xdp_agg.o
           ls -la xdp_agg/xdp_agg.o bin/
