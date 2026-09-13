@@ -434,6 +434,63 @@ def test_fairness_quota_isolates_greedy_job():
     print("PASS: test_fairness_quota_isolates_greedy_job")
 
 
+def test_slot_ttl_reaper_reclaims_permanently_incomplete_slot():
+    # Regression test for the resource-leak gap the fairness quota's own
+    # header comment acknowledged: an HONEST job whose worker legitimately
+    # crashes mid-round (never sends its contribution) leaves its slot
+    # stuck forever with no TTL -- occupying both a g_slots entry AND one
+    # of that job's quota-limited concurrent-slot allowance. This proves
+    # the reaper actually evicts such a slot (observed via the real
+    # subprocess's real [reaped] stderr line, not just "should have"), and
+    # that a healthy, different job's round still completes normally
+    # afterward -- the reaper must not disturb slots that are still making
+    # progress.
+    ps_port = free_port()
+    agg_port = free_port()
+    ttl_ms = 200
+    ps = Server([PARAMSERVER, str(ps_port), "agg"])
+    # max_packets=0 (unbounded): this test stops the aggregator itself via
+    # agg.stop() once it's done, the same way test_missing_worker_never_completes
+    # relies on drain_for()'s bounded window rather than process exit.
+    agg = Server([AGG, str(agg_port), "127.0.0.1", str(ps_port), "0", "0", str(ttl_ms)])
+    try:
+        # Job 1000: 2 workers expected, but worker 1 never sends --
+        # simulating a crashed/dropped worker. This slot can never
+        # complete on its own; only the reaper can reclaim it.
+        run_worker("127.0.0.1", agg_port, job_id=1000, worker_id=0, num_workers=2,
+                   num_rounds=1, chunk_len=1, fixed_value=3.0)
+        # Wait comfortably past the TTL (reaper sweeps every ttl_ms/4 =
+        # 50ms) for the eviction to actually happen and be observed on
+        # stderr -- generous margin to rule out timing flakiness rather
+        # than cutting it close to ttl_ms itself.
+        agg.drain_for(1.0)
+
+        # Second, healthy job: both workers send, must complete normally,
+        # proving the reaper didn't disturb (or somehow starve) an
+        # unrelated, well-behaved slot.
+        run_worker("127.0.0.1", agg_port, job_id=1001, worker_id=0, num_workers=2,
+                   num_rounds=1, chunk_len=1, fixed_value=4.0)
+        run_worker("127.0.0.1", agg_port, job_id=1001, worker_id=1, num_workers=2,
+                   num_rounds=1, chunk_len=1, fixed_value=4.0)
+        agg.drain_for(0.5)
+        ps.drain_for(0.3)
+    finally:
+        agg.stop()
+        ps.stop()
+    text = agg.text()
+    reaped = re.findall(r"\[reaped\] job=1000 round=(\d+) chunk=(\d+) -- incomplete after (\d+)ms, evicting", text)
+    assert len(reaped) == 1, f"expected job 1000's permanently-incomplete slot to be reaped exactly once, got {reaped}\nfull log:\n{text}"
+    completes = extract_complete_lines(text)
+    job_ids_completed = {int(c[0]) for c in completes}
+    assert 1000 not in job_ids_completed, (
+        f"job 1000's slot was reaped (crashed worker), it must never show as completed: {completes}"
+    )
+    assert 1001 in job_ids_completed, (
+        f"job 1001's healthy, complete round must still succeed normally after the reaper ran:\n{text}"
+    )
+    print("PASS: test_slot_ttl_reaper_reclaims_permanently_incomplete_slot")
+
+
 def main():
     tests = [
         test_noagg_basic_sum,
@@ -445,6 +502,7 @@ def main():
         test_truncated_packet_not_summed_as_stale_bytes,
         test_chunk_len_mismatch_rejected_not_silently_summed,
         test_fairness_quota_isolates_greedy_job,
+        test_slot_ttl_reaper_reclaims_permanently_incomplete_slot,
     ]
     failures = 0
     for t in tests:

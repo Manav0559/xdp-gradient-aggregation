@@ -22,6 +22,50 @@
  * already had). See tests/test_correctness.py's fairness tests for a
  * worked example: a greedy job hitting its quota while a second,
  * well-behaved job's slots are admitted normally.
+ *
+ * Slot TTL / reaper (optional `slot_ttl_ms` CLI argument): the fairness
+ * quota above stops an ABUSIVE job from hoarding slots, but does nothing
+ * for the opposite, honest failure mode -- a well-behaved job whose worker
+ * legitimately crashes or drops off the network mid-round, after its slot
+ * was admitted but before every expected worker ever contributed. That
+ * slot would otherwise sit `in_use` forever: one dead entry in
+ * `g_slots`, and worse, one permanent tick against that job's
+ * `concurrent_slots` fairness allowance, silently shrinking its real quota
+ * over the life of the process. xdp_agg.c's own header comment admits
+ * this same gap exists there too ("no TTL/eviction anywhere in this
+ * program") -- this is the userspace-side fix; porting an equivalent into
+ * the kernel program is separate follow-up work (no arbitrary timers in
+ * the BPF hot path without `bpf_timer`, which needs real-kernel testing),
+ * intentionally out of scope here.
+ *
+ * `slot_ttl_ms` (0 = disabled, preserving the exact prior behavior for
+ * every existing test) bounds how long a slot may sit incomplete before a
+ * periodic reaper sweep evicts it via the exact same `free_slot()` path a
+ * normal completion uses, so `concurrent_slots` accounting stays correct
+ * across an eviction.
+ *
+ * Design choice -- LAST-TOUCHED, not creation time: each slot's age is
+ * measured from its most recent ACCEPTED contribution (`last_touched_micros`),
+ * not from when the slot was first created. A slot that's still making
+ * genuine progress (contributions trickling in from different workers
+ * under ordinary network jitter) shouldn't be evicted out from under it
+ * just because it happened to open a while ago; only a slot that has gone
+ * fully silent for the whole TTL window -- the actual crashed-worker
+ * signature -- should be reclaimed. Rejected contributions (duplicate,
+ * chunk_len mismatch) do NOT refresh this timestamp, since those aren't
+ * real progress either.
+ *
+ * Mechanism note: the main loop's `recvfrom()` is normally blocking with
+ * no timeout, which would never wake up to run the reaper if a stuck
+ * slot's whole socket goes silent (exactly the scenario being fixed). When
+ * `slot_ttl_ms > 0`, `SO_RCVTIMEO` is set on the inbound socket so
+ * `recvfrom()` periodically returns `EWOULDBLOCK`/`EAGAIN` on its own,
+ * which the existing `n < NETSUM_HDR_SIZE` check already treats as a
+ * harmless "nothing this iteration" (it doesn't count toward
+ * `max_packets` or log anything) -- giving the loop a chance to run the
+ * reaper sweep even under total silence. When `slot_ttl_ms == 0` no
+ * timeout is ever installed, so recvfrom stays exactly as blocking as
+ * before and every existing test's behavior is unchanged.
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -60,6 +104,13 @@ typedef struct {
      * and got near-zero numbers for every worker count, which was the
      * tell that something was being measured in the wrong place). */
     long first_seen_micros;
+    /* Slot-TTL reaper: timestamp of the most recent ACCEPTED contribution
+     * (or slot creation, since creation always immediately processes a
+     * contribution in the same recvfrom() iteration -- see the header
+     * comment's "LAST-TOUCHED, not creation time" note for why this is
+     * "last touched" rather than "first seen"). A slot whose age exceeds
+     * slot_ttl_ms is evicted by reap_expired_slots(). */
+    long last_touched_micros;
 } slot_t;
 
 static slot_t g_slots[SLOT_TABLE_CAPACITY];
@@ -161,15 +212,43 @@ static long now_micros(void) {
     return (long)tv.tv_sec * 1000000L + tv.tv_usec;
 }
 
+/* Slot-TTL reaper: a plain linear scan of the fixed-size slot table. This
+ * is fine at benchmark scale (SLOT_TABLE_CAPACITY entries, swept only a
+ * few times per second -- see the interval computation in main()), the
+ * same "fixed-size table, no growth" constraint the eventual BPF map will
+ * share. Any slot whose age (now - last_touched_micros) exceeds
+ * slot_ttl_ms is evicted via free_slot() -- the exact same path a normal
+ * completion uses -- so the owning job's concurrent_slots fairness count
+ * decrements correctly instead of leaking. */
+static void reap_expired_slots(long slot_ttl_ms) {
+    long now = now_micros();
+    long ttl_micros = slot_ttl_ms * 1000L;
+    for (size_t i = 0; i < SLOT_TABLE_CAPACITY; i++) {
+        slot_t *s = &g_slots[i];
+        if (!s->in_use) continue;
+        long age_micros = now - s->last_touched_micros;
+        if (age_micros >= ttl_micros) {
+            fprintf(stderr,
+                "[reaped] job=%u round=%u chunk=%u -- incomplete after %ldms, evicting\n",
+                s->job_id, s->round, s->chunk_id, age_micros / 1000);
+            free_slot(s);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
-            "usage: %s <listen_port> <downstream_ip> <downstream_port> [max_packets=0] [max_slots_per_job=0]\n"
+            "usage: %s <listen_port> <downstream_ip> <downstream_port> [max_packets=0] [max_slots_per_job=0] [slot_ttl_ms=0]\n"
             "  max_slots_per_job: fairness admission quota -- caps how many\n"
             "  concurrently-incomplete slots a single job_id may occupy (0 =\n"
             "  unlimited, the original behavior). Reproduces ATP's actual\n"
             "  headline contribution: a shared aggregator serving multiple\n"
-            "  tenants must not let one greedy job starve the others.\n",
+            "  tenants must not let one greedy job starve the others.\n"
+            "  slot_ttl_ms: eviction timeout for a slot that never completes\n"
+            "  (e.g. a crashed/dropped worker) -- 0 = disabled, the original\n"
+            "  behavior. Without this, an incomplete slot occupies its\n"
+            "  g_slots entry AND its job's fairness-quota allowance forever.\n",
             argv[0]);
         return 1;
     }
@@ -178,6 +257,7 @@ int main(int argc, char **argv) {
     int downstream_port = atoi(argv[3]);
     long max_packets = argc > 4 ? atol(argv[4]) : 0;
     g_job_quota = argc > 5 ? atol(argv[5]) : 0;
+    long slot_ttl_ms = argc > 6 ? atol(argv[6]) : 0;
 
     int in_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (in_sock < 0) { perror("socket(in)"); return 1; }
@@ -192,6 +272,26 @@ int main(int argc, char **argv) {
     if (bind(in_sock, (struct sockaddr *)&in_addr, sizeof(in_addr)) < 0) {
         perror("bind");
         return 1;
+    }
+
+    /* Only installed when the TTL reaper is actually enabled -- when
+     * slot_ttl_ms == 0, in_sock stays exactly as blocking-with-no-timeout
+     * as it always was, so every existing test's behavior is byte-for-byte
+     * unchanged. When enabled, the timeout is a quarter of the TTL (floor
+     * 1ms) so the reaper sweeps several times per TTL window -- fine
+     * granularity without spinning -- and a recvfrom() that times out
+     * returns EWOULDBLOCK/EAGAIN, which the main loop's existing
+     * `n < NETSUM_HDR_SIZE` check already treats as a harmless no-op
+     * iteration (see the header comment's "Mechanism note"). */
+    long reap_interval_micros = 0;
+    if (slot_ttl_ms > 0) {
+        long interval_ms = slot_ttl_ms / 4;
+        if (interval_ms < 1) interval_ms = 1;
+        reap_interval_micros = interval_ms * 1000L;
+        struct timeval rcv_timeout;
+        rcv_timeout.tv_sec = interval_ms / 1000;
+        rcv_timeout.tv_usec = (interval_ms % 1000) * 1000;
+        setsockopt(in_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
     }
 
     int out_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -211,10 +311,19 @@ int main(int argc, char **argv) {
     uint8_t in_packet[NETSUM_MAX_PACKET_SIZE];
     uint8_t out_packet[NETSUM_MAX_PACKET_SIZE];
     long packets_in = 0, packets_out = 0;
+    long last_reap_micros = now_micros();
 
     while (max_packets == 0 || packets_in < max_packets) {
+        if (slot_ttl_ms > 0) {
+            long now = now_micros();
+            if (now - last_reap_micros >= reap_interval_micros) {
+                reap_expired_slots(slot_ttl_ms);
+                last_reap_micros = now;
+            }
+        }
+
         ssize_t n = recvfrom(in_sock, in_packet, sizeof(in_packet), 0, NULL, NULL);
-        if (n < (ssize_t)NETSUM_HDR_SIZE) continue;
+        if (n < (ssize_t)NETSUM_HDR_SIZE) continue;  /* also catches the SO_RCVTIMEO EWOULDBLOCK/EAGAIN wakeup -- not a real error, not counted */
         packets_in++;
 
         struct grad_hdr *hdr = (struct grad_hdr *)in_packet;
@@ -292,6 +401,12 @@ int main(int argc, char **argv) {
             continue;
         }
         slot->seen_worker[worker_id] = 1;
+        /* "Last touched," not "first seen": this line is why a slot still
+         * receiving genuine contributions never gets reaped, even if it's
+         * been open a long time -- only one that's gone fully silent for
+         * the whole TTL window does. See the header comment's "LAST-
+         * TOUCHED, not creation time" note. */
+        slot->last_touched_micros = now_micros();
 
         for (int i = 0; i < chunk_len && i < NETSUM_MAX_CHUNK_LEN; i++) {
             slot->sum[i] += (int32_t)ntohl((uint32_t)values[i]);
