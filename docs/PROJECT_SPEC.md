@@ -217,6 +217,17 @@ a second job sharing the slot table. It has not yet been ported into the XDP
 kernel program (`xdp_agg/xdp_agg.c`) or measured via a formal Jain's-index
 sweep across 2–4 jobs — both remain open follow-ups, not silently claimed done.
 
+**Implementation status (slot TTL / crashed-worker eviction):** the fairness
+quota above only bounds a slot table shared by *concurrent* demand from an
+abusive job; it does nothing when an *honest* job's worker legitimately
+crashes mid-round, leaving its slot incomplete forever. `userspace_agg/agg.c`
+now closes this with a configurable `slot_ttl_ms` that periodically reaps any
+slot gone silent past its timeout (measured from the slot's last accepted
+contribution, not its creation, so genuinely-progressing slots are never
+disturbed), regression-tested with a real simulated crashed worker. Not yet
+done: the equivalent in the XDP kernel program, which needs `bpf_timer`
+(Linux 5.15+) and real-kernel testing this dev environment can't do locally.
+
 ---
 
 ## 6. Build Plan (Semester Timeline)

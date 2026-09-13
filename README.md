@@ -19,7 +19,7 @@ correctness test suite:
 ```sh
 make                              # builds bin/worker, bin/paramserver, bin/agg
 make bpf                          # compiles xdp_agg/xdp_agg.c to real eBPF bytecode
-python3 tests/test_correctness.py # 9/9 passing
+python3 tests/test_correctness.py # 10/10 passing
 python3 scripts/benchmark.py      # runs the real noagg-vs-useragg benchmark sweep
 ```
 
@@ -59,6 +59,38 @@ while a second, unrelated job (`job_id=901`) completes normally regardless.
 Not yet done: porting the same quota into the XDP kernel program, and a
 formal Jain's-fairness-index measurement sweep across concurrent jobs (see
 `docs/PROJECT_SPEC.md` §5).
+
+### Slot-table TTL / reaper (the crashed-worker case the quota doesn't cover)
+
+The fairness quota above stops an *abusive* job from hoarding slots — it does
+nothing for the opposite, *honest* failure: a well-behaved job whose worker
+legitimately crashes or drops off mid-round, leaving its slot incomplete
+forever. Without a timeout, that slot occupies its `g_slots` entry **and**
+permanently shrinks that job's fairness-quota allowance for the life of the
+process — `xdp_agg.c`'s own header comment admitted this gap outright ("no
+TTL/eviction anywhere in this program"). `userspace_agg/agg.c` now closes the
+userspace half of it:
+
+```sh
+bin/agg <listen_port> <downstream_ip> <downstream_port> [max_packets=0] [max_slots_per_job=0] [slot_ttl_ms=0]
+```
+
+`slot_ttl_ms` (0 = disabled, the original behavior) bounds how long a slot may
+sit incomplete before a periodic reaper evicts it through the exact same
+`free_slot()` path a normal completion uses, so fairness accounting stays
+correct. The timer is measured from each slot's most recent *accepted*
+contribution, not its creation time, so a slot still making genuine progress
+under ordinary network jitter is never evicted out from under it — only one
+gone fully silent for the whole TTL window (the real crashed-worker
+signature) is reclaimed. A reaped slot logs `[reaped] job=... round=...
+chunk=... -- incomplete after ...ms, evicting`.
+`test_slot_ttl_reaper_reclaims_permanently_incomplete_slot` proves this with a
+real crashed-worker scenario (one of two expected workers never sends), then
+confirms a second, healthy job's round still completes normally afterward.
+Porting an equivalent into the XDP kernel program is separate follow-up work
+(no arbitrary timer inside the BPF hot path without `bpf_timer`, which needs
+real-kernel testing this dev environment can't do locally) — not attempted
+here.
 
 Real bugs were found and fixed during this build (not just written and assumed
 correct) — this is the honest, complete list, not a curated subset:
@@ -100,7 +132,7 @@ worker/         synthetic gradient-chunk sender
 paramserver/    baseline #1 (no aggregation) + the final receiver for #2/#3
 userspace_agg/  baseline #2 (userspace aggregation, same algorithm as XDP)
 xdp_agg/        the kernel-space XDP/eBPF aggregator -- compiles, not yet load-tested
-tests/          correctness test suite (9/9 passing, driving the real binaries)
+tests/          correctness test suite (10/10 passing, driving the real binaries)
 scripts/        benchmark harness -- real measured data in bench/results.csv
 dashboard/      live results dashboard (dark/light, charts bench/results.csv)
 docs/           full project spec (.md + .pdf) and the Linux/XDP dev-environment guide
