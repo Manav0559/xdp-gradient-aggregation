@@ -232,9 +232,23 @@ can run" discipline as itch-lob-engine's benchmark suite.
 quota is implemented and regression-tested in the userspace aggregator
 (`userspace_agg/agg.c`'s `g_job_quota`/`find_or_create_job` machinery — see
 `README.md`), proving the mechanism isolates a greedy job's excess demand from
-a second job sharing the slot table. It has not yet been ported into the XDP
-kernel program (`xdp_agg/xdp_agg.c`) or measured via a formal Jain's-index
-sweep across 2–4 jobs — both remain open follow-ups, not silently claimed done.
+a second job sharing the slot table. **Now also ported into the XDP kernel
+program** (`job_quota_map` in `xdp_agg/xdp_agg.c`) and verified against a real
+loaded kernel in CI (`.github/workflows/xdp-loadtest.yml`'s fairness
+scenario) — a greedy job's excess slot-creation attempt is genuinely
+rejected on the real, loaded program, not just the userspace baseline. A
+**formal Jain's-index sweep** (`scripts/fairness_sweep.py`) is also done:
+3 concurrently-contending jobs with uneven demand show Jain's index climbing
+from 0.778 at `quota=0` toward 1.0 as the quota tightens — the quantitative
+curve this row asked for, not just one qualitative reject.
+
+**Implementation status (adversarial loss/reordering row):** now done via
+the same real-kernel CI job — `tc qdisc ... netem` applied to the veth
+carrying traffic to the live loaded program confirms correct aggregation
+under 20% packet loss and real reordering, and empirically confirms
+(not just predicts) that an incomplete slot from a permanently-lost packet
+is never reclaimed — `xdp_agg.c` has no TTL/reaper of its own, only the
+userspace baseline does (see below).
 
 **Implementation status (slot TTL / crashed-worker eviction):** the fairness
 quota above only bounds a slot table shared by *concurrent* demand from an
