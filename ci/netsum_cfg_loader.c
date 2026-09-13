@@ -9,9 +9,11 @@
  * struct netsum_config is copied here VERBATIM from xdp_agg/xdp_agg.c --
  * this is the one place a layout mismatch would silently corrupt the
  * config the real kernel program reads, so if that struct ever changes,
- * this copy must change with it.
+ * this copy must change with it. (It just did: max_slots_per_job was added
+ * for the kernel-side fairness-quota port -- this copy was updated to
+ * match in the same change.)
  *
- * Usage: netsum_cfg_loader <config_map_pinned_path> <mac aa:bb:cc:dd:ee:ff> <ipv4> <port>
+ * Usage: netsum_cfg_loader <config_map_pinned_path> <mac aa:bb:cc:dd:ee:ff> <ipv4> <port> [max_slots_per_job=0]
  */
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
@@ -26,6 +28,8 @@ struct netsum_config {
     uint16_t _pad;
     uint32_t ps_ip;   /* network byte order */
     uint16_t ps_port; /* network byte order */
+    uint16_t _pad2;
+    uint32_t max_slots_per_job;  /* host-native byte order; 0 = unlimited */
 };
 
 static int parse_mac(const char *s, uint8_t out[6]) {
@@ -38,14 +42,21 @@ static int parse_mac(const char *s, uint8_t out[6]) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
-        fprintf(stderr, "usage: %s <config_map_pinned_path> <mac> <ipv4> <port>\n", argv[0]);
+    if (argc != 5 && argc != 6) {
+        fprintf(stderr,
+                "usage: %s <config_map_pinned_path> <mac> <ipv4> <port> [max_slots_per_job=0]\n"
+                "  max_slots_per_job: kernel-side fairness admission quota -- caps how\n"
+                "  many concurrently-incomplete slots a single job_id may occupy\n"
+                "  (0 = unlimited, the default if omitted). Same convention as\n"
+                "  userspace_agg.c's g_job_quota.\n",
+                argv[0]);
         return 1;
     }
     const char *map_path = argv[1];
     const char *mac_str = argv[2];
     const char *ip_str = argv[3];
     int port = atoi(argv[4]);
+    uint32_t max_slots_per_job = argc > 5 ? (uint32_t)strtoul(argv[5], NULL, 10) : 0;
 
     struct netsum_config cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -61,12 +72,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     cfg.ps_port = htons((uint16_t)port);
+    cfg.max_slots_per_job = max_slots_per_job;  /* host-native, never goes on the wire */
 
     fprintf(stderr,
             "netsum_cfg_loader: writing ps_mac=%02x:%02x:%02x:%02x:%02x:%02x "
-            "ps_ip=%s ps_port=%d (sizeof(struct netsum_config)=%zu) to %s\n",
+            "ps_ip=%s ps_port=%d max_slots_per_job=%u (sizeof(struct netsum_config)=%zu) to %s\n",
             cfg.ps_mac[0], cfg.ps_mac[1], cfg.ps_mac[2], cfg.ps_mac[3], cfg.ps_mac[4], cfg.ps_mac[5],
-            ip_str, port, sizeof(cfg), map_path);
+            ip_str, port, max_slots_per_job, sizeof(cfg), map_path);
 
     int fd = bpf_obj_get(map_path);
     if (fd < 0) {
