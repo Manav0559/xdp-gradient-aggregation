@@ -11,6 +11,7 @@ Run: python3 tests/test_correctness.py   (after `make` in the repo root)
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -288,6 +289,100 @@ def test_aggregator_reduces_packet_count():
     print(f"PASS: test_aggregator_reduces_packet_count ({packets_in} in -> {packets_out} out)")
 
 
+def _raw_grad_packet(job_id, round_, chunk_id, worker_id, num_workers, declared_chunk_len,
+                      values=None):
+    """Builds a raw grad_hdr + payload byte string by hand (bypassing the
+    worker binary entirely), so a test can send something the worker
+    binary would never construct on its own -- specifically, a header that
+    LIES about chunk_len relative to how many values actually follow (or
+    none at all). `values` is a list of real int32 fixed-point values to
+    append; declared_chunk_len is what the header claims, independently of
+    len(values), which is exactly the mismatch these tests need to
+    trigger."""
+    header = struct.pack(">IIIHHHH", job_id, round_, chunk_id, worker_id,
+                          num_workers, declared_chunk_len, 0)
+    payload = b"".join(struct.pack(">i", v) for v in (values or []))
+    return header + payload
+
+
+def test_truncated_packet_not_summed_as_stale_bytes():
+    # Regression test for a critical bug an adversarial review found: agg.c
+    # never checked that the actual received length covered
+    # header + declared_chunk_len*4 bytes before reading that many values
+    # out of its packet buffer. Since that buffer is reused across
+    # recvfrom() calls and never cleared, a genuinely truncated datagram
+    # (header only, chunk_len claims 4 values that were never sent) used to
+    # silently sum whatever stale bytes were left over from a PRIOR, larger
+    # packet -- not the caught-and-dropped behavior this test verifies.
+    ps_port = free_port()
+    agg_port = free_port()
+    num_workers = 2
+    ps = Server([PARAMSERVER, str(ps_port), "agg"])
+    agg = Server([AGG, str(agg_port), "127.0.0.1", str(ps_port)])
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # First: a real, large, well-formed packet from worker 0 -- this is
+        # what used to leave "stale bytes" sitting in agg.c's reused
+        # in_packet buffer for the next recv to accidentally read into.
+        big = _raw_grad_packet(job_id=7, round_=0, chunk_id=0, worker_id=0,
+                               num_workers=num_workers, declared_chunk_len=4,
+                               values=[999999, 999999, 999999, 999999])
+        sock.sendto(big, ("127.0.0.1", agg_port))
+        time.sleep(0.1)
+        # Second: worker 1's packet claims chunk_len=4 but the datagram is
+        # header-only -- genuinely truncated, not just small.
+        truncated = _raw_grad_packet(job_id=7, round_=0, chunk_id=0, worker_id=1,
+                                     num_workers=num_workers, declared_chunk_len=4,
+                                     values=[])
+        sock.sendto(truncated, ("127.0.0.1", agg_port))
+        sock.close()
+        agg.drain_for(0.5)
+        ps.drain_for(0.3)
+    finally:
+        agg.stop()
+        ps.stop()
+    # The truncated packet must be dropped, not summed -- so this slot
+    # (only 1 of its 2 expected workers ever validly contributed) must
+    # never complete.
+    assert extract_complete_lines(agg.text()) == [], (
+        f"a truncated packet was summed instead of dropped:\n{agg.text()}"
+    )
+    print("PASS: test_truncated_packet_not_summed_as_stale_bytes")
+
+
+def test_chunk_len_mismatch_rejected_not_silently_summed():
+    # Regression test for the finding that motivated xdp_agg.c's critical
+    # fix: a contribution whose chunk_len disagrees with the slot's
+    # already-established chunk_len must be rejected, not accumulated
+    # using its own (different) length -- which would silently produce a
+    # sum inconsistent with what any real worker sent.
+    ps_port = free_port()
+    agg_port = free_port()
+    num_workers = 2
+    ps = Server([PARAMSERVER, str(ps_port), "agg"])
+    agg = Server([AGG, str(agg_port), "127.0.0.1", str(ps_port)])
+    try:
+        run_worker("127.0.0.1", agg_port, job_id=8, worker_id=0, num_workers=num_workers,
+                   num_rounds=1, chunk_len=4, fixed_value=1.0)
+        time.sleep(0.1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        mismatched = _raw_grad_packet(job_id=8, round_=0, chunk_id=0, worker_id=1,
+                                      num_workers=num_workers, declared_chunk_len=2,
+                                      values=[65536, 65536])  # chunk_len=2, not the slot's 4
+        sock.sendto(mismatched, ("127.0.0.1", agg_port))
+        sock.close()
+        agg.drain_for(0.5)
+        ps.drain_for(0.3)
+    finally:
+        agg.stop()
+        ps.stop()
+    assert "[chunk_len mismatch]" in agg.text(), f"expected a chunk_len-mismatch rejection:\n{agg.text()}"
+    assert extract_complete_lines(agg.text()) == [], (
+        f"a chunk_len-mismatched contribution was summed instead of rejected:\n{agg.text()}"
+    )
+    print("PASS: test_chunk_len_mismatch_rejected_not_silently_summed")
+
+
 def main():
     tests = [
         test_noagg_basic_sum,
@@ -296,6 +391,8 @@ def main():
         test_duplicate_worker_dropped_not_double_counted,
         test_out_of_order_arrival_still_completes_correctly,
         test_aggregator_reduces_packet_count,
+        test_truncated_packet_not_summed_as_stale_bytes,
+        test_chunk_len_mismatch_rejected_not_silently_summed,
     ]
     failures = 0
     for t in tests:

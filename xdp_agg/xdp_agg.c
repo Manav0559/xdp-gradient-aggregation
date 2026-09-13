@@ -16,23 +16,52 @@
  *
  * Compiles cleanly to real eBPF bytecode: `clang -target bpf -O2 -c` on
  * this file produces a valid eBPF ELF object (confirmed: proper `xdp`,
- * `.maps`, and `license` sections via `llvm-readelf -S`, 336 instructions
- * via `llvm-objdump -d`) -- this machine has no Linux kernel, and libbpf
- * has no macOS build (see docs/DEV_ENVIRONMENT.md), but clang's BPF
- * *codegen* backend needs neither, only the struct layouts and helper IDs
- * vendored in bpf_compat.h. What this compile step does NOT catch: the
- * in-kernel BPF *verifier* only runs at load time (the `bpf()` syscall on
- * a real Linux box) and checks things codegen alone cannot -- e.g. whether
- * every code path's pointer arithmetic stays provably in-bounds, and
- * whether the handful of helper calls permitted while `bpf_spin_lock` is
- * held are actually used correctly. An early version of this function DID
- * fail at the codegen stage (a `final_sum[NETSUM_MAX_CHUNK_LEN]` staging
- * array blew BPF's hard 512-byte kernel stack limit -- invisible in
- * ordinary userspace C, real here) and was fixed by writing summed values
- * straight into the packet under the lock instead of staging them on the
- * stack; that is a genuine bug this compile step caught. The honest
- * remaining status is "compiles to valid bytecode, not yet run through
- * the in-kernel verifier or loaded onto a real interface."
+ * `.maps`, and `license` sections via `llvm-readelf -S`) -- this machine
+ * has no Linux kernel, and libbpf has no macOS build (see
+ * docs/DEV_ENVIRONMENT.md), but clang's BPF *codegen* backend needs
+ * neither, only the struct layouts and helper IDs vendored in
+ * bpf_compat.h. What this compile step does NOT catch: the in-kernel BPF
+ * *verifier* only runs at load time (the `bpf()` syscall on a real Linux
+ * box) and checks things codegen alone cannot -- e.g. whether every code
+ * path's pointer arithmetic stays provably in-bounds. An early version of
+ * this function DID fail at the codegen stage (a
+ * `final_sum[NETSUM_MAX_CHUNK_LEN]` staging array blew BPF's hard 512-byte
+ * kernel stack limit) and was fixed by writing summed values straight into
+ * the packet under the lock instead of staging them on the stack -- a
+ * genuine bug this compile step caught. Measured with
+ * `clang -target bpf -O2 -fstack-usage`: this function currently uses 328
+ * of the 512 allowed bytes (36% headroom) -- real margin today, but the
+ * `struct grad_slot fresh` local (~300 bytes on its own) means raising
+ * NETSUM_MAX_CHUNK_LEN in the future can reintroduce the exact same
+ * class of failure (reproduced deliberately during review by bumping it
+ * to 128, which immediately fails to compile again).
+ *
+ * Also measured, not assumed: the two `#pragma unroll` loops that have a
+ * data-dependent early `break` (the accumulate loop and the write-back
+ * loop, both bounded by a packet-derived chunk_len rather than a literal
+ * constant) do NOT fully unroll under this compiler/flags combination --
+ * `llvm-objdump -d` shows real backward conditional branches for both.
+ * The two loops with no such break (the 10-word IP checksum, the 6-byte
+ * MAC copy) do unroll completely. This is fine on kernels with bounded-loop
+ * verifier support (5.3+, since the trip count is still provably bounded
+ * by NETSUM_MAX_CHUNK_LEN either way) but is a real fact about the
+ * compiled object, not a hypothetical -- claiming "fully unrolled" without
+ * checking would have been wrong.
+ *
+ * A subsequent adversarial review of this file (after the above was
+ * written) found and this version fixes: a critical out-of-bounds-write
+ * risk (the write-back loop used to trust `slot->chunk_len` -- set by
+ * whichever packet created the slot -- to bound writes into the CURRENT
+ * packet's buffer, which was only ever proven safe against THAT packet's
+ * own chunk_len; a chunk_len mismatch between workers could write past
+ * what the verifier could prove safe), an unvalidated num_workers field
+ * that could leak slot_map entries permanently, a forwarded packet that
+ * never updated its own chunk_len field, and a silent, uncounted packet
+ * loss window when config_map isn't populated yet. See the inline
+ * comments at each fix site for the specific mechanism. The honest
+ * remaining status is "compiles to valid bytecode, reviewed and patched
+ * against a real adversarial pass, not yet run through the in-kernel
+ * verifier or loaded onto a real interface."
  *
  * Known, explicit simplifications (see the corrected project spec,
  * docs/PROJECT_SPEC.md, for the design decisions this fixes relative to an
@@ -133,6 +162,32 @@ struct {
     __type(value, struct netsum_config);
 } config_map SEC(".maps");
 
+/* Drop-reason counters, readable from userspace via bpf_map_lookup_elem on
+ * a real box (a small netsum_stats loader is a natural companion to the
+ * config loader). Exists specifically to close the "silent, unacknowledged
+ * data loss" gap an adversarial review of this file found: a completed
+ * aggregation dropped because config_map isn't populated yet used to
+ * vanish with no counter, no bpf_trace_printk, nothing -- this is that
+ * fix, not a general logging facility. */
+enum { STAT_DROPPED_NO_CONFIG = 0 };
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4);
+    __type(key, uint32_t);
+    __type(value, uint64_t);
+} drop_stats SEC(".maps");
+
+static __always_inline void bump_stat(uint32_t stat_key) {
+    uint64_t *cnt = bpf_map_lookup_elem(&drop_stats, &stat_key);
+    if (cnt) {
+        __sync_fetch_and_add(cnt, 1);
+    } else {
+        uint64_t one = 1;
+        bpf_map_update_elem(&drop_stats, &stat_key, &one, BPF_ANY);
+    }
+}
+
 static __always_inline uint16_t ip_checksum(const struct iphdr *iph) {
     /* Full recompute over the 20-byte header (5 x 32-bit words, IHL
      * assumed 5 -- options are rejected before this is ever called): a
@@ -190,9 +245,26 @@ int netsum_xdp_aggregate(struct xdp_md *ctx) {
 
     struct grad_slot *slot = bpf_map_lookup_elem(&slot_map, &key);
     if (!slot) {
+        uint16_t num_workers_hdr = netsum_bpf_ntohs(hdr->num_workers);
+        /* Reject a degenerate or out-of-range num_workers before ever
+         * creating a slot for it -- an adversarial review found that
+         * num_workers==0 makes the completion equality
+         * (contributions_received == num_workers_expected) permanently
+         * unreachable (contributions_received only counts upward from 1),
+         * and anything beyond the dedup bitmap's own range
+         * (MAX_TRACKED_WORKERS_BITMAP_BYTES*8) is meaningless as a worker
+         * count. Either case would otherwise leak one of the 65536
+         * slot_map entries forever, with no TTL/eviction anywhere in this
+         * program -- enough bad packets exhausts the map and starts
+         * XDP_DROPping brand-new, legitimate traffic. Rejecting here,
+         * before the slot exists, is cheaper and simpler than detecting
+         * and cleaning up an already-created unkillable slot later. */
+        if (num_workers_hdr == 0 || num_workers_hdr > MAX_TRACKED_WORKERS_BITMAP_BYTES * 8) {
+            return XDP_DROP;
+        }
         struct grad_slot fresh = {0};
         fresh.chunk_len = chunk_len;
-        fresh.num_workers_expected = netsum_bpf_ntohs(hdr->num_workers);
+        fresh.num_workers_expected = num_workers_hdr;
         if (bpf_map_update_elem(&slot_map, &key, &fresh, BPF_NOEXIST) != 0) {
             /* Lost the race to create this slot -- another CPU's packet for
              * the same key got there first between our lookup and update.
@@ -219,6 +291,28 @@ int netsum_xdp_aggregate(struct xdp_md *ctx) {
     uint16_t final_chunk_len = 0;
 
     bpf_spin_lock(&slot->lock);
+
+    /* Reject a contribution whose chunk_len disagrees with the slot's
+     * established chunk_len (fixed by whichever packet created it). This
+     * closes a critical finding from an adversarial review: the
+     * write-back loop below bounds itself with `slot->chunk_len`, but the
+     * ONLY thing that proved `values[]` safe to write into was the bounds
+     * check against THIS packet's own `chunk_len` (line ~180, checked
+     * against data_end). Those two are only provably the same pointer-safe
+     * extent once they're checked equal -- which is exactly what this
+     * does, before either value is trusted for anything past this point.
+     * Without this check, a later worker sending a different chunk_len
+     * than the slot's creator could make the write-back loop write past
+     * what was ever verified safe for its own buffer, or at minimum
+     * silently sum an inconsistent, wrong-length gradient chunk. Rejecting
+     * one malformed/inconsistent contribution, not the whole slot, means a
+     * single misconfigured worker can't poison an otherwise-healthy
+     * aggregation for everyone else. */
+    if (slot->chunk_len != chunk_len) {
+        bpf_spin_unlock(&slot->lock);
+        return XDP_DROP;
+    }
+
     uint8_t byte = slot->seen_worker[worker_id / 8];
     uint8_t bit = (uint8_t)(1 << (worker_id % 8));
     if (!(byte & bit)) {
@@ -246,14 +340,33 @@ int netsum_xdp_aggregate(struct xdp_md *ctx) {
 
     if (!is_complete) return XDP_DROP;  /* partial contribution: fully absorbed */
 
-    bpf_map_delete_elem(&slot_map, &key);  /* mirrors userspace_agg's free_slot() -- bounded map growth */
-
+    /* Config checked BEFORE the slot is torn down -- not because this
+     * makes the completed aggregation recoverable (an adversarial review
+     * correctly noted it doesn't: a retransmitted "last worker" packet
+     * would just be caught by the seen_worker dedup check above before
+     * ever re-reaching completion logic, so there is no real retry path
+     * either way), but because a dropped-for-missing-config completion
+     * must not vanish with zero observability the way it used to. Bumping
+     * a counter here is the fix; a full retry-safe redesign (e.g. clearing
+     * the relevant dedup bit so a retransmit could re-trigger completion)
+     * is a real, separate piece of future work, not attempted here. */
     uint32_t cfg_key = 0;
     struct netsum_config *cfg = bpf_map_lookup_elem(&config_map, &cfg_key);
-    if (!cfg) return XDP_DROP;  /* no downstream configured yet -- can't forward anywhere meaningful */
+    if (!cfg) {
+        bpf_map_delete_elem(&slot_map, &key);
+        bump_stat(STAT_DROPPED_NO_CONFIG);
+        return XDP_DROP;
+    }
+    bpf_map_delete_elem(&slot_map, &key);  /* mirrors userspace_agg's free_slot() -- bounded map growth */
 
     hdr->worker_id = netsum_bpf_htons(0);
     hdr->num_workers = netsum_bpf_htons(1);  /* tells the receiver: exactly one contribution closes this slot */
+    /* Fixed: an earlier version never rewrote this field, so the forwarded
+     * packet could carry the completing packet's own original chunk_len
+     * instead of final_chunk_len -- harmless now that the consistency
+     * check above guarantees they're equal, but writing it explicitly
+     * documents the invariant instead of relying on it silently. */
+    hdr->chunk_len = netsum_bpf_htons(final_chunk_len);
 
     /* Retarget L2/L3/L4 destination at the configured parameter server. */
 #pragma unroll
