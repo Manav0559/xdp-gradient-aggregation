@@ -123,8 +123,9 @@
       <p class="tagline">
         In-network gradient aggregation on commodity Linux via XDP/eBPF, reproducing
         <a href="https://www.usenix.org/conference/nsdi21/presentation/lao">ATP</a> (NSDI 2021 Best Paper)
-        without a programmable switch. This page charts real measurements from the two working
-        benchmark baselines — no-aggregation vs. userspace aggregation — and correctness-suite status.
+        without a programmable switch. This page charts real measurements from the userspace
+        benchmark baselines, the real-kernel XDP verification/fuzzing CI results, and multi-tenant
+        fairness — all backed by a real, runnable command in this repo, nothing aspirational.
       </p>
       <p class="sub">
         Renders <code>bench/results.csv</code> directly, client-side, no build step. Regenerate with
@@ -149,9 +150,10 @@
     <p class="desc">
       In <code>noagg</code>, every worker's contribution reaches the parameter server individually.
       In <code>useragg</code>, the aggregator absorbs every partial contribution (never forwarded — the
-      same <code>XDP_DROP</code>-shaped behavior the eventual kernel program uses) and emits exactly
-      one summed packet once the slot is complete. This is ATP's core mechanism, reproduced here in
-      userspace before the kernel version exists.
+      same <code>XDP_DROP</code> behavior the real kernel program uses, verified on a live Linux kernel
+      in CI) and emits exactly one summed packet once the slot is complete. This is ATP's core
+      mechanism, measured here against the userspace baseline while the XDP path's own latency number
+      (below) is still pending.
     </p>
     <div class="chart-grid">
       <div class="chart-card">
@@ -175,8 +177,10 @@
       testbed, so absolute numbers include real OS-scheduling jitter (visibly worse at higher worker
       counts). <strong>useragg is not expected to beat noagg here</strong> — it adds one extra network
       hop (worker → aggregator → parameter server) for the same total per-packet processing work;
-      proving a latency win is the eventual XDP kernel-path's job, which this baseline exists to be
-      compared against once it's runnable (see <code>docs/DEV_ENVIRONMENT.md</code>).
+      proving a latency win is the XDP kernel-path's job, which this baseline exists to be compared
+      against. The XDP program is now verifier-accepted and loaded on a real kernel in CI (see
+      §05 below) — its own measured per-packet latency (via <code>BPF_PROG_TEST_RUN</code>) is the
+      one number still missing to complete this comparison.
     </p>
     <div id="latencyChart"><div class="loading-state">Loading…</div></div>
     <div class="legend" id="latencyLegend"></div>
@@ -580,7 +584,7 @@
 
   addStatTiles([
     { label: "Correctness tests", value: "10 / 10", note: "python3 tests/test_correctness.py" },
-    { label: "XDP program", value: "compiles", note: "make bpf — real eBPF bytecode, not yet load-tested" },
+    { label: "XDP program", value: "verified", note: "loaded + verifier-accepted on a real kernel in CI (xdp-loadtest.yml)" },
   ], "static");
 
   loadBenchSection();
