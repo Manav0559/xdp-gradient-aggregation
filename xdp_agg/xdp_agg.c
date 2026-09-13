@@ -178,6 +178,16 @@ struct netsum_config {
     uint16_t _pad;
     uint32_t ps_ip;    /* network byte order */
     uint16_t ps_port;  /* network byte order */
+    /* Multi-tenant fairness admission quota -- kernel-side port of
+     * userspace_agg.c's `g_job_quota` CLI arg (see that file's header
+     * comment). 0 = unlimited, the exact same convention userspace uses,
+     * so existing/default behavior (this field zero-initialized, e.g. by
+     * ci/netsum_cfg_loader.c's callers that never pass a quota) is
+     * unchanged unless a caller explicitly sets it. Host-native byte
+     * order (unlike ps_ip/ps_port): this value never goes on the wire, it
+     * only ever gets compared against an in-kernel counter. */
+    uint16_t _pad2;
+    uint32_t max_slots_per_job;
 };
 
 struct {
@@ -194,6 +204,28 @@ struct {
     __type(value, struct netsum_config);
 } config_map SEC(".maps");
 
+/* Multi-tenant fairness -- kernel-side port of userspace_agg.c's
+ * `g_jobs`/`find_or_create_job()` mechanism (see that file's header
+ * comment; its title-quoted rationale -- ATP's paper is literally
+ * "...for Multi-tenant Learning" -- applies here verbatim). One entry per
+ * distinct job_id, tracking how many concurrently-incomplete slots that
+ * job currently holds. Deliberately simpler than userspace's version:
+ * userspace hand-rolls open-addressing over a fixed array because it has
+ * no hash-map primitive of its own; a BPF_MAP_TYPE_HASH already IS a real
+ * hash table (the kernel handles collision resolution), so there is no
+ * probing logic to port, just the one-entry-per-job_id concept.
+ * max_entries=256 matches userspace's JOB_TABLE_CAPACITY. */
+struct job_quota_entry {
+    uint32_t concurrent_slots;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, uint32_t);  /* job_id */
+    __type(value, struct job_quota_entry);
+} job_quota_map SEC(".maps");
+
 /* Drop-reason counters, readable from userspace via bpf_map_lookup_elem on
  * a real box (a small netsum_stats loader is a natural companion to the
  * config loader). Exists specifically to close the "silent, unacknowledged
@@ -201,7 +233,15 @@ struct {
  * aggregation dropped because config_map isn't populated yet used to
  * vanish with no counter, no bpf_trace_printk, nothing -- this is that
  * fix, not a general logging facility. */
-enum { STAT_DROPPED_NO_CONFIG = 0 };
+enum {
+    STAT_DROPPED_NO_CONFIG = 0,
+    /* A new-slot admission rejected because its job_id was already at
+     * cfg->max_slots_per_job concurrently-incomplete slots -- the kernel
+     * counterpart of userspace_agg.c's `[admission-reject]` log line,
+     * just as a counter instead of a stderr print a kernel program has no
+     * business making on the hot path. */
+    STAT_DROPPED_FAIRNESS_QUOTA = 1,
+};
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -217,6 +257,40 @@ static __always_inline void bump_stat(uint32_t stat_key) {
     } else {
         uint64_t one = 1;
         bpf_map_update_elem(&drop_stats, &stat_key, &one, BPF_ANY);
+    }
+}
+
+/* Bump a job's concurrent_slots by one, creating the job_quota_map entry
+ * (count=1) if this is the job's first tracked slot -- same
+ * lookup-then-BPF_NOEXIST-then-retry race pattern the slot_map creation
+ * above already uses, since two CPUs can create each job's FIRST slot
+ * concurrently. Must be called outside any bpf_spin_lock (it takes none
+ * of its own, but see this file's header comment on lock discipline). */
+static __always_inline void job_quota_increment(uint32_t job_id) {
+    struct job_quota_entry *jq = bpf_map_lookup_elem(&job_quota_map, &job_id);
+    if (jq) {
+        __sync_fetch_and_add(&jq->concurrent_slots, 1);
+        return;
+    }
+    struct job_quota_entry fresh_jq = { .concurrent_slots = 1 };
+    if (bpf_map_update_elem(&job_quota_map, &job_id, &fresh_jq, BPF_NOEXIST) != 0) {
+        /* Lost the race -- another CPU created this job's entry first
+         * (with count=1 for ITS slot). Re-lookup and add ours on top,
+         * exactly like the slot_map creation race above. */
+        jq = bpf_map_lookup_elem(&job_quota_map, &job_id);
+        if (jq) __sync_fetch_and_add(&jq->concurrent_slots, 1);
+    }
+}
+
+/* Decrement a job's concurrent_slots by one on slot teardown (completion
+ * or a completed-but-undeliverable drop) -- mirrors userspace_agg.c's
+ * free_slot(). Uses an atomic add of -1 (matching bump_stat()'s existing
+ * atomic idiom), NOT a plain `count--`, because multiple CPUs can be
+ * completing different slots for the same job_id concurrently. */
+static __always_inline void job_quota_decrement(uint32_t job_id) {
+    struct job_quota_entry *jq = bpf_map_lookup_elem(&job_quota_map, &job_id);
+    if (jq && jq->concurrent_slots > 0) {
+        __sync_fetch_and_add(&jq->concurrent_slots, -1);
     }
 }
 
@@ -294,10 +368,40 @@ int netsum_xdp_aggregate(struct xdp_md *ctx) {
         if (num_workers_hdr == 0 || num_workers_hdr > MAX_TRACKED_WORKERS_BITMAP_BYTES * 8) {
             return XDP_DROP;
         }
+
+        /* Multi-tenant fairness admission check -- kernel port of
+         * userspace_agg.c's find_or_create_slot(): "about to CREATE a
+         * brand-new slot for this job -- this is the one place the
+         * fairness admission policy applies. An existing slot this job
+         * already holds is never affected by its own quota; only a NEW
+         * one can be rejected." Deliberately done here, BEFORE the
+         * slot_map creation attempt below and well before any
+         * bpf_spin_lock is ever taken -- this file's lock-discipline rule
+         * (see header comment) is that no map lookup/update on a map
+         * OTHER than slot_map may happen while slot->lock is held, and
+         * this naturally already satisfies that since slot creation
+         * always precedes locking. cfg is looked up fresh here (not
+         * reusing the completion-time lookup further below, which hasn't
+         * happened yet) -- if config_map is unpopulated (e.g. during
+         * Scenario E's deliberate config wipe), max_slots_per_job reads as
+         * 0/unlimited, the same permissive fallback as every other
+         * not-yet-configured case in this program. */
+        uint32_t precheck_cfg_key = 0;
+        struct netsum_config *precheck_cfg = bpf_map_lookup_elem(&config_map, &precheck_cfg_key);
+        uint32_t max_slots_per_job = precheck_cfg ? precheck_cfg->max_slots_per_job : 0;
+        if (max_slots_per_job > 0) {
+            struct job_quota_entry *jq = bpf_map_lookup_elem(&job_quota_map, &key.job_id);
+            if (jq && jq->concurrent_slots >= max_slots_per_job) {
+                bump_stat(STAT_DROPPED_FAIRNESS_QUOTA);
+                return XDP_DROP;
+            }
+        }
+
         struct grad_slot fresh = {0};
         fresh.chunk_len = chunk_len;
         fresh.num_workers_expected = num_workers_hdr;
-        if (bpf_map_update_elem(&slot_map, &key, &fresh, BPF_NOEXIST) != 0) {
+        int create_rc = bpf_map_update_elem(&slot_map, &key, &fresh, BPF_NOEXIST);
+        if (create_rc != 0) {
             /* Lost the race to create this slot -- another CPU's packet for
              * the same key got there first between our lookup and update.
              * Re-lookup rather than treat this as an error: the winning
@@ -305,6 +409,14 @@ int netsum_xdp_aggregate(struct xdp_md *ctx) {
         }
         slot = bpf_map_lookup_elem(&slot_map, &key);
         if (!slot) return XDP_DROP;  /* map genuinely full; nothing more we can do */
+        if (create_rc == 0) {
+            /* We actually won the creation race for this slot (not just a
+             * re-lookup of one another CPU created first) -- bump this
+             * job's concurrent_slots exactly once per real slot creation,
+             * mirroring userspace's job->concurrent_slots++ which only
+             * fires in the branch that actually allocates a fresh slot. */
+            job_quota_increment(key.job_id);
+        }
     }
 
     /* No `int32_t final_sum[NETSUM_MAX_CHUNK_LEN]` staging copy here -- an
@@ -410,10 +522,18 @@ int netsum_xdp_aggregate(struct xdp_md *ctx) {
     struct netsum_config *cfg = bpf_map_lookup_elem(&config_map, &cfg_key);
     if (!cfg) {
         bpf_map_delete_elem(&slot_map, &key);
+        /* Slot is torn down either way -- decrement its job's fairness
+         * quota count here too (not just on the successful-forward path
+         * below), same as userspace's free_slot() decrementing
+         * unconditionally on eviction. Safe to call outside any lock (see
+         * this file's lock-discipline note at the admission-check site
+         * above): we are well past bpf_spin_unlock() by this point. */
+        job_quota_decrement(key.job_id);
         bump_stat(STAT_DROPPED_NO_CONFIG);
         return XDP_DROP;
     }
     bpf_map_delete_elem(&slot_map, &key);  /* mirrors userspace_agg's free_slot() -- bounded map growth */
+    job_quota_decrement(key.job_id);
 
     hdr->worker_id = netsum_bpf_htons(0);
     hdr->num_workers = netsum_bpf_htons(1);  /* tells the receiver: exactly one contribution closes this slot */
