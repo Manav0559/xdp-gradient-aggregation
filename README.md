@@ -29,9 +29,46 @@ python3 scripts/benchmark.py      # runs the real noagg-vs-useragg benchmark swe
 | `worker/worker.c` | Synthetic gradient-chunk sender | Done, tested |
 | `paramserver/paramserver.c` | Baseline #1 (no aggregation) — sums raw contributions itself | Done, tested |
 | `userspace_agg/agg.c` | Baseline #2 — the *same* slot/accumulate/emit algorithm the XDP program runs, as an ordinary socket program; now also enforces a per-job **multi-tenant fairness quota** (see below) | Done, tested |
-| `xdp_agg/xdp_agg.c` | The actual kernel-space aggregator | Compiles to valid eBPF bytecode (`make bpf`); reviewed and patched against an adversarial pass (see below); not yet load-tested against a real in-kernel verifier — needs a real Linux kernel, see [`docs/DEV_ENVIRONMENT.md`](docs/DEV_ENVIRONMENT.md) |
+| `xdp_agg/xdp_agg.c` | The actual kernel-space aggregator | **Verified on a real Linux kernel** — loaded, verifier-accepted, and driven with real UDP traffic in CI (see below); this dev machine still can't run it directly (macOS has no Linux kernel), but that's now closed via CI rather than an open gap |
 | `scripts/benchmark.py` | Real measurement harness across a worker-count sweep | Done, real data in `bench/results.csv` |
 | `dashboard/index.html` | Live results dashboard charting `bench/results.csv` | Done |
+
+### Real-kernel verification (closing the project's single biggest gap)
+
+Every prior claim about `xdp_agg.c` was argued from `clang -target bpf`
+codegen success alone — the file's own header comment admitted plainly that
+it had "compiled to valid bytecode... not yet run through the in-kernel
+verifier or loaded onto a real interface." That's now closed:
+[`.github/workflows/xdp-loadtest.yml`](.github/workflows/xdp-loadtest.yml)
+runs on a real `ubuntu-latest` Linux kernel (this macOS dev machine
+categorically cannot do this — GitHub Actions CI is what makes it possible
+at all), builds a veth pair across two network namespaces (the standard
+kernel-selftests pattern), loads the compiled object with `bpftool`,
+attaches it to the veth via `xdpgeneric`, populates its config map with a
+small libbpf-based loader (`ci/netsum_cfg_loader.c`), and drives it with
+real UDP gradient traffic — including every adversarial scenario an earlier
+human code review found bugs in (chunk_len mismatch, a truncated packet,
+`num_workers` 0/oversized, a missing config map).
+
+**This found a real bug clang's codegen-only compile could never have
+caught:** the real verifier rejected the original object —
+`invalid access to packet ... R3 offset is outside of the packet` — because
+the accumulate/write-back loops don't fully unroll (already documented in
+the file's own header comment) and the verifier doesn't carry a single
+upfront bounds proof through a loop's back-edge with enough precision to
+accept a per-iteration packet-pointer dereference. Fixed with the standard
+idiom: a redundant, logically-no-op `(values + i + 1) > data_end` re-check
+immediately before each dereference, giving the verifier a fresh, local
+proof at the access site. With that fix, the workflow is green: the
+verifier accepts the program (`processed 55542 insns`, captured in a build
+artifact), `bpftool prog show` confirms it's really loaded and JITed
+(`xlated 2760B jited 1679B`), a real multi-worker round sums correctly
+through the live program, and every adversarial input is correctly
+rejected — including `drop_stats[STAT_DROPPED_NO_CONFIG]` actually
+incrementing on a real kernel, not a userspace model of one. Honest scope
+note: this uses `xdpgeneric` (SKB) mode, which is what a software veth
+supports — native driver-mode XDP on real NIC hardware remains untested
+(see Stretch Goals in `docs/PROJECT_SPEC.md`).
 
 ### Multi-tenant fairness (ATP's actual headline contribution)
 
