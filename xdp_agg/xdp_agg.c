@@ -320,6 +320,28 @@ int netsum_xdp_aggregate(struct xdp_md *ctx) {
 #pragma unroll
         for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++) {
             if (i >= chunk_len) break;
+            /* Redundant, per-iteration re-check of `values+i` against
+             * data_end, immediately before the packet-pointer dereference
+             * below -- discovered to be REQUIRED, not just defensive, by
+             * .github/workflows/xdp-loadtest.yml actually loading this
+             * program through a real Linux kernel's BPF verifier: this
+             * loop does not fully unroll (see this file's header
+             * comment), and the verifier will NOT carry the single
+             * `(values + chunk_len) > data_end` proof taken once before
+             * this loop through the loop's own back-edge with enough
+             * precision to accept a `values[i]` access inside it --
+             * observed verifier rejection was exactly "invalid access to
+             * packet ... R3 offset is outside of the packet" at this
+             * dereference. clang -target bpf codegen alone could not
+             * have caught this; only a real verifier run could, and did.
+             * Logically a no-op on this path (i < chunk_len is already
+             * established, and chunk_len was already checked against
+             * data_end above), but giving the verifier a fresh,
+             * syntactically-local bounds check at the access site is the
+             * standard, documented way real XDP programs satisfy its
+             * per-dereference packet-pointer proof requirement inside a
+             * loop it won't fully unroll. */
+            if ((void *)(values + i + 1) > data_end) break;
             slot->sum[i] += (int32_t)netsum_bpf_ntohl((uint32_t)values[i]);
         }
         slot->contributions_received++;
@@ -329,6 +351,8 @@ int netsum_xdp_aggregate(struct xdp_md *ctx) {
 #pragma unroll
             for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++) {
                 if (i >= final_chunk_len) break;
+                /* Same fix, same reason, for the write-back direction. */
+                if ((void *)(values + i + 1) > data_end) break;
                 values[i] = (int32_t)netsum_bpf_htonl((uint32_t)slot->sum[i]);
             }
         }
