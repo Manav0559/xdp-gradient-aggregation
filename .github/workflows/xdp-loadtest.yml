@@ -32,8 +32,9 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y clang llvm gcc libbpf-dev libelf-dev python3
+          sudo apt-get install -y clang llvm gcc libbpf-dev libelf-dev python3 iproute2
           sudo modprobe veth || true
+          sudo modprobe sch_netem || true  # netem qdisc for the loss/reorder sweep, below
           sudo apt-get install -y bpftool || \
             sudo apt-get install -y linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" || true
           # Gotcha: Ubuntu's /usr/sbin/bpftool is a wrapper script that gates
@@ -277,6 +278,139 @@ jobs:
           sleep 1
           python3 ci/assert_paramserver.py /tmp/ps.log 106 require 2 1.0
 
+      - name: "Scenario G: kernel-side fairness quota rejects a greedy job's excess slots, isolating a second job"
+        run: |
+          set -euo pipefail
+          # Kernel port of tests/test_correctness.py's
+          # test_fairness_quota_isolates_greedy_job, replayed against the
+          # REAL loaded xdp_agg.o instead of only the userspace binary.
+          # Set max_slots_per_job=2 in config_map (same ps_mac/ip/port as
+          # before, plus the new field) -- the only place this quota is
+          # configured from, per xdp_agg.c's new struct netsum_config field.
+          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 2
+          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/config_map
+          # Job 900: greedy job opening 3 concurrent incomplete slots
+          # (rounds 0-2, only worker_id=0 of num_workers=2 ever sends, so
+          # none of these slots ever completes/frees). With quota=2,
+          # round 2's slot-creation attempt must be rejected outright.
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 900 0 2 3 1 1.0 0.5
+          sleep 0.5
+          # Job 901: a different job_id's single, well-behaved,
+          # self-contained round (num_workers=1) -- must complete normally,
+          # unaffected by job 900 already sitting at its own quota.
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 901 0 1 1 1 1.0 2.0
+          sleep 1
+          echo "--- slot_map (expect exactly 2 stuck entries for job 900, rounds 0 and 1) ---"
+          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map
+          echo "--- job_quota_map (expect job 900 concurrent_slots=2, the quota ceiling) ---"
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/job_quota_map > /tmp/job_quota.json
+          cat /tmp/job_quota.json
+          python3 ci/check_job_quota.py /tmp/job_quota.json 900 2
+          echo "--- drop_stats (expect STAT_DROPPED_FAIRNESS_QUOTA=1 bumped exactly once) ---"
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/drop_stats > /tmp/drop_stats_quota.json
+          cat /tmp/drop_stats_quota.json
+          python3 ci/check_drop_stat.py /tmp/drop_stats_quota.json 1
+          # Job 900 must never complete (worker 1 never sends); job 901 must.
+          python3 ci/assert_paramserver.py /tmp/ps.log 900 forbid
+          python3 ci/assert_paramserver.py /tmp/ps.log 901 require 1 2.0
+          # Reset the quota to unlimited (0) so it doesn't affect the netem
+          # sweep scenarios below, which use fresh job_ids of their own but
+          # should otherwise see the same default (pre-Scenario-G) behavior.
+          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 0
+
+      - name: "Scenario H: netem 20% loss -- a full round still completes correctly via redundant sends"
+        run: |
+          set -euo pipefail
+          # netem is applied on veth1 (the ns1 end where worker/paramserver
+          # run), per the workflow's own veth0(root)/veth1(ns1) split --
+          # this genuinely perturbs traffic reaching/leaving the
+          # XDP-attached veth0, not a no-op on the wrong interface.
+          sudo ip netns exec ns1 tc qdisc add dev veth1 root netem loss 20%
+          sudo ip netns exec ns1 tc qdisc show dev veth1
+          # Experimental design: with a real, uncontrolled 20% per-packet
+          # loss rate, a single send per worker would only complete
+          # ~51% of the time (0.8^3 for 3 independent single-packet
+          # sends). Rather than accept a flaky ~50% pass rate, each
+          # worker's single round is sent 5 times (all 5 identical
+          # packets land on the same slot; xdp_agg.c's seen_worker dedup
+          # bitmap silently absorbs the duplicates that do arrive) --
+          # per-worker delivery failure probability drops to 0.2^5 =
+          # 0.00032, i.e. round failure probability across all 3 workers
+          # is bounded by ~0.001, low enough not to flake CI while still
+          # exercising the REAL netem-perturbed path.
+          for worker_id in 0 1 2; do
+            for attempt in 1 2 3 4 5; do
+              sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 950 "$worker_id" 3 1 1 1.0 1.0 || true
+            done
+          done
+          sleep 1.5
+          python3 ci/assert_paramserver.py /tmp/ps.log 950 require 3 3.0
+          echo "--- veth1 (ns1) counters after the lossy round ---"
+          sudo ip netns exec ns1 ip -s link show veth1
+
+      - name: "Scenario I: netem delay+reorder -- a full round still completes correctly (sum is order-independent)"
+        run: |
+          set -euo pipefail
+          # Swap the qdisc for delay+reorder: `reorder` on its own is a
+          # documented netem no-op without a correlated `delay` term (a
+          # reordered packet needs something to reorder AROUND), so this
+          # is the standard idiom for exercising real packet reordering.
+          sudo ip netns exec ns1 tc qdisc change dev veth1 root netem delay 50ms 20ms reorder 25% 50%
+          sudo ip netns exec ns1 tc qdisc show dev veth1
+          # Same redundant-send design as Scenario H (belt-and-suspenders
+          # against any residual loss from the delay jitter); the actual
+          # property under test here is that xdp_agg.c's slot/accumulate
+          # logic is commutative in arrival order -- summing worker
+          # contributions in whatever order they truly arrive, reordered
+          # or not, must produce the same total.
+          for worker_id in 0 1 2; do
+            for attempt in 1 2 3; do
+              sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 951 "$worker_id" 3 1 1 1.0 1.0 || true
+            done
+          done
+          sleep 2
+          python3 ci/assert_paramserver.py /tmp/ps.log 951 require 3 3.0
+
+      - name: "Scenario J (honest finding): a netem-dropped worker packet leaves its slot stuck forever -- no TTL"
+        run: |
+          set -euo pipefail
+          # This is the actually-interesting, expected-to-be-real finding
+          # this scenario exists to measure, not assert away: xdp_agg.c
+          # has no TTL/eviction mechanism at all (see its header comment
+          # and userspace_agg.c's, which explicitly call this out as
+          # separate, out-of-scope follow-up work needing bpf_timer on a
+          # 5.15+ kernel). A worker whose contribution is permanently lost
+          # mid-round should leave its slot stuck in slot_map forever --
+          # this proves that empirically against the REAL loaded program,
+          # rather than leaving it a theoretical risk.
+          #
+          # Deterministic construction (not relying on netem's own random
+          # loss rate to happen to hit the right packet, which would be
+          # flaky): send workers 0 and 1 with netem CLEAN (loss 0%), then
+          # switch netem to loss 100% for worker 2's single send -- that
+          # packet is now genuinely, certainly dropped by netem itself
+          # (not just "we chose not to send it"), simulating a real
+          # dropped-worker-packet loss event. Then restore netem to clean.
+          sudo ip netns exec ns1 tc qdisc change dev veth1 root netem loss 0%
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 952 0 3 1 1 1.0 1.0
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 952 1 3 1 1 1.0 1.0
+          sleep 0.3
+          sudo ip netns exec ns1 tc qdisc change dev veth1 root netem loss 100%
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 952 2 3 1 1 1.0 1.0
+          sleep 0.3
+          sudo ip netns exec ns1 tc qdisc change dev veth1 root netem loss 0%
+          sleep 1
+          echo "--- paramserver log (job 952 must never appear -- its 3rd contribution never arrived) ---"
+          python3 ci/assert_paramserver.py /tmp/ps.log 952 forbid
+          echo "--- slot_map (measure, don't assume: confirm job 952's incomplete slot is STILL there) ---"
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_952.json
+          cat /tmp/slot_map_952.json
+          python3 ci/check_slot_present.py /tmp/slot_map_952.json 952 present
+          # Teardown -- remove the netem qdisc so it doesn't outlive this
+          # scenario (the netns is torn down at the end of the job anyway,
+          # but doing it explicitly documents the impairment window).
+          sudo ip netns exec ns1 tc qdisc del dev veth1 root || true
+
       - name: Collect final evidence (paramserver log, verifier log, map state)
         if: always()
         run: |
@@ -286,7 +420,7 @@ jobs:
           echo "--- final drop_stats ---"
           sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/drop_stats > /tmp/drop_stats_final.json 2>&1
           cat /tmp/drop_stats_final.json
-          echo "--- final slot_map (should be empty -- every slot completes or is deleted) ---"
+          echo "--- final slot_map (Scenarios A-F/H/I complete or reject cleanly; Scenario G leaves 2 stuck job-900 entries -- fairness quota rejects admission, it does not evict; Scenario J leaves 1 stuck job-952 entry -- the documented, no-TTL leak) ---"
           sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_final.json 2>&1
           cat /tmp/slot_map_final.json
           exit 0
@@ -307,6 +441,9 @@ jobs:
             /tmp/drop_stats.json
             /tmp/drop_stats_final.json
             /tmp/slot_map_final.json
+            /tmp/job_quota.json
+            /tmp/drop_stats_quota.json
+            /tmp/slot_map_952.json
 
       - name: Tear down netns/veth/pinned objects
         if: always()
