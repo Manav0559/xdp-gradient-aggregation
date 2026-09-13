@@ -69,6 +69,7 @@
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,10 +130,21 @@ static slot_t g_slots[SLOT_TABLE_CAPACITY];
  * reject it -- it does not touch slots the job already has in flight. */
 static long g_job_quota = 0;  /* 0 = unlimited */
 
+/* Jain's-fairness-index sweep support (scripts/fairness_sweep.py):
+ * admitted_count/rejected_count are cumulative, monotonic per-job counters
+ * -- unlike concurrent_slots (which drops back down whenever a slot frees),
+ * these never decrease, so they always answer "since this job first showed
+ * up, how many of its new-slot attempts were let in vs. turned away." Both
+ * are bumped at the exact same two call sites concurrent_slots already is
+ * (see find_or_create_slot()), so they cost nothing extra on the
+ * request path beyond one more integer increment next to one that was
+ * already there. */
 typedef struct {
     int in_use;
     uint32_t job_id;
     uint32_t concurrent_slots;
+    uint32_t admitted_count;
+    uint32_t rejected_count;
 } job_entry_t;
 
 static job_entry_t g_jobs[JOB_TABLE_CAPACITY];
@@ -148,7 +160,11 @@ static job_entry_t *find_or_create_job(uint32_t job_id) {
     for (size_t probe = 0; probe < JOB_TABLE_CAPACITY; probe++) {
         size_t idx = (h + probe) & (JOB_TABLE_CAPACITY - 1);
         job_entry_t *j = &g_jobs[idx];
-        if (!j->in_use) { j->in_use = 1; j->job_id = job_id; j->concurrent_slots = 0; return j; }
+        if (!j->in_use) {
+            j->in_use = 1; j->job_id = job_id; j->concurrent_slots = 0;
+            j->admitted_count = 0; j->rejected_count = 0;
+            return j;
+        }
         if (j->job_id == job_id) return j;
     }
     return NULL;  /* more than JOB_TABLE_CAPACITY distinct concurrent job_ids -- not expected at benchmark scale */
@@ -177,6 +193,7 @@ static slot_t *find_or_create_slot(uint32_t job_id, uint32_t round, uint32_t chu
              * its own quota; only a NEW one can be rejected. */
             job_entry_t *job = find_or_create_job(job_id);
             if (job && g_job_quota > 0 && job->concurrent_slots >= (uint32_t)g_job_quota) {
+                job->rejected_count++;
                 return NULL;
             }
             memset(s, 0, sizeof(*s));
@@ -184,7 +201,7 @@ static slot_t *find_or_create_slot(uint32_t job_id, uint32_t round, uint32_t chu
             s->job_id = job_id;
             s->round = round;
             s->chunk_id = chunk_id;
-            if (job) job->concurrent_slots++;
+            if (job) { job->concurrent_slots++; job->admitted_count++; }
             return s;
         }
         if (s->job_id == job_id && s->round == round && s->chunk_id == chunk_id) {
@@ -210,6 +227,56 @@ static long now_micros(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (long)tv.tv_sec * 1000000L + tv.tv_usec;
+}
+
+/* Jain's-fairness-index sweep stats emission (scripts/fairness_sweep.py):
+ * driven entirely from OUTSIDE this process (a SIGUSR1 sent by the sweep
+ * script), not by a new listener socket or a per-packet log line -- this
+ * flag is the only thing the signal handler itself touches (async-signal-
+ * safe: sig_atomic_t, no I/O in the handler), and the actual dump happens
+ * on the main loop's own thread the next time it's checked, exactly like
+ * the existing TTL-reaper's periodic sweep. */
+static volatile sig_atomic_t g_dump_stats_requested = 0;
+
+static void handle_sigusr1(int sig) {
+    (void)sig;
+    g_dump_stats_requested = 1;
+}
+
+/* Deliberately no SA_RESTART: when slot_ttl_ms==0 (the original, still-
+ * default behavior), in_sock's recvfrom() blocks with no timeout at all --
+ * without SA_RESTART, a delivered SIGUSR1 interrupts that blocking call
+ * (EINTR) instead of silently resuming it, so the stats dump below runs
+ * promptly instead of waiting for a packet that may never come. The main
+ * loop's existing `n < NETSUM_HDR_SIZE` check already treats EINTR's -1
+ * return as a harmless no-op iteration, the same as the SO_RCVTIMEO
+ * EWOULDBLOCK case slot_ttl_ms>0 relies on -- see the header comment's
+ * "Mechanism note." */
+static void install_sigusr1_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sigusr1;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGUSR1, &sa, NULL);
+}
+
+/* Dumps one JSON line per currently-tracked job to stderr: {job_id,
+ * concurrent_slots, admitted_count, rejected_count}. concurrent_slots is
+ * the live, momentary occupancy (drops back down when a slot frees);
+ * admitted_count/rejected_count are the cumulative counters above. A
+ * "[stats]" prefix lets a sweep script grep its own signal-request out of
+ * whatever else this process is logging, the same convention
+ * "[admission-reject]" and "[reaped]" already use. */
+static void dump_job_stats(void) {
+    for (size_t i = 0; i < JOB_TABLE_CAPACITY; i++) {
+        job_entry_t *j = &g_jobs[i];
+        if (!j->in_use) continue;
+        fprintf(stderr,
+            "[stats] {\"job_id\":%u,\"concurrent_slots\":%u,\"admitted_count\":%u,\"rejected_count\":%u}\n",
+            j->job_id, j->concurrent_slots, j->admitted_count, j->rejected_count);
+    }
+    fflush(stderr);
 }
 
 /* Slot-TTL reaper: a plain linear scan of the fixed-size slot table. This
@@ -248,7 +315,11 @@ int main(int argc, char **argv) {
             "  slot_ttl_ms: eviction timeout for a slot that never completes\n"
             "  (e.g. a crashed/dropped worker) -- 0 = disabled, the original\n"
             "  behavior. Without this, an incomplete slot occupies its\n"
-            "  g_slots entry AND its job's fairness-quota allowance forever.\n",
+            "  g_slots entry AND its job's fairness-quota allowance forever.\n"
+            "  SIGUSR1 (send from outside, e.g. scripts/fairness_sweep.py):\n"
+            "  dumps one '[stats] {...}' JSON line per tracked job_id to\n"
+            "  stderr -- {job_id, concurrent_slots, admitted_count,\n"
+            "  rejected_count} -- for a formal Jain's-fairness-index sweep.\n",
             argv[0]);
         return 1;
     }
@@ -258,6 +329,8 @@ int main(int argc, char **argv) {
     long max_packets = argc > 4 ? atol(argv[4]) : 0;
     g_job_quota = argc > 5 ? atol(argv[5]) : 0;
     long slot_ttl_ms = argc > 6 ? atol(argv[6]) : 0;
+
+    install_sigusr1_handler();
 
     int in_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (in_sock < 0) { perror("socket(in)"); return 1; }
@@ -322,8 +395,13 @@ int main(int argc, char **argv) {
             }
         }
 
+        if (g_dump_stats_requested) {
+            dump_job_stats();
+            g_dump_stats_requested = 0;
+        }
+
         ssize_t n = recvfrom(in_sock, in_packet, sizeof(in_packet), 0, NULL, NULL);
-        if (n < (ssize_t)NETSUM_HDR_SIZE) continue;  /* also catches the SO_RCVTIMEO EWOULDBLOCK/EAGAIN wakeup -- not a real error, not counted */
+        if (n < (ssize_t)NETSUM_HDR_SIZE) continue;  /* also catches the SO_RCVTIMEO EWOULDBLOCK/EAGAIN wakeup, and now a SIGUSR1-interrupted recvfrom's EINTR too -- none are real errors, none are counted */
         packets_in++;
 
         struct grad_hdr *hdr = (struct grad_hdr *)in_packet;
