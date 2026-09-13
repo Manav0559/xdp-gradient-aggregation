@@ -46,7 +46,14 @@ jobs:
 
       - name: Build BPF object (real verifier target) and userspace binaries
         run: |
-          make bpf
+          # Plain `clang -target bpf` on Linux doesn't know the host's
+          # multiarch include path, so glibc's stdint.h -> bits/libc-header-
+          # start.h (which lives under /usr/include/<triplet>/, not
+          # /usr/include/ directly) fails to resolve. -idirafter fixes this
+          # without touching the Makefile's macOS-first BPF_CC logic.
+          MULTIARCH=$(gcc -print-multiarch)
+          echo "host multiarch: $MULTIARCH"
+          make bpf BPF_CC="clang -idirafter /usr/include/${MULTIARCH}"
           make
           llvm-objdump -h xdp_agg/xdp_agg.o
           ls -la xdp_agg/xdp_agg.o bin/
