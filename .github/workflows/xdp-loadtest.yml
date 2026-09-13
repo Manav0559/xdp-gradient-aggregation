@@ -102,6 +102,22 @@ jobs:
           sudo ip netns exec ns1 ip addr add 10.200.1.2/24 dev veth1
           sudo ip netns exec ns1 ip link set veth1 up
           sudo ip netns exec ns1 ip link set lo up
+          # This minimal test topology puts BOTH the sending worker and the
+          # receiving paramserver inside ns1 (see workflow header), which
+          # means the completed/forwarded packet xdp_agg.c retargets ends
+          # up with saddr == daddr == 10.200.1.2 -- it only ever rewrites
+          # iph->daddr, never iph->saddr, which is correct for a REAL
+          # deployment (a real parameter server has a genuinely different
+          # IP than any worker) but means this specific test topology's
+          # loopback-shaped traffic needs the kernel's default
+          # "martian packet" protections (accept_local=0, rp_filter)
+          # relaxed on veth1, or the completed packet gets silently
+          # dropped by the IP stack for looking spoofed -- not an
+          # xdp_agg.c bug, a consequence of this test intentionally
+          # colocating both endpoints in one namespace.
+          sudo ip netns exec ns1 sysctl -qw net.ipv4.conf.veth1.accept_local=1
+          sudo ip netns exec ns1 sysctl -qw net.ipv4.conf.veth1.rp_filter=0
+          sudo ip netns exec ns1 sysctl -qw net.ipv4.conf.all.rp_filter=0
           echo "--- veth0 (root ns) ---"
           ip addr show veth0
           echo "--- veth1 (ns1) ---"
@@ -173,10 +189,21 @@ jobs:
       - name: "Scenario A: real multi-worker round completes and sums correctly through the real kernel"
         run: |
           set -euo pipefail
-          for i in 0 1 2; do
-            sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 100 "$i" 3 1 4 1.0 0.25
-          done
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 100 0 3 1 4 1.0 0.25
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 100 1 3 1 4 1.0 0.25
+          sleep 0.3
+          echo "--- slot_map after 2 of 3 contributions (expect ONE entry, not yet complete) ---"
+          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 100 2 3 1 4 1.0 0.25
           sleep 1
+          echo "--- slot_map after all 3 (expect EMPTY -- the completed slot is deleted) ---"
+          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map
+          echo "--- veth0 (root ns) counters after the round ---"
+          ip -s link show veth0
+          echo "--- veth1 (ns1) counters after the round ---"
+          sudo ip netns exec ns1 ip -s link show veth1
+          echo "--- paramserver log so far ---"
+          cat /tmp/ps.log
           python3 ci/assert_paramserver.py /tmp/ps.log 100 require 3 0.75
 
       - name: "Scenario B (adversarial): chunk_len mismatch between workers is rejected, not silently summed"
