@@ -1,0 +1,30 @@
+name: Differential fuzz -- grad_hdr admission checks
+
+# Builds fuzz/fuzz_grad_parse.cpp (userspace_agg/agg.c's vs.
+# xdp_agg/xdp_agg.c's stateless grad_hdr admission-check logic,
+# differentially fuzzed against each other under libFuzzer + AddressSanitizer
+# -- see fuzz/README.md) and runs it for a bounded time against
+# fuzz/corpus/, failing the job on any crash or verdict divergence.
+#
+# This needs no Linux kernel feature at all: it fuzzes the extracted
+# userspace-only logic in fuzz/parse_shared.h, never the live XDP program
+# itself (xdp_agg.c's own header comment is explicit that file has only
+# ever been compiled to BPF bytecode here, never verifier- or load-tested
+# on a real interface) -- so ubuntu-latest's stock clang is enough, no BPF
+# toolchain, no libbpf, no root.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Regenerate seed corpus
+        run: python3 fuzz/generate_corpus.py
+
+      - name: Build and run differential fuzzer (120s)
+        run: fuzz/build_and_run_fuzz.sh 120
