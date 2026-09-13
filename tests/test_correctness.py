@@ -383,6 +383,57 @@ def test_chunk_len_mismatch_rejected_not_silently_summed():
     print("PASS: test_chunk_len_mismatch_rejected_not_silently_summed")
 
 
+def test_fairness_quota_isolates_greedy_job():
+    # Reproduces ATP's actual headline contribution -- its full paper
+    # title is "In-network Aggregation for MULTI-TENANT Learning," not
+    # just streaming aggregation (which SwitchML, ATP's own predecessor,
+    # already had). A per-job admission quota on concurrently-incomplete
+    # slots must isolate one greedy job's excess demand from a second,
+    # well-behaved job sharing the same aggregator -- proving real
+    # starvation-isolation, not just that the quota mechanism compiles.
+    ps_port = free_port()
+    agg_port = free_port()
+    quota = 2
+    ps = Server([PARAMSERVER, str(ps_port), "agg"])
+    # 4 total packets expected: job 900's 3 rounds (each incomplete --
+    # num_workers=2 but only worker_id=0 ever sends, so none of these
+    # slots ever frees its quota slot via free_slot()) plus job 901's
+    # single self-contained round (num_workers=1, completes immediately).
+    agg = Server([AGG, str(agg_port), "127.0.0.1", str(ps_port), "4", str(quota)])
+    try:
+        # Job 900: greedy job opening 3 concurrent incomplete slots
+        # (rounds 0-2). With quota=2, exactly one of the three must be
+        # rejected at admission.
+        run_worker("127.0.0.1", agg_port, job_id=900, worker_id=0, num_workers=2,
+                   num_rounds=3, chunk_len=1, fixed_value=1.0)
+        # Job 901: a different job_id's single, well-behaved round --
+        # must succeed regardless of job 900 already sitting at quota.
+        run_worker("127.0.0.1", agg_port, job_id=901, worker_id=0, num_workers=1,
+                   num_rounds=1, chunk_len=1, fixed_value=2.0)
+        deadline = time.time() + 2.0
+        while agg.proc.poll() is None and time.time() < deadline:
+            agg.drain_for(0.1)
+        agg.drain_for(0.2)
+    finally:
+        agg.stop()
+        ps.stop()
+    text = agg.text()
+    rejects_900 = re.findall(r"\[admission-reject\] job=900 round=(\d+)", text)
+    assert len(rejects_900) == 1, (
+        f"expected exactly 1 of job 900's 3 rounds rejected once its quota={quota} "
+        f"concurrent slots were held, got {rejects_900}\nfull log:\n{text}"
+    )
+    completes = extract_complete_lines(text)
+    job_ids_completed = {int(c[0]) for c in completes}
+    assert 900 not in job_ids_completed, (
+        f"job 900's admitted slots should never complete (worker 1 never sends): {completes}"
+    )
+    assert 901 in job_ids_completed, (
+        f"job 901 must complete normally -- unaffected by job 900 sitting at its own quota:\n{text}"
+    )
+    print("PASS: test_fairness_quota_isolates_greedy_job")
+
+
 def main():
     tests = [
         test_noagg_basic_sum,
@@ -393,6 +444,7 @@ def main():
         test_aggregator_reduces_packet_count,
         test_truncated_packet_not_summed_as_stale_bytes,
         test_chunk_len_mismatch_rejected_not_silently_summed,
+        test_fairness_quota_isolates_greedy_job,
     ]
     failures = 0
     for t in tests:

@@ -179,13 +179,14 @@
     <p class="desc">Every checked item below is backed by a real, runnable command in this repo — nothing here is aspirational.</p>
     <ul class="checklist" id="statusList">
       <li><span class="tick done">[x]</span><span>Wire protocol (<code>protocol/grad_proto.h</code>) — Q16.16 fixed-point, network byte order, shared by every component</span></li>
-      <li><span class="tick done">[x]</span><span>Worker + parameter server (baseline #1, no-aggregation) — <code>make &amp;&amp; python3 tests/test_correctness.py</code>, 6/6 passing</span></li>
+      <li><span class="tick done">[x]</span><span>Worker + parameter server (baseline #1, no-aggregation) — <code>make &amp;&amp; python3 tests/test_correctness.py</code>, 9/9 passing</span></li>
       <li><span class="tick done">[x]</span><span>Userspace aggregator (baseline #2) — same slot/accumulate/emit algorithm the XDP program will run, packet-reduction verified (N→1)</span></li>
       <li><span class="tick done">[x]</span><span>Two real bugs found and fixed during testing: duplicate-worker double-counting, and a select()-vs-buffered-I/O race in the test harness itself</span></li>
       <li><span class="tick done">[x]</span><span>XDP/eBPF kernel program (<code>xdp_agg/xdp_agg.c</code>) — compiles to valid eBPF bytecode (<code>make bpf</code>); a real BPF-stack-limit bug was caught and fixed at this stage</span></li>
       <li><span class="tick done">[x]</span><span>Independent adversarial code review found 10 confirmed issues (2 critical: an out-of-bounds-write risk in the write-back path, and a missing packet-length check in the userspace baseline) — all fixed and regression-tested, see <a href="../xdp_agg/xdp_agg.c">xdp_agg.c</a>'s header comment for the full list</span></li>
+      <li><span class="tick done">[x]</span><span>Multi-tenant fairness — ATP's actual headline contribution (<em>"...for Multi-tenant Learning"</em>): a per-job admission quota in <code>userspace_agg/agg.c</code> caps concurrently-incomplete slots per <code>job_id</code>, proven to isolate a greedy job from starving others via a dedicated regression test</span></li>
       <li><span class="tick pending">[ ]</span><span>XDP program load-tested against the real in-kernel verifier and run on a live interface — needs a real Linux kernel (see <code>docs/DEV_ENVIRONMENT.md</code> for why this dev machine can't do it directly)</span></li>
-      <li><span class="tick pending">[ ]</span><span>Multi-tenant fairness (Jain's index across concurrent jobs) and the full netem loss/reorder correctness sweep</span></li>
+      <li><span class="tick pending">[ ]</span><span>Porting the fairness quota into the XDP kernel program itself, a formal Jain's-fairness-index sweep across concurrent jobs, and the full netem loss/reorder correctness sweep</span></li>
     </ul>
   </section>
 
@@ -391,7 +392,7 @@
   }
 
   addStatTiles([
-    { label: "Correctness tests", value: "8 / 8", note: "python3 tests/test_correctness.py" },
+    { label: "Correctness tests", value: "9 / 9", note: "python3 tests/test_correctness.py" },
     { label: "XDP program", value: "compiles", note: "make bpf — real eBPF bytecode, not yet load-tested" },
   ], "static");
 

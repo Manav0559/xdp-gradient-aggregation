@@ -19,7 +19,7 @@ correctness test suite:
 ```sh
 make                              # builds bin/worker, bin/paramserver, bin/agg
 make bpf                          # compiles xdp_agg/xdp_agg.c to real eBPF bytecode
-python3 tests/test_correctness.py # 8/8 passing
+python3 tests/test_correctness.py # 9/9 passing
 python3 scripts/benchmark.py      # runs the real noagg-vs-useragg benchmark sweep
 ```
 
@@ -28,10 +28,37 @@ python3 scripts/benchmark.py      # runs the real noagg-vs-useragg benchmark swe
 | `protocol/grad_proto.h` | The wire format every other piece includes verbatim — Q16.16 fixed-point (no floats, since the BPF verifier forbids them), network byte order | Done, tested |
 | `worker/worker.c` | Synthetic gradient-chunk sender | Done, tested |
 | `paramserver/paramserver.c` | Baseline #1 (no aggregation) — sums raw contributions itself | Done, tested |
-| `userspace_agg/agg.c` | Baseline #2 — the *same* slot/accumulate/emit algorithm the XDP program runs, as an ordinary socket program | Done, tested |
+| `userspace_agg/agg.c` | Baseline #2 — the *same* slot/accumulate/emit algorithm the XDP program runs, as an ordinary socket program; now also enforces a per-job **multi-tenant fairness quota** (see below) | Done, tested |
 | `xdp_agg/xdp_agg.c` | The actual kernel-space aggregator | Compiles to valid eBPF bytecode (`make bpf`); reviewed and patched against an adversarial pass (see below); not yet load-tested against a real in-kernel verifier — needs a real Linux kernel, see [`docs/DEV_ENVIRONMENT.md`](docs/DEV_ENVIRONMENT.md) |
 | `scripts/benchmark.py` | Real measurement harness across a worker-count sweep | Done, real data in `bench/results.csv` |
 | `dashboard/index.html` | Live results dashboard charting `bench/results.csv` | Done |
+
+### Multi-tenant fairness (ATP's actual headline contribution)
+
+ATP's full paper title is *"In-network Aggregation for **Multi-tenant** Learning"*
+— the fairness mechanism, not bare streaming aggregation, is its real
+contribution (streaming aggregation alone was already in SwitchML, ATP's own
+predecessor). `userspace_agg/agg.c` now reproduces that mechanism: an optional
+`max_slots_per_job` CLI argument caps how many concurrently-incomplete slots
+a single `job_id` may hold in the slot table at once, so one greedy job
+opening many concurrent rounds cannot exhaust the table and starve every
+other job sharing the aggregator.
+
+```sh
+bin/agg <listen_port> <downstream_ip> <downstream_port> [max_packets=0] [max_slots_per_job=0]
+```
+
+A rejected admission logs `[admission-reject] job=... round=... chunk=... --
+slot table full or job at fairness quota, dropping` and is dropped exactly
+like a malformed packet — the job's *other* already-admitted slots, and every
+other job's slots, are unaffected. `tests/test_correctness.py`'s
+`test_fairness_quota_isolates_greedy_job` proves real starvation isolation,
+not just that the mechanism compiles: a greedy job (`job_id=900`) opens 3
+concurrent incomplete slots against a quota of 2 — exactly one is rejected —
+while a second, unrelated job (`job_id=901`) completes normally regardless.
+Not yet done: porting the same quota into the XDP kernel program, and a
+formal Jain's-fairness-index measurement sweep across concurrent jobs (see
+`docs/PROJECT_SPEC.md` §5).
 
 Real bugs were found and fixed during this build (not just written and assumed
 correct) — this is the honest, complete list, not a curated subset:
@@ -73,7 +100,7 @@ worker/         synthetic gradient-chunk sender
 paramserver/    baseline #1 (no aggregation) + the final receiver for #2/#3
 userspace_agg/  baseline #2 (userspace aggregation, same algorithm as XDP)
 xdp_agg/        the kernel-space XDP/eBPF aggregator -- compiles, not yet load-tested
-tests/          correctness test suite (8/8 passing, driving the real binaries)
+tests/          correctness test suite (9/9 passing, driving the real binaries)
 scripts/        benchmark harness -- real measured data in bench/results.csv
 dashboard/      live results dashboard (dark/light, charts bench/results.csv)
 docs/           full project spec (.md + .pdf) and the Linux/XDP dev-environment guide
