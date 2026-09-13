@@ -97,6 +97,15 @@
   .checklist .tick { flex: none; font-family: var(--font-mono); }
   .checklist .tick.done { color: var(--good); }
   .checklist .tick.pending { color: var(--text-muted); }
+  .sig-table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-family: var(--font-mono); margin-top: 4px; }
+  .sig-table th, .sig-table td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  .sig-table th:first-child, .sig-table td:first-child { text-align: left; }
+  .sig-table th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; font-size: 10.5px; }
+  .sig-table td { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+  .sig-table tr:last-child td { border-bottom: none; }
+  .sig-table .yes { color: var(--good); font-weight: 600; }
+  .sig-table .no { color: var(--text-muted); }
+  .table-wrap { overflow-x: auto; }
   .empty-state, .loading-state { padding: 28px 20px; text-align: center; color: var(--text-muted); font-size: 13px; font-family: var(--font-mono);
     border: 1px solid var(--border); border-radius: 8px; background: var(--surface-1); }
   .empty-state { border-style: dashed; }
@@ -174,7 +183,71 @@
   </section>
 
   <section class="panel">
-    <p class="eyebrow">// 03 · project status</p>
+    <p class="eyebrow">// 03 · latency distribution rigor</p>
+    <h2>Percentiles, bootstrap confidence, and significance — not just mean/min/max</h2>
+    <p class="desc">
+      Mean/min/max over a handful of trials is exactly the setup prone to tail-latency effects (the
+      userspace aggregator is explicitly single-threaded — one OS-scheduling gap shows up as a tail
+      outlier, not a shifted mean) and to noise at low trial counts. This panel reads
+      <code>bench/results_percentiles.csv</code> (written by <code>scripts/benchmark.py</code> from the
+      same real per-trial runs as the chart above, now at 30 trials per cell): p50/p95/p99 per config,
+      a bootstrap 95% confidence interval on the median (whiskers on the p50 bars below), and a
+      permutation test — using <a href="https://en.wikipedia.org/wiki/Effect_size#Effect_sizes_based_on_binary_data" target="_blank" rel="noopener">Cliff's delta</a>
+      as a distribution-free effect size, the same quantity a Mann-Whitney U test's statistic reduces to
+      (<code>delta = 2U/(n·m) − 1</code>) — comparing noagg vs. useragg latency at each worker count.
+      Plain Python throughout (resampling loops, no SciPy/NumPy dependency).
+    </p>
+    <div class="chart-grid">
+      <div class="chart-card">
+        <h3>noagg — p50 (± 95% CI), p95, p99 by worker count</h3>
+        <div id="latencyPercentilesNoagg"><div class="loading-state">Loading…</div></div>
+      </div>
+      <div class="chart-card">
+        <h3>useragg — p50 (± 95% CI), p95, p99 by worker count</h3>
+        <div id="latencyPercentilesUseragg"><div class="loading-state">Loading…</div></div>
+      </div>
+    </div>
+    <div class="legend" id="latencyPercentilesLegend"></div>
+    <div class="table-wrap">
+      <table class="sig-table">
+        <thead><tr><th>Worker count</th><th>Cliff's delta (useragg vs. noagg)</th><th>Permutation-test p-value</th><th>Significant at α=0.05?</th></tr></thead>
+        <tbody id="sigTableBody"><tr><td colspan="4" style="text-align:center;color:var(--text-muted);">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <p class="eyebrow">// 04 · multi-tenant fairness — Jain's index</p>
+    <h2>Formal fairness sweep: does the admission quota actually equalize access?</h2>
+    <p class="desc">
+      ATP's own paper title is literally <em>"...for Multi-tenant Learning"</em> — its headline
+      contribution, previously proven here only qualitatively (one test, one greedy job, one rejected
+      round). <code>scripts/fairness_sweep.py</code> drives 3 concurrent synthetic jobs with
+      deliberately uneven concurrent-slot demand (16 / 4 / 8, via the same "worker 1 never sends, so the
+      slot never frees" technique the correctness suite already uses) at a fresh <code>bin/agg</code> for
+      each <code>max_slots_per_job</code> quota value, snapshots each job's live slot-table occupancy via
+      a real SIGUSR1-triggered stats dump, and computes
+      <code>J = (Σxᵢ)² / (n·Σxᵢ²)</code> over each job's <code>concurrent_slots</code> — its actual share
+      of the shared resource at that moment, not its own admitted/attempted ratio (that ratio is
+      trivially 1.0 whenever quota=0, which would make "unlimited" look perfectly fair — the opposite of
+      the point). Every quota's outcome here reran identically across 3 repeats — real, deterministic
+      measurements, not simulated.
+    </p>
+    <div class="chart-grid">
+      <div class="chart-card">
+        <h3>Jain's fairness index vs. admission quota</h3>
+        <div id="fairnessChart"><div class="loading-state">Loading…</div></div>
+      </div>
+      <div class="chart-card">
+        <h3>Per-job concurrent slots held, by quota</h3>
+        <div id="fairnessSlotsChart"><div class="loading-state">Loading…</div></div>
+      </div>
+    </div>
+    <div class="legend" id="fairnessLegend"></div>
+  </section>
+
+  <section class="panel">
+    <p class="eyebrow">// 05 · project status</p>
     <h2>What's built, tested, and pending</h2>
     <p class="desc">Every checked item below is backed by a real, runnable command in this repo — nothing here is aspirational.</p>
     <ul class="checklist" id="statusList">
@@ -188,12 +261,16 @@
       <li><span class="tick done">[x]</span><span>Multi-tenant fairness — ATP's actual headline contribution (<em>"...for Multi-tenant Learning"</em>): a per-job admission quota in <code>userspace_agg/agg.c</code> caps concurrently-incomplete slots per <code>job_id</code>, proven to isolate a greedy job from starving others via a dedicated regression test</span></li>
       <li><span class="tick done">[x]</span><span>Slot-table TTL/reaper — closes the crashed-worker resource leak the fairness quota alone doesn't cover: an incomplete slot with a genuinely dead worker is now evicted after a configurable timeout instead of leaking forever, proven via a dedicated regression test</span></li>
       <li><span class="tick done">[x]</span><span>Differential fuzz harness (<code>fuzz/</code>) — adversarially searches for divergence between the userspace and XDP admission-check logic instead of relying only on hand-written tests; 133M CI executions, zero crashes, zero divergences found</span></li>
-      <li><span class="tick pending">[ ]</span><span>Porting the fairness quota and TTL reaper into the XDP kernel program itself, a formal Jain's-fairness-index sweep across concurrent jobs, real per-packet XDP latency numbers (BPF_PROG_TEST_RUN), and the full netem loss/reorder correctness sweep against the now-loadable program</span></li>
+      <li><span class="tick done">[x]</span><span>Formal Jain's-fairness-index sweep (<code>scripts/fairness_sweep.py</code>) — quantifies the per-job admission quota's actual fairness across 3 concurrent jobs with uneven demand instead of just proving the mechanism fires once, via a real SIGUSR1-driven stats dump added to <code>userspace_agg/agg.c</code></span></li>
+      <li><span class="tick done">[x]</span><span>Latency-distribution rigor (<code>scripts/benchmark.py</code>) — p50/p95/p99, a bootstrap 95% CI on the median, and a permutation test (Cliff's delta effect size) comparing noagg vs. useragg at each worker count, over 30 trials per cell instead of mean/min/max over 10</span></li>
+      <li><span class="tick pending">[ ]</span><span>Porting the fairness quota and TTL reaper into the XDP kernel program itself, real per-packet XDP latency numbers (BPF_PROG_TEST_RUN), and the full netem loss/reorder correctness sweep against the now-loadable program — in progress on a parallel workstream</span></li>
     </ul>
   </section>
 
   <footer class="page">
-    Data source: <code>bench/results.csv</code>, committed under <code>bench/</code> — this page performs
+    Data sources: <code>bench/results.csv</code>, <code>bench/results_percentiles.csv</code>
+    (<code>scripts/benchmark.py</code>) and <code>bench/fairness_results.csv</code>
+    (<code>scripts/fairness_sweep.py</code>), all committed under <code>bench/</code> — this page performs
     no computation the repo doesn't already do, it only parses and charts what's there.
   </footer>
 </div>
@@ -393,12 +470,121 @@
     });
   }
 
+  function loadPercentilesSection() {
+    fetchCSV("../bench/results_percentiles.csv").then(function (data) {
+      var rows = data.rows;
+      if (rows.length === 0) {
+        ["latencyPercentilesNoagg", "latencyPercentilesUseragg"].forEach(function (id) {
+          document.getElementById(id).innerHTML = emptyStateHTML("No percentile data yet", "Run <code>python3 scripts/benchmark.py</code> from the repo root, then reload.");
+        });
+        document.getElementById("sigTableBody").innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-muted);">No data yet</td></tr>';
+        return;
+      }
+      var workerCounts = Array.from(new Set(rows.map(function (r) { return num(r.num_workers); }))).sort(function (a, b) { return a - b; });
+      var catLabels = workerCounts.map(function (n) { return n + "w"; });
+
+      function buildForConfig(config, containerId) {
+        var byW = {};
+        rows.forEach(function (r) { if (r.config === config) byW[num(r.num_workers)] = r; });
+        var series = [
+          { name: "p50 (median)", color: "var(--series-1)",
+            values: workerCounts.map(function (w) { return byW[w] ? num(byW[w].p50) : 0; }),
+            whiskers: workerCounts.map(function (w) {
+              return byW[w] ? { min: num(byW[w].median_ci95_lo), max: num(byW[w].median_ci95_hi) } : null;
+            }) },
+          { name: "p95", color: "var(--series-2)", values: workerCounts.map(function (w) { return byW[w] ? num(byW[w].p95) : 0; }) },
+          { name: "p99", color: "var(--series-3)", values: workerCounts.map(function (w) { return byW[w] ? num(byW[w].p99) : 0; }) },
+        ];
+        groupedBarChart(document.getElementById(containerId), { categories: catLabels, series: series, unit: "us", width: 520, height: 230 });
+        return series;
+      }
+      var legendSeries = buildForConfig("noagg", "latencyPercentilesNoagg");
+      buildForConfig("useragg", "latencyPercentilesUseragg");
+      legendFor(document.getElementById("latencyPercentilesLegend"), legendSeries);
+
+      var tbody = document.getElementById("sigTableBody");
+      tbody.innerHTML = "";
+      workerCounts.forEach(function (w) {
+        var r = rows.find(function (rr) { return rr.config === "useragg" && num(rr.num_workers) === w; });
+        if (!r) return;
+        var sig = String(r["significant_at_0.05"]).toLowerCase() === "true";
+        var tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + w + "</td><td>" + num(r.cliffs_delta_vs_other_config).toFixed(4) +
+          "</td><td>" + num(r.p_value_vs_other_config).toFixed(4) +
+          '</td><td class="' + (sig ? "yes" : "no") + '">' + (sig ? "yes" : "no") + "</td>";
+        tbody.appendChild(tr);
+      });
+    }).catch(function (err) {
+      ["latencyPercentilesNoagg", "latencyPercentilesUseragg"].forEach(function (id) {
+        document.getElementById(id).innerHTML = emptyStateHTML("Couldn't load percentile data", err.message);
+      });
+      document.getElementById("sigTableBody").innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--critical);">' + err.message + "</td></tr>";
+      console.error(err);
+    });
+  }
+
+  function loadFairnessSection() {
+    fetchCSV("../bench/fairness_results.csv").then(function (data) {
+      var rows = data.rows;
+      if (rows.length === 0) {
+        ["fairnessChart", "fairnessSlotsChart"].forEach(function (id) {
+          document.getElementById(id).innerHTML = emptyStateHTML("No fairness-sweep data yet", "Run <code>python3 scripts/fairness_sweep.py</code> from the repo root, then reload.");
+        });
+        return;
+      }
+      var quotas = Array.from(new Set(rows.map(function (r) { return num(r.quota); }))).sort(function (a, b) { return a - b; });
+      var quotaLabels = quotas.map(function (q) { return q === 0 ? "0 (∞)" : String(q); });
+
+      function avgFor(filterFn) {
+        var matched = rows.filter(filterFn);
+        if (matched.length === 0) return 0;
+        return matched.reduce(function (acc, r) { return acc + num(r.jains_index); }, 0) / matched.length;
+      }
+      var jainsByQuota = quotas.map(function (q) { return avgFor(function (r) { return num(r.quota) === q; }); });
+      groupedBarChart(document.getElementById("fairnessChart"), {
+        categories: quotaLabels,
+        series: [{ name: "Jain's fairness index", color: "var(--accent)", values: jainsByQuota }],
+        unit: "J (1/n .. 1.0)", width: 520, height: 230,
+      });
+
+      var jobNames = Array.from(new Set(rows.map(function (r) { return r.job_name; }))).sort();
+      var palette = ["var(--series-1)", "var(--series-2)", "var(--series-3)"];
+      var slotSeries = jobNames.map(function (name, i) {
+        return {
+          name: name, color: palette[i % palette.length],
+          values: quotas.map(function (q) {
+            var matched = rows.filter(function (r) { return num(r.quota) === q && r.job_name === name; });
+            if (matched.length === 0) return 0;
+            return matched.reduce(function (acc, r) { return acc + num(r.concurrent_slots); }, 0) / matched.length;
+          }),
+        };
+      });
+      groupedBarChart(document.getElementById("fairnessSlotsChart"), { categories: quotaLabels, series: slotSeries, unit: "slots held", width: 520, height: 230 });
+      legendFor(document.getElementById("fairnessLegend"), slotSeries);
+
+      var jAtUnlimited = avgFor(function (r) { return num(r.quota) === 0; });
+      var maxJ = Math.max.apply(null, jainsByQuota);
+      var stats = [
+        { label: "Jain's index, quota=0 (unlimited)", value: jAtUnlimited.toFixed(4), note: jobNames.length + " concurrent jobs, uneven demand" },
+        { label: "Jain's index, best quota observed", value: maxJ.toFixed(4) },
+      ];
+      addStatTiles(stats, "fairness");
+    }).catch(function (err) {
+      ["fairnessChart", "fairnessSlotsChart"].forEach(function (id) {
+        document.getElementById(id).innerHTML = emptyStateHTML("Couldn't load fairness-sweep data", err.message);
+      });
+      console.error(err);
+    });
+  }
+
   addStatTiles([
     { label: "Correctness tests", value: "10 / 10", note: "python3 tests/test_correctness.py" },
     { label: "XDP program", value: "compiles", note: "make bpf — real eBPF bytecode, not yet load-tested" },
   ], "static");
 
   loadBenchSection();
+  loadPercentilesSection();
+  loadFairnessSection();
 
   var refreshBtn = document.getElementById("refreshBtn");
   var lastUpdatedEl = document.getElementById("lastUpdated");
@@ -406,7 +592,7 @@
     var now = new Date();
     lastUpdatedEl.textContent = "updated " + now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   }
-  refreshBtn.addEventListener("click", function () { loadBenchSection(); markUpdated(); });
+  refreshBtn.addEventListener("click", function () { loadBenchSection(); loadPercentilesSection(); loadFairnessSection(); markUpdated(); });
   markUpdated();
 })();
 </script>
