@@ -182,6 +182,25 @@ not part of the core deliverable.
 - **Traffic generation:** synthetic fixed-point gradient chunks generated at a
   configurable rate/size (no real training loop required for the core deliverable —
   named honestly as synthetic, not oversold as "real ML training").
+
+**Implementation status (real-kernel verification):** this project's actual
+testbed for verifier/load testing is GitHub Actions' `ubuntu-latest` runners,
+not a manually-provisioned VM — a real Linux kernel and real BPF verifier,
+scripted and reproducible on every push
+([`.github/workflows/xdp-loadtest.yml`](../.github/workflows/xdp-loadtest.yml)),
+rather than a one-time manual session. It builds a veth pair across two
+network namespaces (the standard kernel-selftests topology), loads
+`xdp_agg.o`, and drives it with real UDP gradient traffic including every
+adversarial input an earlier code review found bugs in. This found and fixed
+one genuine defect `clang -target bpf` codegen could never catch: the
+accumulate/write-back loops' bounds proof did not survive the loops' own
+back-edge, since they don't fully unroll (already documented above) — fixed
+with a redundant per-iteration bounds re-check, the standard idiom for this
+situation. See `README.md`'s "Real-kernel verification" section for the full
+account, including the exact verifier-rejection message and the real
+numbers from the now-green run. Scope note: this uses `xdpgeneric` (SKB)
+mode on a software veth, not native driver-mode XDP on physical NIC
+hardware — that remains a stretch goal (§7).
 - **Baselines** (both required, not optional — this is where the actual research
   comparison lives):
   1. **No aggregation** — every worker sends directly to the parameter server, which
