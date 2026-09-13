@@ -160,7 +160,29 @@ int main(int argc, char **argv) {
         uint16_t chunk_len = ntohs(hdr->chunk_len);
 
         if (chunk_len > NETSUM_MAX_CHUNK_LEN) continue;  /* malformed, drop -- mirrors XDP_DROP for a bad parse */
+        /* CRITICAL FIX (found by an adversarial review that also reviewed
+         * xdp_agg.c, comparing the two): this check was missing entirely.
+         * `in_packet` is a fixed-size buffer reused across every
+         * recvfrom() call and NEVER cleared between them. Without
+         * verifying the actual received length `n` covers
+         * NETSUM_HDR_SIZE + chunk_len*sizeof(int32_t), a truncated/
+         * malformed datagram that merely CLAIMS a large chunk_len (while
+         * actually being short) would read past what this packet really
+         * delivered and silently sum stale leftover bytes from a PRIOR,
+         * larger packet into the running total -- with no crash, no log,
+         * nothing to signal the corruption. The XDP program (xdp_agg.c)
+         * already had the equivalent check against `data_end`; this
+         * brings the two back into the "byte-for-byte the same algorithm"
+         * parity this file's own header comment claims. */
+        if ((size_t)n < NETSUM_HDR_SIZE + (size_t)chunk_len * sizeof(int32_t)) continue;
         if (worker_id >= MAX_TRACKED_WORKERS) continue;
+        /* Reject a degenerate/out-of-range num_workers before it can ever
+         * create a slot that could never legitimately complete (0) or
+         * that exceeds what MAX_TRACKED_WORKERS' seen_worker[] can even
+         * track -- same fix as xdp_agg.c's slot-creation validation, same
+         * reasoning: a bad value here would otherwise occupy one of the
+         * 65536 slot-table entries forever, with no TTL/eviction. */
+        if (num_workers == 0 || num_workers > MAX_TRACKED_WORKERS) continue;
 
         slot_t *slot = find_or_create_slot(job_id, round, chunk_id);
         if (!slot) { fprintf(stderr, "slot table full, dropping\n"); continue; }
@@ -169,6 +191,18 @@ int main(int argc, char **argv) {
             slot->chunk_len = chunk_len;
             slot->num_workers_expected = num_workers;
             slot->first_seen_micros = now_micros();
+        } else if (slot->chunk_len != chunk_len) {
+            /* Same fix as xdp_agg.c's chunk_len-consistency check: a
+             * contribution that disagrees with the slot's established
+             * chunk_len would otherwise get summed using its OWN chunk_len
+             * as the loop bound below, silently producing a sum
+             * inconsistent with what any single worker actually sent.
+             * Reject the one inconsistent contribution, not the whole
+             * slot. */
+            fprintf(stderr,
+                "[chunk_len mismatch] job=%u round=%u chunk=%u worker=%u sent chunk_len=%u, slot expects %u -- dropping\n",
+                job_id, round, chunk_id, worker_id, chunk_len, slot->chunk_len);
+            continue;
         }
 
         if (slot->seen_worker[worker_id]) {
