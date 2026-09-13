@@ -209,6 +209,14 @@ Every number reported must come from a script that actually ran, output committe
 alongside the code — the same "every number is produced by a committed target you
 can run" discipline as itch-lob-engine's benchmark suite.
 
+**Implementation status (multi-tenant fairness row):** the per-job admission
+quota is implemented and regression-tested in the userspace aggregator
+(`userspace_agg/agg.c`'s `g_job_quota`/`find_or_create_job` machinery — see
+`README.md`), proving the mechanism isolates a greedy job's excess demand from
+a second job sharing the slot table. It has not yet been ported into the XDP
+kernel program (`xdp_agg/xdp_agg.c`) or measured via a formal Jain's-index
+sweep across 2–4 jobs — both remain open follow-ups, not silently claimed done.
+
 ---
 
 ## 6. Build Plan (Semester Timeline)

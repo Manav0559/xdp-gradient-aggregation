@@ -11,6 +11,17 @@
  * fast path vs. in an ordinary process," and adding userspace
  * multi-threading here would conflate a threading advantage with the
  * kernel-fast-path question the benchmark exists to isolate.
+ *
+ * Multi-tenant fairness (optional `max_slots_per_job` CLI argument): a
+ * real per-job admission quota on concurrently-incomplete slots, so one
+ * greedy job spamming many concurrent rounds cannot starve every other
+ * job sharing this aggregator out of the slot table. This reproduces
+ * ATP's actual headline contribution -- its paper's own title is
+ * literally "...for Multi-tenant Learning" -- not just its bare
+ * streaming-aggregation mechanism (which SwitchML, ATP's predecessor,
+ * already had). See tests/test_correctness.py's fairness tests for a
+ * worked example: a greedy job hitting its quota while a second,
+ * well-behaved job's slots are admitted normally.
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -24,6 +35,7 @@
 #include "../protocol/grad_proto.h"
 
 #define SLOT_TABLE_CAPACITY 65536  /* must be a power of 2 */
+#define JOB_TABLE_CAPACITY 256     /* must be a power of 2 -- concurrent distinct job_ids tracked for fairness */
 
 #define MAX_TRACKED_WORKERS 256
 
@@ -52,6 +64,45 @@ typedef struct {
 
 static slot_t g_slots[SLOT_TABLE_CAPACITY];
 
+/* Multi-tenant fairness -- this is ATP's actual headline contribution
+ * (its title is literally "...for Multi-tenant Learning"), reproduced
+ * here as a real per-job admission policy rather than left as a "planned"
+ * checkbox: the shared slot table is a scarce resource multiple
+ * concurrent training jobs can contend for, and without an admission
+ * policy, one greedy job spamming many concurrent (round, chunk_id) slots
+ * could starve every other job sharing this aggregator. `g_job_quota`, set
+ * from the CLI (0 = unlimited, preserving the exact prior behavior for
+ * every existing test), caps how many INCOMPLETE slots a single job_id
+ * may occupy at once; a job at its quota has its next new-slot attempt
+ * rejected outright, the same way a switch with a full slot table would
+ * reject it -- it does not touch slots the job already has in flight. */
+static long g_job_quota = 0;  /* 0 = unlimited */
+
+typedef struct {
+    int in_use;
+    uint32_t job_id;
+    uint32_t concurrent_slots;
+} job_entry_t;
+
+static job_entry_t g_jobs[JOB_TABLE_CAPACITY];
+
+static uint32_t job_hash(uint32_t job_id) {
+    uint32_t h = job_id;
+    h ^= h >> 16; h *= 0x85ebca6bu; h ^= h >> 13; h *= 0xc2b2ae35u; h ^= h >> 16;
+    return h;
+}
+
+static job_entry_t *find_or_create_job(uint32_t job_id) {
+    uint32_t h = job_hash(job_id);
+    for (size_t probe = 0; probe < JOB_TABLE_CAPACITY; probe++) {
+        size_t idx = (h + probe) & (JOB_TABLE_CAPACITY - 1);
+        job_entry_t *j = &g_jobs[idx];
+        if (!j->in_use) { j->in_use = 1; j->job_id = job_id; j->concurrent_slots = 0; return j; }
+        if (j->job_id == job_id) return j;
+    }
+    return NULL;  /* more than JOB_TABLE_CAPACITY distinct concurrent job_ids -- not expected at benchmark scale */
+}
+
 static uint64_t slot_key(uint32_t job_id, uint32_t round, uint32_t chunk_id) {
     uint64_t h = 1469598103934665603ULL;
     uint32_t fields[3] = {job_id, round, chunk_id};
@@ -69,11 +120,20 @@ static slot_t *find_or_create_slot(uint32_t job_id, uint32_t round, uint32_t chu
         size_t idx = (h + probe) & (SLOT_TABLE_CAPACITY - 1);
         slot_t *s = &g_slots[idx];
         if (!s->in_use) {
+            /* About to CREATE a brand-new slot for this job -- this is the
+             * one place the fairness admission policy applies. An
+             * existing slot this job already holds is never affected by
+             * its own quota; only a NEW one can be rejected. */
+            job_entry_t *job = find_or_create_job(job_id);
+            if (job && g_job_quota > 0 && job->concurrent_slots >= (uint32_t)g_job_quota) {
+                return NULL;
+            }
             memset(s, 0, sizeof(*s));
             s->in_use = 1;
             s->job_id = job_id;
             s->round = round;
             s->chunk_id = chunk_id;
+            if (job) job->concurrent_slots++;
             return s;
         }
         if (s->job_id == job_id && s->round == round && s->chunk_id == chunk_id) {
@@ -90,6 +150,8 @@ static slot_t *find_or_create_slot(uint32_t job_id, uint32_t round, uint32_t chu
  * once it closes. This mirrors a real constraint the eventual BPF map
  * (fixed-size, no growth) will have too. */
 static void free_slot(slot_t *s) {
+    job_entry_t *job = find_or_create_job(s->job_id);  /* must already exist -- this slot incremented it on creation */
+    if (job && job->concurrent_slots > 0) job->concurrent_slots--;
     s->in_use = 0;
 }
 
@@ -102,7 +164,12 @@ static long now_micros(void) {
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
-            "usage: %s <listen_port> <downstream_ip> <downstream_port> [max_packets=0]\n",
+            "usage: %s <listen_port> <downstream_ip> <downstream_port> [max_packets=0] [max_slots_per_job=0]\n"
+            "  max_slots_per_job: fairness admission quota -- caps how many\n"
+            "  concurrently-incomplete slots a single job_id may occupy (0 =\n"
+            "  unlimited, the original behavior). Reproduces ATP's actual\n"
+            "  headline contribution: a shared aggregator serving multiple\n"
+            "  tenants must not let one greedy job starve the others.\n",
             argv[0]);
         return 1;
     }
@@ -110,6 +177,7 @@ int main(int argc, char **argv) {
     const char *downstream_ip = argv[2];
     int downstream_port = atoi(argv[3]);
     long max_packets = argc > 4 ? atol(argv[4]) : 0;
+    g_job_quota = argc > 5 ? atol(argv[5]) : 0;
 
     int in_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (in_sock < 0) { perror("socket(in)"); return 1; }
@@ -185,7 +253,19 @@ int main(int argc, char **argv) {
         if (num_workers == 0 || num_workers > MAX_TRACKED_WORKERS) continue;
 
         slot_t *slot = find_or_create_slot(job_id, round, chunk_id);
-        if (!slot) { fprintf(stderr, "slot table full, dropping\n"); continue; }
+        if (!slot) {
+            /* Two different reasons collapse to the same NULL return from
+             * find_or_create_slot(): the whole 65536-entry table is full
+             * (essentially never at benchmark scale), or -- the
+             * realistic case when g_job_quota > 0 -- this specific job_id
+             * is already at its fairness quota. Logged distinctly so a
+             * fairness benchmark can grep for exactly the rejection it's
+             * testing for. */
+            fprintf(stderr,
+                "[admission-reject] job=%u round=%u chunk=%u -- slot table full or job at fairness quota, dropping\n",
+                job_id, round, chunk_id);
+            continue;
+        }
 
         if (slot->contributions_received == 0) {
             slot->chunk_len = chunk_len;
