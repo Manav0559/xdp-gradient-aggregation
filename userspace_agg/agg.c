@@ -67,6 +67,18 @@
  * timeout is ever installed, so recvfrom stays exactly as blocking as
  * before and every existing test's behavior is unchanged.
  */
+/* POSIX.1-2008 feature-test macro, required before ANY system header on
+ * glibc/Linux to expose struct sigaction / sigaction() / sigemptyset()
+ * under strict `-std=c11` (Makefile's CFLAGS) -- glibc gates POSIX
+ * extensions behind this under a strict C standard, unlike macOS's libc,
+ * which exposes them regardless. This was invisible in every local build
+ * on this project's macOS dev machine and only surfaced as a real build
+ * failure the first time `make` ran on a real Linux box (GitHub Actions
+ * CI, building this file for the xdp-loadtest workflow) -- a genuine
+ * cross-platform portability bug, not a hypothetical one. Must be defined
+ * before the first #include, since glibc headers key off it at first
+ * inclusion. */
+#define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <signal.h>
