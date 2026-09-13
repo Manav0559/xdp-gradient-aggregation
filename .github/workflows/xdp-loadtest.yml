@@ -129,7 +129,7 @@ jobs:
           echo "--- bpftool prog show (loaded_at/tag/xlated+jited sizes = proof it's really loaded) ---"
           sudo "$BPFTOOL" prog show pinned /sys/fs/bpf/netsum/prog | tee /tmp/prog_show.log
           echo "--- pinned maps ---"
-          ls -la /sys/fs/bpf/netsum
+          sudo ls -la /sys/fs/bpf/netsum
 
       - name: Attach the verified program to veth0's real ingress path
         run: |
