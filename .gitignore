@@ -16,3 +16,6 @@ fuzz/corpus/regressions/
 fuzz/crash-*
 fuzz/oom-*
 fuzz/timeout-*
+
+# macOS Finder metadata
+.DS_Store

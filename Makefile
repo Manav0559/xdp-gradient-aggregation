@@ -39,7 +39,7 @@ test: all
 
 bpf: xdp_agg/xdp_agg.c xdp_agg/bpf_compat.h protocol/grad_proto.h
 	$(BPF_CC) -target bpf -Wall -Wextra -O2 -g -c xdp_agg/xdp_agg.c -o xdp_agg/xdp_agg.o
-	@echo "compiled xdp_agg/xdp_agg.o -- codegen-clean, not yet verifier/load-tested (needs a real Linux kernel, see docs/DEV_ENVIRONMENT.md)"
+	@echo "compiled xdp_agg/xdp_agg.o -- codegen only; loading it needs a real Linux kernel (CI does this in .github/workflows/xdp-loadtest.yml, see docs/DEV_ENVIRONMENT.md)"
 
 clean:
 	rm -rf $(BIN_DIR) xdp_agg/*.o

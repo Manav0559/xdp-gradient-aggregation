@@ -1,5 +1,10 @@
 # NetSum — In-Network Gradient Aggregation on Commodity Linux via XDP/eBPF
 
+[![CI](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/ci.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/ci.yml)
+[![XDP real-kernel load test](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/xdp-loadtest.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/xdp-loadtest.yml)
+[![Fuzz](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/fuzz.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/fuzz.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A CN + OS + distributed-systems research project: reproducing **ATP**'s
 (*"In-network Aggregation for Multi-tenant Learning,"* NSDI 2021 Best Paper)
 streaming, multi-tenant, fairness-aware gradient-aggregation mechanism — normally
@@ -8,17 +13,19 @@ using XDP/eBPF instead. No specialized hardware.
 
 **Full project specification:** [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md)
 (also available as a formatted PDF: [`docs/NetSum_Project_Spec.pdf`](docs/NetSum_Project_Spec.pdf))
-**Live results dashboard:** see the `dashboard/` section below.
+**Live results dashboard:** <https://manav0559.github.io/xdp-gradient-aggregation/dashboard/>
 
 ## What's built and tested right now
 
 The wire protocol, both non-kernel benchmark baselines, and the XDP/eBPF kernel
-program (compiled, not yet load-tested) are all implemented and passing a real
+program (loaded through the real in-kernel verifier and driven with real UDP
+traffic in CI — see below) are all implemented and passing a real
 correctness test suite:
 
 ```sh
 make                              # builds bin/worker, bin/paramserver, bin/agg
 make bpf                          # compiles xdp_agg/xdp_agg.c to real eBPF bytecode
+                                  # (loading it needs Linux; CI does that in xdp-loadtest.yml)
 python3 tests/test_correctness.py # 10/10 passing
 python3 scripts/benchmark.py      # runs the real noagg-vs-useragg benchmark sweep
 ```
@@ -60,9 +67,13 @@ accept a per-iteration packet-pointer dereference. Fixed with the standard
 idiom: a redundant, logically-no-op `(values + i + 1) > data_end` re-check
 immediately before each dereference, giving the verifier a fresh, local
 proof at the access site. With that fix, the workflow is green: the
-verifier accepts the program (`processed 55542 insns`, captured in a build
-artifact), `bpftool prog show` confirms it's really loaded and JITed
-(`xlated 2760B jited 1679B`), a real multi-worker round sums correctly
+verifier accepts the program, and `bpftool prog show` confirms it's really
+loaded and JITed. (Sizes from the most recent `main` run checked, 10 Oct 2026,
+kernel `6.17.0-1022-azure`, after the fairness quota was ported in:
+`processed 110791 insns (limit 1000000)`, `xlated 3568B jited 2138B`. The
+first green run, before that change, reported 55542 insns / 2760B / 1679B.
+Each run uploads the full verifier log as the `xdp-loadtest-evidence`
+artifact.) A real multi-worker round sums correctly
 through the live program, and every adversarial input is correctly
 rejected — including `drop_stats[STAT_DROPPED_NO_CONFIG]` actually
 incrementing on a real kernel, not a userspace model of one. Honest scope
@@ -221,7 +232,7 @@ protocol/       shared wire-format header (single source of truth)
 worker/         synthetic gradient-chunk sender
 paramserver/    baseline #1 (no aggregation) + the final receiver for #2/#3
 userspace_agg/  baseline #2 (userspace aggregation, same algorithm as XDP)
-xdp_agg/        the kernel-space XDP/eBPF aggregator -- compiles, not yet load-tested
+xdp_agg/        the kernel-space XDP/eBPF aggregator -- verifier-loaded and traffic-tested in CI (xdpgeneric on veth)
 tests/          correctness test suite (10/10 passing, driving the real binaries)
 scripts/        benchmark harness -- real measured data in bench/results.csv
 dashboard/      live results dashboard (dark/light, charts bench/results.csv)
