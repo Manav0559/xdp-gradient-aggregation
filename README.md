@@ -192,9 +192,14 @@ real kernel only. Its performance has not been benchmarked.
 
 **What was measured.** `scripts/benchmark.py` compares two userspace setups.
 In `noagg`, workers send straight to the parameter server. In `useragg`,
-`bin/agg` sums the packets first. The script recorded completion latency
-(from the first contribution to a complete slot) and the number of packets
-reaching the parameter server. It ran on the macOS development machine over
+`bin/agg` sums the packets first. For each trial the script recorded a
+completion latency and an uplink packet count. The latency is the gap between
+the first and the last contribution arriving at the node that does the
+summing: the parameter server under `noagg`, the aggregator under `useragg`.
+It does not include the aggregator-to-parameter-server hop. The workers are
+launched one after another as separate processes, so this gap mostly measures
+how far apart the harness starts them: the p50 grows by roughly 3 ms per
+extra worker in both setups (see the table). It ran on the macOS development machine over
 loopback: one host, no NIC, no XDP. That run produced the committed
 `bench/results.csv`, with 30 trials for each (config, worker count) cell and
 240 rows in total. The p-values come from a two-sided permutation test (2000
@@ -216,12 +221,15 @@ exactly.)
 - *Latency:* no worker count shows a statistically significant difference
   (every p ≥ 0.38, and every |delta| ≤ 0.134, below the usual 0.147 cutoff
   for a "negligible" Cliff's delta). With 30 trials per cell, this run cannot tell the two setups
-  apart. This is expected: `useragg` adds a hop and does the same per-packet
-  work in userspace, so it has no structural reason to be faster.
-- *Packets:* this is the only effect that was measured. The parameter server
-  receives N packets per round under `noagg` and 1 under `useragg`, in every
-  trial at every worker count (2, 4, 8, 16). This is a deterministic count
-  of messages, not a timing result.
+  apart. This is expected: both latencies are dominated by the serial worker
+  launches described above, not by the cost of summing, so this benchmark
+  cannot show an aggregation speedup in either direction.
+- *Packets:* this is the only clear effect. Under `useragg` the aggregator's
+  own log reports exactly 1 packet sent upstream per round, in every trial at
+  every worker count (2, 4, 8, 16). Under `noagg` the script does not count
+  packets; it records N because each of the N workers sends its packet
+  straight to the parameter server. This is a count of messages by design,
+  not a timing result.
 - *XDP:* `xdp_agg.c` is **not** included in the latency comparison above.
   The CI load test (`.github/workflows/xdp-loadtest.yml`) loads the program
   through the verifier and checks that sums are correct and that bad input is
