@@ -11,6 +11,10 @@ streaming, multi-tenant, fairness-aware gradient-aggregation mechanism — norma
 built on a Barefoot/Intel Tofino programmable switch — on an ordinary Linux box
 using XDP/eBPF instead. No specialized hardware.
 
+**Scope of the results:** correctness and fairness are tested, including on
+a real kernel in CI. No performance gain from XDP has been measured. See
+[Measured results](#measured-results-what-the-numbers-do-and-dont-show).
+
 **Full project specification:** [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md)
 (also available as a formatted PDF: [`docs/NetSum_Project_Spec.pdf`](docs/NetSum_Project_Spec.pdf))
 **Live results dashboard:** <https://manav0559.github.io/xdp-gradient-aggregation/dashboard/>
@@ -180,18 +184,63 @@ read-through. The one deliberately out-of-scope nuance (a stateful
 `slot->chunk_len` consistency check neither extracted function can model
 without a live slot table) is documented in `fuzz/README.md`, not hidden.
 
-### Latency distribution rigor (percentiles, not just mean/min/max)
+### Measured results: what the numbers do and don't show
 
-`scripts/benchmark.py` now runs 30 trials per (config, worker-count) cell
-(up from 10) and reports p50/p95/p99, a bootstrap 95% confidence interval on
-the median, and a permutation test with Cliff's delta effect size comparing
-`noagg` vs. `useragg` at each worker count — plain Python throughout, no new
-dependency. Real result: none of the 4 worker counts show a statistically
-significant difference (all p > 0.05), consistent with this project's own
-"`useragg` is not expected to beat `noagg` here" framing (see the dashboard's
-latency panel) — a claim that previously rested on a bare mean comparison
-over a handful of trials now rests on an actual significance test. Data in
-`bench/results_percentiles.csv`, charted on the dashboard.
+**Short version:** no latency or throughput gain has been measured for
+aggregation in this repo. The XDP path has been checked for correctness on a
+real kernel only. Its performance has not been benchmarked.
+
+**What was measured.** `scripts/benchmark.py` compares two userspace setups.
+In `noagg`, workers send straight to the parameter server. In `useragg`,
+`bin/agg` sums the packets first. The script recorded completion latency
+(from the first contribution to a complete slot) and the number of packets
+reaching the parameter server. It ran on the macOS development machine over
+loopback: one host, no NIC, no XDP. That run produced the committed
+`bench/results.csv`, with 30 trials for each (config, worker count) cell and
+240 rows in total. The p-values come from a two-sided permutation test (2000
+iterations, fixed seed). The effect size is Cliff's delta for useragg vs.
+noagg.
+
+| Workers | n per config | noagg p50 (us) | useragg p50 (us) | Cliff's delta | p-value |
+|---:|---:|---:|---:|---:|---:|
+| 2  | 30 | 3329.5  | 3542.0  | +0.029 | 0.848 |
+| 4  | 30 | 11531.5 | 11013.0 | -0.124 | 0.421 |
+| 8  | 30 | 24132.5 | 22245.0 | -0.056 | 0.710 |
+| 16 | 30 | 49258.5 | 47125.5 | -0.133 | 0.381 |
+
+(`bench/results_percentiles.csv`. These values were recomputed from the raw
+`bench/results.csv` with the script's own statistics functions and match
+exactly.)
+
+**Interpretation.**
+- *Latency:* no worker count shows a statistically significant difference
+  (every p ≥ 0.38, and every |delta| ≤ 0.134, below the usual 0.147 cutoff
+  for a "negligible" Cliff's delta). With 30 trials per cell, this run cannot tell the two setups
+  apart. This is expected: `useragg` adds a hop and does the same per-packet
+  work in userspace, so it has no structural reason to be faster.
+- *Packets:* this is the only effect that was measured. The parameter server
+  receives N packets per round under `noagg` and 1 under `useragg`, in every
+  trial at every worker count (2, 4, 8, 16). This is a deterministic count
+  of messages, not a timing result.
+- *XDP:* `xdp_agg.c` is **not** included in the latency comparison above.
+  The CI load test (`.github/workflows/xdp-loadtest.yml`) loads the program
+  through the verifier and checks that sums are correct and that bad input is
+  rejected. It does not record any timing. The test also runs in
+  `xdpgeneric` (SKB) mode on a veth pair inside one GitHub-hosted VM. Generic
+  XDP runs after the kernel has already allocated an skb, so it skips most of
+  the work that native XDP avoids. Even if timing were added, this setup
+  would not be expected to show the kernel-fast-path gain that motivates the
+  project.
+
+**What it would take to show a gain (not done).** Run native (driver-mode)
+XDP on a real NIC that supports it, on separate hosts. Generate realistic
+traffic with many workers and large gradient chunks. Then compare the XDP
+path against the userspace aggregator and report per-packet latency (for
+example with `BPF_PROG_TEST_RUN` for the program alone) and end-to-end
+round-completion time. Report the same sample sizes and significance tests
+as above. Until that is done, this project shows that ATP's
+aggregation-and-fairness mechanism *works correctly* in XDP. It does not
+show that it is faster.
 
 Real bugs were found and fixed during this build (not just written and assumed
 correct) — this is the honest, complete list, not a curated subset:
