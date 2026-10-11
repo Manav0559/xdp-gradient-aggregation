@@ -8,10 +8,10 @@ name: Differential fuzz -- grad_hdr admission checks
 #
 # This needs no Linux kernel feature at all: it fuzzes the extracted
 # userspace-only logic in fuzz/parse_shared.h, never the live XDP program
-# itself (xdp_agg.c's own header comment is explicit that file has only
-# ever been compiled to BPF bytecode here, never verifier- or load-tested
-# on a real interface) -- so ubuntu-latest's stock clang is enough, no BPF
-# toolchain, no libbpf, no root.
+# itself (the loaded program is exercised separately, through the real
+# in-kernel verifier on a veth pair, by xdp-loadtest.yml) -- so
+# ubuntu-latest's stock clang is enough, no BPF toolchain, no libbpf, no
+# root.
 on:
   push:
   pull_request:

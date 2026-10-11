@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc make python3
+
+      - name: Build userspace binaries
+        run: make
+
+      - name: Correctness tests
+        run: python3 tests/test_correctness.py
+
+      - name: Compile XDP program to BPF bytecode
+        run: |
+          # Same multiarch include workaround as xdp-loadtest.yml: clang's
+          # bpf target needs the host's glibc include triplet and the 64-bit
+          # stubs branch selected.
+          MULTIARCH=$(gcc -print-multiarch)
+          make bpf BPF_CC="clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH}"
+          llvm-objdump -h xdp_agg/xdp_agg.o
