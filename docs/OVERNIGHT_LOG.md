@@ -279,3 +279,21 @@ record J2 timeline and H2 resend counts; then 4c (array mode + fallback).
   other overlap rejected). `tests/test_fallback.py` (7 tests); the superset
   and subset tests fail against the previous paramserver (checked by building
   `HEAD:paramserver/paramserver.c`) and pass now.
+- CI run 43762407606 (`9b86b9c`, with the C14 fix): J2 now recovers: all 3
+  workers got the correct result (1.5) in 1.50 s; PS `[partial] have=2/3`,
+  then completion via the superset rule (the 300 ms TTL had also retired the
+  FLUSHED slot, so the retransmissions re-created and completed it as {0,1,2}).
+  Only the assertion `tx_fallback >= 1` failed, because that path did not run.
+  J2 now uses TTL 1 s (flush at ~1.1 s, retransmit at 1.5 s, slot still
+  FLUSHED) so the FALLBACK path is the one exercised; the superset path is
+  covered by tests/test_fallback.py and was observed here on the real kernel.
+- 4c kernel: array mode (`agg_array`, tag-checked, claim under the lock),
+  collision -> FALLBACK + `fallback_keys` (LRU), quota policy `fallback` in
+  hash mode, mode-aware ACK and sweep. First verifier attempt rejected
+  (`R2 !read_ok`): a `goto` jumped over initialisers the forwarding tail
+  reads; hoisting them fixed it. bpf-unit 69/69 locally (array cases use a
+  16-entry pool via bpf_map__set_max_entries). netsum-ctl: --slots-log2,
+  --slot-mode, array-aware slots and sweep. New CI scenarios G2 (fallback
+  policy) and P (array mode, reliable workers).
+- Deferred: array mode in the userspace agg (the benchmark compares hash mode
+  in both paths; XDP array mode is an extra configuration).

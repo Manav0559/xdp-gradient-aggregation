@@ -82,6 +82,7 @@ struct {
  * Per-CPU maps may not hold a spin lock, hence the lock-free twin type. */
 struct grad_slot_init {
     uint32_t lock_placeholder;
+    struct grad_slot_key tag;
     uint8_t state, overflowed, charged, _pad0;
     uint16_t fanin, chunk_len, contributors, _pad1;
     uint64_t last_touched_ns;
@@ -89,12 +90,35 @@ struct grad_slot_init {
     int32_t sum[NETSUM_MAX_CHUNK_LEN];
 };
 
+_Static_assert(sizeof(struct grad_slot_init) == sizeof(struct grad_slot), "template matches slot layout");
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, uint32_t);
     __type(value, struct grad_slot_init);
 } slot_template SEC(".maps");
+
+/* Array mode (ATP-style): a fixed pool of aggregators indexed by
+ * netsum_slot_hash(key) & slot_mask, each tagged with the key that owns it.
+ * A busy aggregator owned by another key means fallback to the PS. netsum-ctl
+ * sets max_entries before load (--slots-log2). */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, uint32_t);
+    __type(value, struct grad_slot);
+} agg_array SEC(".maps");
+
+/* Keys that have fallen back: later contributions for them fall back too,
+ * so no worker is aggregated both in-network and at the PS. LRU: an evicted
+ * entry is safe because the PS merges by contributor set (DESIGN_NOTES §Fallback). */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct grad_slot_key);
+    __type(value, uint8_t);
+} fallback_keys SEC(".maps");
 
 static __always_inline void stat_inc(uint32_t id)
 {
@@ -160,6 +184,7 @@ enum outcome {
     OUT_RESEND_RESULT,   /* RESEND on a completed slot: forward the stored aggregate again */
     OUT_FLUSH,           /* RESEND of a held worker: forward the partial, slot -> FLUSHED */
     OUT_FALLBACK,        /* contribution to a FLUSHED slot: forward it raw, flagged FALLBACK */
+    OUT_COLLISION,       /* array mode: aggregator owned by another key -> FALLBACK */
     OUT_DUPLICATE,
     OUT_RESEND_DUPLICATE,
     OUT_LATE,
@@ -192,23 +217,41 @@ static __always_inline void copy_slot_out(struct grad_slot *slot, int32_t *value
 /* ACK from the parameter server: the key is finished, drop our state. An ACK
  * for a slot that is still accumulating means the PS completed the key from
  * fallbacks or partials, so our partial sum is stale. */
-static __always_inline int handle_ack(const struct netsum_parsed *p)
+static __always_inline int handle_ack(const struct netsum_parsed *p, const struct netsum_config *cfg)
 {
     stat_inc(NS_ACK_SEEN);
     struct grad_slot_key key = {p->job_id, p->round, p->chunk_id};
-    struct grad_slot *slot = bpf_map_lookup_elem(&slot_map, &key);
+    bpf_map_delete_elem(&fallback_keys, &key);
+    int array = cfg && cfg->slot_mode == NETSUM_SLOT_MODE_ARRAY;
+    struct grad_slot *slot;
+    if (array) {
+        uint32_t idx = netsum_slot_hash(key.job_id, key.round, key.chunk_id) & cfg->slot_mask;
+        slot = bpf_map_lookup_elem(&agg_array, &idx);
+    } else {
+        slot = bpf_map_lookup_elem(&slot_map, &key);
+    }
     if (!slot) {
         stat_inc(NS_ACK_UNEXPECTED);
         return XDP_DROP;
     }
-    int accumulating, charged;
+    int accumulating, charged, owned = 1;
     bpf_spin_lock(&slot->lock);
+    if (array && (slot->state == NETSUM_SLOT_EMPTY || slot->tag.job_id != key.job_id ||
+                  slot->tag.round != key.round || slot->tag.chunk_id != key.chunk_id))
+        owned = 0; /* the aggregator now belongs to another key */
     accumulating = slot->state == NETSUM_SLOT_ACCUMULATING;
-    charged = slot->charged;
-    slot->charged = 0;
-    slot->state = NETSUM_SLOT_EMPTY;
+    charged = owned ? slot->charged : 0;
+    if (owned) {
+        slot->charged = 0;
+        slot->state = NETSUM_SLOT_EMPTY;
+    }
     bpf_spin_unlock(&slot->lock);
-    bpf_map_delete_elem(&slot_map, &key);
+    if (!owned) {
+        stat_inc(NS_ACK_UNEXPECTED);
+        return XDP_DROP;
+    }
+    if (!array)
+        bpf_map_delete_elem(&slot_map, &key);
     if (charged)
         quota_release(p->job_id);
     stat_inc(accumulating ? NS_ACK_UNEXPECTED : NS_SLOT_RETIRED_ACK);
@@ -263,8 +306,10 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
         stat_inc(NS_FROM_VERDICT(v));
         return XDP_DROP;
     }
+    uint32_t cfg_key = 0;
+    struct netsum_config *cfg = bpf_map_lookup_elem(&config_map, &cfg_key);
     if (p.kind == NETSUM_KIND_ACK)
-        return handle_ack(&p);
+        return handle_ack(&p, cfg);
     if (p.kind == NETSUM_KIND_REGISTER) {
         stat_inc(NS_PASS_CONTROL);
         return XDP_PASS;
@@ -279,12 +324,31 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
     int v2 = p.version == NETSUM_VERSION_V2;
     int resend = (p.flags & NETSUM_F_RESEND) != 0;
 
-    uint32_t cfg_key = 0;
-    struct netsum_config *cfg = bpf_map_lookup_elem(&config_map, &cfg_key);
     struct grad_slot_key key = {p.job_id, p.round, p.chunk_id};
     uint64_t now = bpf_ktime_get_ns();
+    int array = cfg && cfg->slot_mode == NETSUM_SLOT_MODE_ARRAY;
+    int fallback_policy = cfg && cfg->quota_policy == NETSUM_QUOTA_FALLBACK;
+    int outcome = OUT_ACCEPTED;
+    struct grad_slot *slot = 0;
+    /* Everything the forwarding tail reads is initialised before the first
+     * goto: jumping over an initialiser leaves the value undefined, and the
+     * compiler may then spill a clobbered register the verifier rejects. */
+    int32_t *values = (int32_t *)((uint8_t *)payload + NETSUM_HDR_SIZE);
+    int release_quota = 0, overflowed = 0, copy_out = 0;
+    uint16_t fanin = 0, agg_flags = 0;
 
-    struct grad_slot *slot = bpf_map_lookup_elem(&slot_map, &key);
+    if ((array || fallback_policy) && bpf_map_lookup_elem(&fallback_keys, &key)) {
+        outcome = OUT_FALLBACK; /* this key already lives at the PS */
+        goto forward;
+    }
+    if (array) {
+        uint32_t idx = netsum_slot_hash(key.job_id, key.round, key.chunk_id) & cfg->slot_mask;
+        slot = bpf_map_lookup_elem(&agg_array, &idx);
+        if (!slot)
+            return XDP_DROP;
+        goto locked;
+    }
+    slot = bpf_map_lookup_elem(&slot_map, &key);
     if (!slot) {
         uint32_t max = cfg ? cfg->max_slots_per_job : 0;
         int charged = 0;
@@ -295,6 +359,13 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
                 return XDP_DROP;
             }
             if (rc == -2) {
+                if (fallback_policy) { /* degrade to the PS instead of dropping */
+                    uint8_t one = 1;
+                    bpf_map_update_elem(&fallback_keys, &key, &one, BPF_ANY);
+                    stat_inc(NS_FALLBACK_QUOTA);
+                    outcome = OUT_FALLBACK;
+                    goto forward;
+                }
                 stat_inc(NS_DROP_QUOTA);
                 return XDP_DROP;
             }
@@ -320,19 +391,41 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
         }
         slot = bpf_map_lookup_elem(&slot_map, &key);
         if (!slot) {
+            if (fallback_policy) {
+                uint8_t one = 1;
+                bpf_map_update_elem(&fallback_keys, &key, &one, BPF_ANY);
+                stat_inc(NS_FALLBACK_COLLISION); /* no aggregator available */
+                outcome = OUT_FALLBACK;
+                goto forward;
+            }
             stat_inc(NS_DROP_MAP_FULL);
             return XDP_DROP;
         }
     }
 
-    int32_t *values = (int32_t *)((uint8_t *)payload + NETSUM_HDR_SIZE);
-    int outcome = OUT_ACCEPTED;
-    int release_quota = 0, overflowed = 0, copy_out = 0;
-    uint16_t fanin = 0;
+locked:
 
     bpf_spin_lock(&slot->lock);
+    if (array && slot->state == NETSUM_SLOT_EMPTY) { /* claim a free aggregator */
+        slot->tag = key;
+        slot->state = NETSUM_SLOT_ACCUMULATING;
+        slot->fanin = p.num_workers;
+        slot->chunk_len = chunk_len;
+        slot->contributors = 0;
+        slot->overflowed = 0;
+        slot->charged = 0;
+        slot->last_touched_ns = now;
+#pragma unroll
+        for (int b = 0; b < NETSUM_BITMAP_BYTES; b++)
+            slot->bitmap[b] = 0;
+        for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++)
+            slot->sum[i] = 0;
+    }
     int held = (slot->bitmap[(p.worker_id >> 3) & 31] >> (p.worker_id & 7)) & 1;
-    if (p.num_workers != slot->fanin) {
+    if (array && (slot->tag.job_id != key.job_id || slot->tag.round != key.round ||
+                  slot->tag.chunk_id != key.chunk_id)) {
+        outcome = OUT_COLLISION; /* aggregator busy with another key */
+    } else if (p.num_workers != slot->fanin) {
         outcome = OUT_FANIN_MISMATCH;
     } else if (chunk_len != slot->chunk_len) {
         outcome = OUT_CHUNK_LEN_MISMATCH;
@@ -398,7 +491,6 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
     if (release_quota)
         quota_release(p.job_id);
 
-    uint16_t agg_flags = 0;
     switch (outcome) {
     case OUT_ACCEPTED:
         stat_inc(NS_ACCEPTED);
@@ -432,8 +524,21 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
         stat_inc(NS_SLOT_FLUSHED_PARTIAL);
         agg_flags = NETSUM_F_PARTIAL;
         break;
+    case OUT_COLLISION: {
+        uint8_t one = 1;
+        bpf_map_update_elem(&fallback_keys, &key, &one, BPF_ANY);
+        stat_inc(NS_FALLBACK_COLLISION);
+        outcome = OUT_FALLBACK;
+        break;
+    }
     default: /* OUT_FALLBACK */
         break;
+    }
+
+forward:
+    if (outcome == OUT_FALLBACK && !v2) {
+        stat_inc(NS_LATE_DUPLICATE); /* v1 has no FALLBACK flag */
+        return XDP_DROP;
     }
 
     if (!cfg) {
@@ -501,8 +606,16 @@ int netsum_sweep(struct xdp_md *ctx)
         return XDP_ABORTED;
     uint64_t ttl_ns;
     __builtin_memcpy(&ttl_ns, values, sizeof(ttl_ns));
+    /* flags == NETSUM_SWEEP_ARRAY_INDEX: job_id carries an agg_array index */
+    int array = netsum_ntohs(h->flags) == NETSUM_SWEEP_ARRAY_INDEX;
     struct grad_slot_key key = {netsum_ntohl(h->job_id), netsum_ntohl(h->round), netsum_ntohl(h->chunk_id)};
-    struct grad_slot *slot = bpf_map_lookup_elem(&slot_map, &key);
+    struct grad_slot *slot;
+    if (array) {
+        uint32_t idx = key.job_id;
+        slot = bpf_map_lookup_elem(&agg_array, &idx);
+    } else {
+        slot = bpf_map_lookup_elem(&slot_map, &key);
+    }
     if (!slot)
         return XDP_PASS;
     uint64_t now = bpf_ktime_get_ns();
@@ -510,7 +623,9 @@ int netsum_sweep(struct xdp_md *ctx)
     uint16_t fanin = 0, chunk_len = 0;
 
     bpf_spin_lock(&slot->lock);
-    if (now - slot->last_touched_ns >= ttl_ns) {
+    if (array)
+        key = slot->tag;
+    if (slot->state != NETSUM_SLOT_EMPTY && now - slot->last_touched_ns >= ttl_ns) {
         if (slot->state == NETSUM_SLOT_ACCUMULATING) {
             action = XDP_TX;
             slot->state = NETSUM_SLOT_FLUSHED;
@@ -525,14 +640,20 @@ int netsum_sweep(struct xdp_md *ctx)
             copy_slot_out(slot, values, chunk_len, 1, data_end);
         } else {
             action = XDP_DROP;
+            if (array)
+                slot->state = NETSUM_SLOT_EMPTY;
         }
     }
     bpf_spin_unlock(&slot->lock);
 
     if (action == XDP_DROP) {
-        bpf_map_delete_elem(&slot_map, &key);
+        if (!array)
+            bpf_map_delete_elem(&slot_map, &key);
         stat_inc(NS_SLOT_RETIRED_TTL);
     } else if (action == XDP_TX) {
+        h->job_id = netsum_htonl(key.job_id);
+        h->round = netsum_htonl(key.round);
+        h->chunk_id = netsum_htonl(key.chunk_id);
         if (release_quota)
             quota_release(key.job_id);
         h->worker_id = netsum_htons(NETSUM_WORKER_AGGREGATE);

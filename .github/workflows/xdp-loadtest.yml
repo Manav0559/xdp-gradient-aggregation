@@ -215,11 +215,13 @@ jobs:
           source ci/lib.sh
           stats_to /tmp/stats_j0.json
           T0=$(date +%s%N)
-          # Worker 2's first transmission is lost; its RTO (1.5 s) is longer than
-          # the aggregator's TTL (300 ms), so the sweeper flushes {0,1} first.
+          # Worker 2's first transmission is lost. TTL 1 s < RTO 1.5 s < 2 x TTL:
+          # the sweeper flushes {0,1} at ~1.1 s and the slot is still FLUSHED
+          # when the retransmissions arrive at ~1.5 s, so worker 2's resend
+          # reaches the PS as a FALLBACK and completes the round there.
           for w in 0 1; do reliable_bg 952 "$w" 3 1 64 --rto-ms 1500; done
           reliable_bg 952 2 3 1 64 --rto-ms 1500 --drop-every 1
-          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --ttl-ms 300 --interval-ms 100 --duration-ms 3500 > /tmp/sweep_j2.log &
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --ttl-ms 1000 --interval-ms 100 --duration-ms 3500 > /tmp/sweep_j2.log &
           SWEEP=$!
           wait $(jobs -p | grep -v "^$SWEEP$") 2>/dev/null || true
           wait $SWEEP || true
@@ -327,6 +329,34 @@ jobs:
           wait
           in_ns1 tc qdisc del dev veth1 root
           check_reliable 981 3 64
+
+      - name: "Scenario G2 (G3): quota policy fallback sends a greedy job's excess round to the PS instead of dropping it"
+        run: |
+          set -euo pipefail
+          source ci/lib.sh
+          stats_to /tmp/stats_g2a.json
+          ctl_json config $CFG --max-slots-per-job 2 --quota-policy fallback
+          send 910 0 2 0.5 3      # rounds 0-1 aggregate in-network; round 2 is over quota
+          send 910 1 2 0.5 3
+          sleep 1
+          stats_to /tmp/stats_g2b.json
+          for r in 0 1 2; do grep -E "^\[complete\] job=910 round=$r chunk=0 " /tmp/ps.log; done
+          python3 ci/check_stat.py /tmp/stats_g2a.json /tmp/stats_g2b.json --delta fallback_quota=1 tx_fallback=2 drop_quota=0 tx_aggregate=2
+          ctl_json config $CFG
+
+      - name: "Scenario P: array mode (ATP-style aggregator pool) end to end"
+        run: |
+          set -euo pipefail
+          source ci/lib.sh
+          stats_to /tmp/stats_p0.json
+          ctl_json config $CFG --slot-mode array
+          for w in 0 1; do reliable_bg 990 "$w" 2 8 256 --rto-ms 100; done
+          wait
+          stats_to /tmp/stats_p1.json; ctl_json slots > /tmp/slots_p.json
+          check_reliable 990 2 32
+          python3 ci/check_stat.py /tmp/stats_p0.json /tmp/stats_p1.json --delta slot_completed=32 tx_aggregate=32
+          python3 -c "import json; d=json.load(open('/tmp/slots_p.json')); assert all(s['state'] != 'accumulating' for s in d), d"
+          ctl_json config $CFG
 
       - name: "Scenario O (C1 hygiene): the TTL sweeper leaves no slot behind"
         run: |

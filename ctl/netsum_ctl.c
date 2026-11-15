@@ -51,6 +51,8 @@ struct ctl {
     const char *ps_mac, *ps_ip, *agg_mac, *agg_ip, *egress_ifname, *quota_policy;
     long ps_port, max_slots, slot_ttl_ms;
     int delete_config;
+    const char *slot_mode;
+    long slots_log2;
 };
 
 static int fail(int code, const char *fmt, ...)
@@ -142,6 +144,9 @@ static int cmd_attach(struct ctl *c)
         struct bpf_object *obj = bpf_object__open_file(c->obj_path, NULL);
         if (!obj)
             return fail(EXIT_LOAD, "open %s: %s", c->obj_path, strerror(errno));
+        if (c->slots_log2 && bpf_map__set_max_entries(bpf_object__find_map_by_name(obj, "agg_array"),
+                                                      1u << c->slots_log2))
+            return fail(EXIT_USAGE, "bad --slots-log2");
         if (bpf_object__load(obj)) {
             fprintf(stderr, "%.*s", (int)g_verifier_len, g_verifier_log);
             return fail(EXIT_LOAD, "load %s failed (verifier log above)", c->obj_path);
@@ -178,8 +183,8 @@ static int cmd_detach(struct ctl *c)
             return fail(EXIT_ENV, "detach %s: %s", c->ifnames[i], strerror(errno));
     }
     if (c->unpin) {
-        const char *names[] = {"netsum_xdp_aggregate", "netsum_sweep", "slot_map", "config_map",
-                               "job_quota_map", "stats", "slot_template"};
+        const char *names[] = {"netsum_xdp_aggregate", "netsum_sweep", "slot_map", "config_map", "job_quota_map",
+                               "stats", "slot_template", "agg_array", "fallback_keys"};
         char path[512];
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             snprintf(path, sizeof(path), "%s/%s", c->pin, names[i]);
@@ -230,6 +235,20 @@ static int cmd_config(struct ctl *c)
     if (c->egress_ifname && !(cfg.egress_ifindex = if_nametoindex(c->egress_ifname)))
         return fail(EXIT_ENV, "no interface %s", c->egress_ifname);
     cfg.max_slots_per_job = (uint32_t)c->max_slots;
+    if (c->slot_mode && !strcmp(c->slot_mode, "array")) {
+        int afd = pinned_fd(c, "agg_array");
+        struct bpf_map_info mi;
+        __u32 ml = sizeof(mi);
+        memset(&mi, 0, sizeof(mi));
+        if (afd < 0 || bpf_obj_get_info_by_fd(afd, &mi, &ml))
+            return fail(EXIT_ENV, "cannot read agg_array: %s", strerror(errno));
+        if (mi.max_entries & (mi.max_entries - 1))
+            return fail(EXIT_ENV, "agg_array size %u is not a power of two", mi.max_entries);
+        cfg.slot_mode = NETSUM_SLOT_MODE_ARRAY;
+        cfg.slot_mask = mi.max_entries - 1;
+    } else if (c->slot_mode && strcmp(c->slot_mode, "hash")) {
+        return fail(EXIT_USAGE, "--slot-mode must be hash or array");
+    }
     cfg.slot_ttl_ms = (uint32_t)c->slot_ttl_ms;
     const char *qp = c->quota_policy ? c->quota_policy : (c->max_slots ? "drop" : "none");
     if (!strcmp(qp, "none"))
@@ -243,8 +262,10 @@ static int cmd_config(struct ctl *c)
     if (bpf_map_update_elem(fd, &key, &cfg, BPF_ANY))
         return fail(EXIT_RUNTIME, "write config_map: %s", strerror(errno));
     if (c->json)
-        printf("{\"ps\":\"%s:%ld\",\"egress_ifindex\":%u,\"max_slots_per_job\":%u,\"quota_policy\":\"%s\",\"slot_ttl_ms\":%u}\n",
-               c->ps_ip, c->ps_port, cfg.egress_ifindex, cfg.max_slots_per_job, qp, cfg.slot_ttl_ms);
+        printf("{\"ps\":\"%s:%ld\",\"egress_ifindex\":%u,\"max_slots_per_job\":%u,\"quota_policy\":\"%s\",\"slot_ttl_ms\":%u,"
+               "\"slot_mode\":\"%s\",\"slots\":%u}\n",
+               c->ps_ip, c->ps_port, cfg.egress_ifindex, cfg.max_slots_per_job, qp, cfg.slot_ttl_ms,
+               cfg.slot_mode ? "array" : "hash", cfg.slot_mode ? cfg.slot_mask + 1 : 0);
     return 0;
 }
 
@@ -308,15 +329,59 @@ static const char *state_name(uint8_t s)
     return s < 4 ? names[s] : "?";
 }
 
+static int array_mode(const struct ctl *c, uint32_t *entries)
+{
+    int cfd = pinned_fd(c, "config_map"), afd = pinned_fd(c, "agg_array");
+    uint32_t zero = 0;
+    struct netsum_config cfg;
+    if (cfd < 0 || afd < 0 || bpf_map_lookup_elem(cfd, &zero, &cfg) || cfg.slot_mode != NETSUM_SLOT_MODE_ARRAY)
+        return -1;
+    *entries = cfg.slot_mask + 1;
+    return afd;
+}
+
+static void print_slot(const struct ctl *c, struct grad_slot_key k, const struct grad_slot *v, uint64_t now, int *first)
+{
+    double age_ms = (double)(now - v->last_touched_ns) / 1e6;
+    if (c->json)
+        printf("%s{\"job_id\":%u,\"round\":%u,\"chunk_id\":%u,\"state\":\"%s\",\"contributors\":%u,"
+               "\"fanin\":%u,\"chunk_len\":%u,\"overflowed\":%u,\"charged\":%u,\"age_ms\":%.1f}",
+               *first ? "" : ",", k.job_id, k.round, k.chunk_id, state_name(v->state), v->contributors, v->fanin,
+               v->chunk_len, v->overflowed, v->charged, age_ms);
+    else
+        printf("job %u round %u chunk %u: %s %u/%u chunk_len %u age %.1f ms%s\n", k.job_id, k.round, k.chunk_id,
+               state_name(v->state), v->contributors, v->fanin, v->chunk_len, age_ms,
+               v->overflowed ? " overflowed" : "");
+    *first = 0;
+}
+
 static int cmd_slots(struct ctl *c)
 {
+    uint64_t now = mono_ns();
+    struct grad_slot v;
+    int first = 1;
+    uint32_t entries;
+    int afd = array_mode(c, &entries);
+    if (afd >= 0) {
+        if (c->json)
+            printf("[");
+        for (uint32_t i = 0; i < entries; i++) {
+            if (bpf_map_lookup_elem_flags(afd, &i, &v, BPF_F_LOCK) || v.state == NETSUM_SLOT_EMPTY)
+                continue;
+            if ((c->job_filter >= 0 && v.tag.job_id != (uint32_t)c->job_filter) ||
+                (strcmp(c->state_filter, "any") && strcmp(c->state_filter, state_name(v.state))))
+                continue;
+            print_slot(c, v.tag, &v, now, &first);
+        }
+        if (c->json)
+            printf("]\n");
+        return 0;
+    }
     int fd, rc = need_fd(c, "slot_map", &fd);
     if (rc)
         return rc;
     struct grad_slot_key k, next;
-    struct grad_slot v;
-    int first = 1, have = bpf_map_get_next_key(fd, NULL, &next) == 0;
-    uint64_t now = mono_ns();
+    int have = bpf_map_get_next_key(fd, NULL, &next) == 0;
     if (c->json)
         printf("[");
     while (have) {
@@ -328,17 +393,7 @@ static int cmd_slots(struct ctl *c)
             continue;
         if (strcmp(c->state_filter, "any") && strcmp(c->state_filter, state_name(v.state)))
             continue;
-        double age_ms = (double)(now - v.last_touched_ns) / 1e6;
-        if (c->json)
-            printf("%s{\"job_id\":%u,\"round\":%u,\"chunk_id\":%u,\"state\":\"%s\",\"contributors\":%u,"
-                   "\"fanin\":%u,\"chunk_len\":%u,\"overflowed\":%u,\"charged\":%u,\"age_ms\":%.1f}",
-                   first ? "" : ",", k.job_id, k.round, k.chunk_id, state_name(v.state), v.contributors, v.fanin,
-                   v.chunk_len, v.overflowed, v.charged, age_ms);
-        else
-            printf("job %u round %u chunk %u: %s %u/%u chunk_len %u age %.1f ms%s\n", k.job_id, k.round,
-                   k.chunk_id, state_name(v.state), v.contributors, v.fanin, v.chunk_len, age_ms,
-                   v.overflowed ? " overflowed" : "");
-        first = 0;
+        print_slot(c, k, &v, now, &first);
     }
     if (c->json)
         printf("]\n");
@@ -416,12 +471,23 @@ static int cmd_sweep(struct ctl *c)
     for (;;) {
         /* Snapshot the key set first: the sweep step deletes entries. */
         size_t n = 0;
-        struct grad_slot_key k, next;
-        int have = bpf_map_get_next_key(slot_fd, NULL, &next) == 0;
-        while (have && n < cap) {
-            keys[n++] = next;
-            k = next;
-            have = bpf_map_get_next_key(slot_fd, &k, &next) == 0;
+        uint32_t entries;
+        int afd = array_mode(c, &entries);
+        int array = afd >= 0;
+        if (array) { /* non-empty aggregators, by index */
+            struct grad_slot v;
+            for (uint32_t i = 0; i < entries && n < cap; i++)
+                if (!bpf_map_lookup_elem(afd, &i, &v) && v.state != NETSUM_SLOT_EMPTY)
+                    keys[n++] = (struct grad_slot_key){i, 0, 0};
+            close(afd);
+        } else {
+            struct grad_slot_key k, next;
+            int have = bpf_map_get_next_key(slot_fd, NULL, &next) == 0;
+            while (have && n < cap) {
+                keys[n++] = next;
+                k = next;
+                have = bpf_map_get_next_key(slot_fd, &k, &next) == 0;
+            }
         }
         for (size_t i = 0; i < n; i++) {
             uint8_t in[NETSUM_SWEEP_FRAME_SIZE], out[NETSUM_SWEEP_FRAME_SIZE + 64];
@@ -430,6 +496,7 @@ static int cmd_sweep(struct ctl *c)
             h->job_id = htonl(keys[i].job_id);
             h->round = htonl(keys[i].round);
             h->chunk_id = htonl(keys[i].chunk_id);
+            h->flags = htons(array ? NETSUM_SWEEP_ARRAY_INDEX : 0);
             memcpy(h + 1, &ttl_ns, sizeof(ttl_ns));
             LIBBPF_OPTS(bpf_test_run_opts, o, .data_in = in, .data_size_in = sizeof(in), .data_out = out,
                         .data_size_out = sizeof(out), .repeat = 1);
@@ -442,8 +509,8 @@ static int cmd_sweep(struct ctl *c)
                 sendto(sock, oh, len, 0, (struct sockaddr *)&to, sizeof(to));
                 flushed++;
                 if (!c->json)
-                    printf("[partial-flush] job=%u round=%u chunk=%u\n", keys[i].job_id, keys[i].round,
-                           keys[i].chunk_id);
+                    printf("[partial-flush] job=%u round=%u chunk=%u\n", ntohl(oh->job_id), ntohl(oh->round),
+                           ntohl(oh->chunk_id));
             } else if (o.retval == XDP_DROP) {
                 retired++;
             }
@@ -465,9 +532,11 @@ static void usage(void)
     fprintf(stderr,
             "usage: netsum-ctl [--pin DIR] [--json] <command> [options]\n"
             "  attach  --ifname IF [--ifname IF2] [--mode native|generic|auto] [--obj xdp_agg/xdp_agg.o]\n"
+            "          [--slots-log2 N]   (size of the array-mode aggregator pool, default 16)\n"
             "  detach  --ifname IF [--unpin]\n"
             "  config  --ps-mac MAC --ps-ip IP --ps-port N [--agg-mac MAC --agg-ip IP] [--egress-ifname IF]\n"
-            "          [--max-slots-per-job N] [--quota-policy none|drop|fallback] [--slot-ttl-ms N] | --delete\n"
+            "          [--max-slots-per-job N] [--quota-policy none|drop|fallback] [--slot-ttl-ms N]\n"
+            "          [--slot-mode hash|array] | --delete\n"
             "  stats   [--reset]\n"
             "  slots   [--state any|accumulating|completed|flushed] [--job N]\n"
             "  jobs\n"
@@ -487,7 +556,7 @@ int main(int argc, char **argv)
     c.state_filter = "any";
     enum { O_PIN = 256, O_OBJ, O_IF, O_MODE, O_JSON, O_RESET, O_ONCE, O_UNPIN, O_TTL, O_INTERVAL, O_DURATION,
            O_STATE, O_JOB, O_FLUSH, O_PSMAC, O_PSIP, O_PSPORT, O_AGGMAC, O_AGGIP, O_EGRESS, O_MAX, O_POLICY,
-           O_SLOTTTL, O_DELETE };
+           O_SLOTTTL, O_DELETE, O_SLOTMODE, O_SLOTSLOG2 };
     static const struct option opts[] = {
         {"pin", required_argument, 0, O_PIN}, {"obj", required_argument, 0, O_OBJ},
         {"ifname", required_argument, 0, O_IF}, {"mode", required_argument, 0, O_MODE},
@@ -500,7 +569,8 @@ int main(int argc, char **argv)
         {"agg-mac", required_argument, 0, O_AGGMAC}, {"agg-ip", required_argument, 0, O_AGGIP},
         {"egress-ifname", required_argument, 0, O_EGRESS}, {"max-slots-per-job", required_argument, 0, O_MAX},
         {"quota-policy", required_argument, 0, O_POLICY}, {"slot-ttl-ms", required_argument, 0, O_SLOTTTL},
-        {"delete", no_argument, 0, O_DELETE}, {0, 0, 0, 0}};
+        {"delete", no_argument, 0, O_DELETE}, {"slot-mode", required_argument, 0, O_SLOTMODE},
+        {"slots-log2", required_argument, 0, O_SLOTSLOG2}, {0, 0, 0, 0}};
     int o;
     while ((o = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (o) {
@@ -532,6 +602,8 @@ int main(int argc, char **argv)
         case O_POLICY: c.quota_policy = optarg; break;
         case O_SLOTTTL: c.slot_ttl_ms = atol(optarg); break;
         case O_DELETE: c.delete_config = 1; break;
+        case O_SLOTMODE: c.slot_mode = optarg; break;
+        case O_SLOTSLOG2: c.slots_log2 = atol(optarg); break;
         default: usage(); return EXIT_USAGE;
         }
     }

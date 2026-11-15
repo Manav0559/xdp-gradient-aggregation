@@ -20,6 +20,7 @@
 #include "../../protocol/netsum_maps.h"
 #include "../../protocol/netsum_stats.h"
 
+static int array_fd, fallback_fd;
 static int prog_fd, sweep_fd, slot_fd, config_fd, quota_fd, stats_fd, ncpus;
 static int cases, failures;
 static uint64_t snap[NS_STAT__COUNT];
@@ -172,6 +173,9 @@ static int slot_get(uint32_t job, uint32_t round, uint32_t chunk, struct grad_sl
     return bpf_map_lookup_elem(slot_fd, &k, s) == 0;
 }
 
+static uint16_t g_slot_mode;
+static uint32_t g_quota_policy = 0xFFFFFFFFu; /* default: drop if max_slots */
+
 static void set_config(uint32_t max_slots, uint32_t egress)
 {
     struct netsum_config c;
@@ -183,7 +187,9 @@ static void set_config(uint32_t max_slots, uint32_t egress)
     c.ps_port = __builtin_bswap16(PS_PORT);
     c.egress_ifindex = egress;
     c.max_slots_per_job = max_slots;
-    c.quota_policy = max_slots ? NETSUM_QUOTA_DROP : NETSUM_QUOTA_NONE;
+    c.quota_policy = g_quota_policy != 0xFFFFFFFFu ? g_quota_policy : (max_slots ? NETSUM_QUOTA_DROP : NETSUM_QUOTA_NONE);
+    c.slot_mode = g_slot_mode;
+    c.slot_mask = 15; /* agg_array is sized to 16 before load */
     uint32_t zero = 0;
     if (bpf_map_update_elem(config_fd, &zero, &c, BPF_ANY))
         fprintf(stderr, "config update failed: %s\n", strerror(errno));
@@ -553,6 +559,106 @@ static void test_sweep(void)
     CHECK(sweep(603, 0, out) == XDP_PASS, "action");
 }
 
+/* ---- array mode (ATP-style aggregators) and fallback ------------------------- */
+
+static int array_get(uint32_t job, struct grad_slot *s)
+{
+    uint32_t idx = netsum_slot_hash(job, 0, 0) & 15;
+    return bpf_map_lookup_elem(array_fd, &idx, s) == 0;
+}
+
+static int fallback_has(uint32_t job)
+{
+    struct grad_slot_key k = {job, 0, 0};
+    uint8_t v;
+    return bpf_map_lookup_elem(fallback_fd, &k, &v) == 0;
+}
+
+static uint32_t colliding_job(uint32_t base, uint32_t with)
+{
+    uint32_t want = netsum_slot_hash(with, 0, 0) & 15;
+    for (uint32_t j = base;; j++)
+        if (j != with && (netsum_slot_hash(j, 0, 0) & 15) == want)
+            return j;
+}
+
+static void test_array_mode(void)
+{
+    uint8_t out[4096];
+    struct grad_slot s;
+    g_slot_mode = NETSUM_SLOT_MODE_ARRAY;
+    set_config(0, 0);
+    const uint8_t *pl = out + 14 + 20 + 8;
+
+    begin("array: a free aggregator is claimed and completes");
+    uint32_t k1 = 7000;
+    send_frame(F(.job = k1, .wid = 0, .nw = 2, .chunk_len = 2, .val = 3), out);
+    CHECK(array_get(k1, &s) && s.state == NETSUM_SLOT_ACCUMULATING && s.tag.job_id == k1, "claimed with tag");
+    CHECK(send_frame(F(.job = k1, .wid = 1, .nw = 2, .chunk_len = 2, .val = 4), out) == XDP_TX, "completes");
+    check_aggregate_frame(out, 2, 2, 7, 0);
+    begin("array: ACK frees the aggregator");
+    send_frame(F(.job = k1, .wid = 0xFFFF, .nw = 2, .chunk_len = 2, .flags = NETSUM_F_ACK), out);
+    CHECK(array_get(k1, &s) && s.state == NETSUM_SLOT_EMPTY, "EMPTY");
+    CHECK(delta(NS_SLOT_RETIRED_ACK) == 1, "retired");
+
+    begin("array: a busy aggregator owned by another key -> FALLBACK to the PS");
+    uint32_t a = 7100, b = colliding_job(7101, 7100);
+    send_frame(F(.job = a, .wid = 0, .nw = 2, .chunk_len = 2, .val = 1), out);
+    CHECK(send_frame(F(.job = b, .wid = 0, .nw = 2, .chunk_len = 2, .val = 50), out) == XDP_TX, "action");
+    CHECK(get32(pl) == b && get16(pl + 12) == 0 && (get16(pl + 18) & NETSUM_F_FALLBACK), "raw contribution, FALLBACK");
+    CHECK((int32_t)get32(pl + 20) == 50 && memcmp(out, PS_MAC, 6) == 0, "own values, to the PS");
+    CHECK(array_get(a, &s) && s.tag.job_id == a && s.contributors == 1, "owner's slot untouched");
+    CHECK(fallback_has(b) && delta(NS_FALLBACK_COLLISION) == 1 && delta(NS_TX_FALLBACK) == 1, "recorded");
+    begin("array: a fallen-back key keeps falling back even once its aggregator is free");
+    send_frame(F(.job = a, .wid = 1, .nw = 2, .chunk_len = 2, .val = 1), out);
+    send_frame(F(.job = a, .wid = 0xFFFF, .nw = 2, .chunk_len = 2, .flags = NETSUM_F_ACK), out);
+    CHECK(array_get(a, &s) && s.state == NETSUM_SLOT_EMPTY, "free now");
+    CHECK(send_frame(F(.job = b, .wid = 1, .nw = 2, .chunk_len = 2, .val = 60), out) == XDP_TX, "action");
+    CHECK(get16(pl + 18) & NETSUM_F_FALLBACK, "still FALLBACK");
+    CHECK(array_get(b, &s) && s.state == NETSUM_SLOT_EMPTY, "not claimed: no worker split across paths");
+    begin("array: the PS's ACK for a fallen-back key clears its fallback entry");
+    send_frame(F(.job = b, .wid = 0xFFFF, .nw = 2, .chunk_len = 2, .flags = NETSUM_F_ACK), out);
+    CHECK(!fallback_has(b), "cleared");
+
+    begin("array: sweep flushes an expired aggregator by index and frees it");
+    uint32_t c = 7200;
+    send_frame(F(.job = c, .wid = 2, .nw = 3, .chunk_len = 1, .val = 9), out);
+    uint8_t in[NETSUM_SWEEP_FRAME_SIZE];
+    memset(in, 0, sizeof(in));
+    uint8_t *h = in + NETSUM_SWEEP_PAYLOAD_OFFSET;
+    put32(h, netsum_slot_hash(c, 0, 0) & 15);
+    put16(h + 18, NETSUM_SWEEP_ARRAY_INDEX);
+    uint64_t zero_ttl = 0;
+    memcpy(h + 20, &zero_ttl, 8);
+    LIBBPF_OPTS(bpf_test_run_opts, o, .data_in = in, .data_size_in = sizeof(in), .data_out = out,
+                .data_size_out = 4096, .repeat = 1);
+    CHECK(bpf_prog_test_run_opts(sweep_fd, &o) == 0 && o.retval == XDP_TX, "flushed");
+    const uint8_t *sp = out + NETSUM_SWEEP_PAYLOAD_OFFSET;
+    CHECK(get32(sp) == c && (get16(sp + 18) & NETSUM_F_PARTIAL) && (int32_t)get32(sp + 20) == 9, "PARTIAL named by tag");
+    CHECK(array_get(c, &s) && s.state == NETSUM_SLOT_FLUSHED, "FLUSHED");
+    CHECK(bpf_prog_test_run_opts(sweep_fd, &o) == 0 && o.retval == XDP_DROP, "retired");
+    CHECK(array_get(c, &s) && s.state == NETSUM_SLOT_EMPTY, "EMPTY");
+
+    g_slot_mode = NETSUM_SLOT_MODE_HASH;
+    set_config(0, 0);
+}
+
+static void test_quota_fallback_policy(void)
+{
+    uint8_t out[4096];
+    const uint8_t *pl = out + 14 + 20 + 8;
+    g_quota_policy = NETSUM_QUOTA_FALLBACK;
+    set_config(1, 0);
+    begin("quota policy fallback: over-quota slots go to the PS instead of being dropped");
+    send_frame(F(.job = 7300, .round = 0, .wid = 0, .nw = 2, .chunk_len = 1, .val = 1), out);
+    CHECK(send_frame(F(.job = 7300, .round = 1, .wid = 0, .nw = 2, .chunk_len = 1, .val = 5), out) == XDP_TX, "action");
+    CHECK(get32(pl + 4) == 1 && (get16(pl + 18) & NETSUM_F_FALLBACK), "round 1 forwarded as FALLBACK");
+    CHECK(delta(NS_FALLBACK_QUOTA) == 1 && delta(NS_DROP_QUOTA) == 0, "counted as fallback, not drop");
+    g_quota_policy = 0xFFFFFFFFu;
+    clear_quota_map();
+    set_config(0, 0);
+}
+
 /* ---- corpus replay: kernel verdicts vs the userspace parser -------------- */
 
 static int expected_action_ok(const struct netsum_parsed *p)
@@ -639,6 +745,8 @@ int main(int argc, char **argv)
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     struct bpf_object *obj = bpf_object__open_file(argv[1], NULL);
+    if (obj)
+        bpf_map__set_max_entries(bpf_object__find_map_by_name(obj, "agg_array"), 16);
     if (!obj || bpf_object__load(obj)) {
         fprintf(stderr, "failed to open/load %s: %s\n", argv[1], strerror(errno));
         return 2;
@@ -650,6 +758,8 @@ int main(int argc, char **argv)
     config_fd = bpf_object__find_map_fd_by_name(obj, "config_map");
     quota_fd = bpf_object__find_map_fd_by_name(obj, "job_quota_map");
     stats_fd = bpf_object__find_map_fd_by_name(obj, "stats");
+    array_fd = bpf_object__find_map_fd_by_name(obj, "agg_array");
+    fallback_fd = bpf_object__find_map_fd_by_name(obj, "fallback_keys");
     ncpus = libbpf_num_possible_cpus();
     if (prog_fd < 0 || sweep_fd < 0 || slot_fd < 0 || config_fd < 0 || quota_fd < 0 || stats_fd < 0 || ncpus <= 0 || ncpus > 512) {
         fprintf(stderr, "program or maps not found\n");
@@ -665,6 +775,8 @@ int main(int argc, char **argv)
     test_config_and_forwarding();
     test_ack_and_resend();
     test_sweep();
+    test_array_mode();
+    test_quota_fallback_policy();
     test_corpus(argv[2]);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);

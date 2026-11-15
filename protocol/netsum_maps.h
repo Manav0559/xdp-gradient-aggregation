@@ -21,6 +21,11 @@ enum netsum_slot_state {
     NETSUM_SLOT_FLUSHED = 3,
 };
 
+enum netsum_slot_mode {
+    NETSUM_SLOT_MODE_HASH = 0,  /* BPF hash map keyed by (job, round, chunk) */
+    NETSUM_SLOT_MODE_ARRAY = 1, /* ATP-style fixed array indexed by hash, tag-checked */
+};
+
 enum netsum_quota_policy {
     NETSUM_QUOTA_NONE = 0,
     NETSUM_QUOTA_DROP = 1,
@@ -35,6 +40,7 @@ struct grad_slot_key {
 
 struct grad_slot {
     NETSUM_LOCK_T lock;
+    struct grad_slot_key tag;  /* array mode: the key that owns this slot */
     uint8_t state;            /* enum netsum_slot_state */
     uint8_t overflowed;       /* sticky: some lane overflowed */
     uint8_t charged;          /* holds one unit of its job's quota */
@@ -55,17 +61,20 @@ struct netsum_config {
     uint32_t ps_ip;
     uint32_t agg_ip;           /* 0: keep the frame's source IP */
     uint16_t ps_port;
-    uint16_t _pad2;
+    uint16_t slot_mode;        /* enum netsum_slot_mode */
     uint32_t egress_ifindex;   /* 0 or ingress: XDP_TX; otherwise bpf_redirect */
     uint32_t max_slots_per_job;/* 0: no quota */
     uint32_t quota_policy;     /* enum netsum_quota_policy */
     uint32_t slot_ttl_ms;      /* read by the userspace sweeper */
+    uint32_t slot_mask;        /* array mode: agg_array max_entries - 1 (power of two) */
 };
 
 /* netsum_sweep input frame: the grad_hdr naming the key starts here (after
  * Ethernet, IPv4 and UDP headers the sweeper fills with zeros). */
 #define NETSUM_SWEEP_PAYLOAD_OFFSET 42
 #define NETSUM_SWEEP_FRAME_SIZE (NETSUM_SWEEP_PAYLOAD_OFFSET + NETSUM_MAX_PACKET_SIZE)
+/* netsum_sweep: grad_hdr.flags value meaning job_id is an agg_array index. */
+#define NETSUM_SWEEP_ARRAY_INDEX 1
 
 struct job_quota_entry {
     uint32_t concurrent_slots; /* charged ACCUMULATING slots */
@@ -73,8 +82,19 @@ struct job_quota_entry {
 };
 
 NETSUM_STATIC_ASSERT(sizeof(struct grad_slot_key) == 12, "grad_slot_key layout");
-NETSUM_STATIC_ASSERT(sizeof(struct grad_slot) == 312, "grad_slot layout");
-NETSUM_STATIC_ASSERT(sizeof(struct netsum_config) == 40, "netsum_config layout");
+NETSUM_STATIC_ASSERT(sizeof(struct grad_slot) == 328, "grad_slot layout");
+NETSUM_STATIC_ASSERT(sizeof(struct netsum_config) == 44, "netsum_config layout");
 NETSUM_STATIC_ASSERT(sizeof(struct job_quota_entry) == 8, "job_quota_entry layout");
+
+/* Array-mode aggregator index (also used by tests and userspace): a cheap
+ * multiplicative mix of the key, masked to the table size. */
+NETSUM_INLINE uint32_t netsum_slot_hash(uint32_t job_id, uint32_t round, uint32_t chunk_id)
+{
+    uint32_t x = job_id * 0x9E3779B1u ^ round * 0x85EBCA77u ^ chunk_id * 0xC2B2AE3Du;
+    x ^= x >> 15;
+    x *= 0x2C1B3C6Du;
+    x ^= x >> 12;
+    return x;
+}
 
 #endif /* NETSUM_MAPS_H */

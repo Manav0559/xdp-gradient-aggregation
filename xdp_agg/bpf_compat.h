@@ -35,6 +35,7 @@ struct xdp_md {
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_ARRAY 2
 #define BPF_MAP_TYPE_PERCPU_ARRAY 6
+#define BPF_MAP_TYPE_LRU_HASH 9
 
 /* libbpf BTF map-definition macros */
 #define __uint(name, val) int (*name)[val]
