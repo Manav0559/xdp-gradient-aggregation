@@ -18,11 +18,11 @@ on:
   pull_request:
 
 env:
-  NETSUM_EXPECT_RED_K: '1'
-  NETSUM_EXPECT_RED_L: '1'
-  NETSUM_EXPECT_RED_M: '1'
-  NETSUM_EXPECT_RED_N: '1'
-  NETSUM_EXPECT_RED_O: '1'
+  NETSUM_EXPECT_RED_K: '0'
+  NETSUM_EXPECT_RED_L: '0'
+  NETSUM_EXPECT_RED_M: '0'
+  NETSUM_EXPECT_RED_N: '0'
+  NETSUM_EXPECT_RED_O: '0'
 
 jobs:
   xdp-loadtest:
@@ -179,7 +179,10 @@ jobs:
           # traffic TO (filtered on by xdp_agg.c itself); ps_port here is the
           # separate, configurable port the COMPLETED/forwarded packet gets
           # retargeted to, which is where `paramserver` listens below.
-          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000
+          VETH0_MAC=$(ip link show veth0 | awk '/link\/ether/ {print $2}')
+          echo "VETH0_MAC=$VETH0_MAC" >> "$GITHUB_ENV"
+          # Aggregates leave with the aggregator's own MAC/IP as source (C9).
+          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 0 "$VETH0_MAC" 10.200.1.1
           sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/config_map
 
       - name: Start paramserver inside ns1 (receives XDP_TX'd completions)
@@ -204,7 +207,7 @@ jobs:
           sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map
           sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 100 2 3 1 4 1.0 0.25
           sleep 1
-          echo "--- slot_map after all 3 (expect EMPTY -- the completed slot is deleted) ---"
+          echo "--- slot_map after all 3 (expect one COMPLETED tombstone for job 100) ---"
           sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map
           echo "--- veth0 (root ns) counters after the round ---"
           ip -s link show veth0
@@ -263,19 +266,19 @@ jobs:
           # temporarily empty config_map, then complete a real 2-worker
           # round. The completed aggregation must be dropped (never
           # forwarded -- paramserver sees nothing) AND
-          # drop_stats[STAT_DROPPED_NO_CONFIG=0] must be bumped, proving
+          # the drop_no_config counter must be bumped exactly once, proving
           # this isn't just silent packet loss on the real kernel path.
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_e0.json
           sudo "$BPFTOOL" map delete pinned /sys/fs/bpf/netsum/config_map key hex 00 00 00 00
           sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/config_map || echo "(confirmed: config_map is empty)"
           sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 105 0 2 1 1 1.0 0.5
           sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 105 1 2 1 1 1.0 0.5
           sleep 1
           python3 ci/assert_paramserver.py /tmp/ps.log 105 forbid
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/drop_stats > /tmp/drop_stats.json
-          cat /tmp/drop_stats.json
-          python3 ci/check_drop_stat.py /tmp/drop_stats.json 0 1
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_e1.json
+          python3 ci/check_stat.py /tmp/stats_e0.json /tmp/stats_e1.json --delta drop_no_config=1 slot_completed=1
           # Restore config for the recovery scenario below.
-          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000
+          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 0 "$VETH0_MAC" 10.200.1.1
 
       - name: "Scenario F: recovery -- normal completion works again after config_map is restored"
         run: |
@@ -294,7 +297,8 @@ jobs:
           # Set max_slots_per_job=2 in config_map (same ps_mac/ip/port as
           # before, plus the new field) -- the only place this quota is
           # configured from, per xdp_agg.c's new struct netsum_config field.
-          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 2
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_g0.json
+          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 2 "$VETH0_MAC" 10.200.1.1
           sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/config_map
           # Job 900: greedy job opening 3 concurrent incomplete slots
           # (rounds 0-2, only worker_id=0 of num_workers=2 ever sends, so
@@ -313,17 +317,16 @@ jobs:
           sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/job_quota_map > /tmp/job_quota.json
           cat /tmp/job_quota.json
           python3 ci/check_job_quota.py /tmp/job_quota.json 900 2
-          echo "--- drop_stats (expect STAT_DROPPED_FAIRNESS_QUOTA=1 bumped exactly once) ---"
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/drop_stats > /tmp/drop_stats_quota.json
-          cat /tmp/drop_stats_quota.json
-          python3 ci/check_drop_stat.py /tmp/drop_stats_quota.json 1 1
+          echo "--- stats (expect drop_quota bumped exactly once) ---"
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_g1.json
+          python3 ci/check_stat.py /tmp/stats_g0.json /tmp/stats_g1.json --delta drop_quota=1
           # Job 900 must never complete (worker 1 never sends); job 901 must.
           python3 ci/assert_paramserver.py /tmp/ps.log 900 forbid
           python3 ci/assert_paramserver.py /tmp/ps.log 901 require 1 2.0
           # Reset the quota to unlimited (0) so it doesn't affect the netem
           # sweep scenarios below, which use fresh job_ids of their own but
           # should otherwise see the same default (pre-Scenario-G) behavior.
-          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 0
+          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 0 "$VETH0_MAC" 10.200.1.1
 
       - name: "Scenario H: netem 20% loss -- a full round still completes correctly via redundant sends"
         run: |
@@ -412,7 +415,7 @@ jobs:
           echo "--- slot_map (measure, don't assume: confirm job 952's incomplete slot is STILL there) ---"
           sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_952.json
           cat /tmp/slot_map_952.json
-          python3 ci/check_slot_present.py /tmp/slot_map_952.json 952 present
+          python3 ci/check_slot_present.py /tmp/slot_map_952.json 952 accumulating
           # Teardown -- remove the netem qdisc so it doesn't outlive this
           # scenario (the netns is torn down at the end of the job anyway,
           # but doing it explicitly documents the impairment window).
@@ -425,19 +428,23 @@ jobs:
       - name: "Scenario K (C2): worker_id beyond fan-in must not complete a round"
         run: |
           set -euo pipefail
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_k0.json
           for w in 10 11 12; do
             sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 960 "$w" 3 1 1 1.0 1.0
           done
           sleep 1
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_k1.json
           if [ "$NETSUM_EXPECT_RED_K" = "1" ]; then
             python3 ci/assert_paramserver.py /tmp/ps.log 960 require 3 3.0
             echo "RED as expected (C2): worker_ids 10,11,12 completed job 960"
           else
             python3 ci/assert_paramserver.py /tmp/ps.log 960 forbid
+            python3 ci/check_stat.py /tmp/stats_k0.json /tmp/stats_k1.json --delta rej_worker_id=3 slot_created=0
           fi
       - name: "Scenario L (C3): fan-in disagreement is rejected; a fan-in-1 claim closes the round once"
         run: |
           set -euo pipefail
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_l0.json
           # L1: worker 1 claims fan-in 4 while the round was opened with 3.
           sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 961 0 3 1 1 1.0 1.0
           sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 961 1 4 1 1 1.0 2.0
@@ -465,7 +472,9 @@ jobs:
             python3 ci/check_slot_present.py /tmp/slot_map_965.json 965 present
             echo "RED as expected (C3/L2): job 965 left a never-completing slot"
           else
-            python3 ci/check_slot_present.py /tmp/slot_map_965.json 965 absent
+            python3 ci/check_slot_present.py /tmp/slot_map_965.json 965 no-accumulating
+            sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_l1.json
+            python3 ci/check_stat.py /tmp/stats_l0.json /tmp/stats_l1.json --delta num_workers_mismatch=3
           fi
       - name: "Scenario M (C1): a late duplicate after completion must not re-create the slot"
         run: |
@@ -474,29 +483,35 @@ jobs:
             sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 962 "$w" 3 1 1 1.0 1.0
           done
           sleep 0.2
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_m0.json
           sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 962 1 3 1 1 1.0 1.0
           sleep 1
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_m1.json
           python3 ci/assert_paramserver.py /tmp/ps.log 962 require 3 3.0
           sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_962.json
           if [ "$NETSUM_EXPECT_RED_M" = "1" ]; then
             python3 ci/check_slot_present.py /tmp/slot_map_962.json 962 present
             echo "RED as expected (C1): the late duplicate re-created slot (962,0,0)"
           else
-            python3 ci/check_slot_present.py /tmp/slot_map_962.json 962 absent
+            python3 ci/check_slot_present.py /tmp/slot_map_962.json 962 completed
+            python3 ci/check_stat.py /tmp/stats_m0.json /tmp/stats_m1.json --delta late_duplicate=1 slot_created=0
           fi
       - name: "Scenario N (C4): accumulator overflow must never be reported as a sum"
         run: |
           set -euo pipefail
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_n0.json
           for w in 0 1 2; do
             sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 963 "$w" 3 1 1 20000.0 20000.0 2>/dev/null
           done
           sleep 1
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_n1.json
           if [ "$NETSUM_EXPECT_RED_N" = "1" ]; then
             python3 ci/assert_paramserver.py /tmp/ps.log 963 require 3 -5536.0
             echo "RED as expected (C4): 3 x 20000.0 wrapped to -5536.0"
           else
             python3 ci/assert_paramserver.py /tmp/ps.log 963 forbid
-            grep -q "\[overflow\] job=963" /tmp/ps.log
+            grep "\[overflow\] job=963" /tmp/ps.log
+            python3 ci/check_stat.py /tmp/stats_n0.json /tmp/stats_n1.json --delta overflow=1 tx_aggregate=1
           fi
       - name: "Scenario O (C1 hygiene): scenarios that finish cleanly leave no slot behind"
         run: |
@@ -507,7 +522,7 @@ jobs:
             echo "RED as expected (C1): completed jobs still hold slots"
           else
             for j in 100 103 104 105 106 950 951 962; do
-              python3 ci/check_slot_present.py /tmp/slot_map_o.json "$j" absent
+              python3 ci/check_slot_present.py /tmp/slot_map_o.json "$j" no-accumulating
             done
           fi
       - name: "Red/green ledger"
@@ -523,9 +538,9 @@ jobs:
           set +e
           echo "--- full paramserver log ---"
           cat /tmp/ps.log
-          echo "--- final drop_stats ---"
-          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/drop_stats > /tmp/drop_stats_final.json 2>&1
-          cat /tmp/drop_stats_final.json
+          echo "--- final stats (per-CPU counters, netsum_stats.h order) ---"
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_final.json 2>&1
+          python3 -c "import sys; sys.path.insert(0,'ci'); import netsum_bpf_json as n; print({k: v for k, v in n.stats('/tmp/stats_final.json').items() if v})"
           echo "--- final slot_map (intended leftovers: 900x2 from G, 952 from J; anything else is a bug -- see Scenarios M and O) ---"
           sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_final.json 2>&1
           cat /tmp/slot_map_final.json
@@ -544,11 +559,9 @@ jobs:
             /tmp/attach.log
             /tmp/link_show_veth0.log
             /tmp/ps.log
-            /tmp/drop_stats.json
-            /tmp/drop_stats_final.json
+            /tmp/stats_*.json
             /tmp/slot_map_final.json
             /tmp/job_quota.json
-            /tmp/drop_stats_quota.json
             /tmp/slot_map_952.json
             /tmp/slot_map_96*.json
             /tmp/slot_map_o.json

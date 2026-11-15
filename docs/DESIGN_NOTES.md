@@ -183,6 +183,66 @@ segment: there is no authentication, so a sender can forge any worker id or
 claim a smaller fan-in. A control-plane-registered fan-in would close the
 fan-in hole for registered jobs.
 
+## 5. Concurrency
+
+The kernel program runs concurrently on every CPU that receives packets.
+
+* **Slots** live in a `BPF_MAP_TYPE_HASH` whose value embeds a
+  `bpf_spin_lock`. Every read-modify-write of a slot (admission checks,
+  accumulation, completion, writing the result into the packet) happens under
+  that lock. No helper is called while it is held (the verifier forbids it),
+  so the clock is read and counters are bumped outside the lock.
+* **Slot creation** races are resolved by `bpf_map_update_elem(BPF_NOEXIST)`:
+  exactly one CPU creates the slot; the losers re-look it up and join it.
+* **Job quota** (bug C8): a slot is charged to its job *before* it is
+  created. `__sync_fetch_and_add` returns the previous count (a `BPF_FETCH`
+  atomic, compiled with `-mcpu=v3`), so concurrent CPUs cannot all pass the
+  limit; a CPU that ends up over the limit, or loses the creation race, gives
+  the unit back. Release is a saturating compare-and-swap loop (at most four
+  attempts), so two concurrent releases can never wrap the counter to
+  `0xFFFFFFFF`. The slot records whether it was charged (`charged`), so a
+  slot created while no quota was configured is never released against one.
+* When a job's count returns to zero its `job_quota_map` entry is deleted, so
+  256 distinct job ids cannot fill the map for good (C7). A CPU that charged
+  an entry at the same moment another CPU deleted it loses that unit; the
+  quota then under-counts by one until the job's next slot. That is accepted
+  and documented rather than taking a second lock.
+* **Lock ordering:** slot locks and job state are never held together. The
+  verifier allows only one held spin lock anyway.
+
+## 6. Verifier constraints
+
+Measured with `bpftool prog load` on the CI runner and on a local 7.0 kernel
+(`-mcpu=v3`, clang 22 on macOS / the runner's clang on Linux):
+
+| Version | Stack depth | Instructions processed |
+|---|---|---|
+| v1 (base `f7ea415`) | 352 bytes | 110,791 (CI, 6.17) |
+| v2 (this design) | 192 bytes | 177,407 (local 7.0.11) |
+
+* The 300-byte `struct grad_slot fresh = {0}` stack local is gone: new slots
+  are initialised from a zeroed per-CPU template map (`slot_template`). A
+  per-CPU map may not contain a `bpf_spin_lock`, so the template uses a twin
+  struct with a plain `uint32_t` in the lock's place; the kernel's value copy
+  skips the lock field anyway.
+* The accumulate loop is bounded by `NETSUM_MAX_CHUNK_LEN` and re-checks the
+  packet bound on every iteration, so the verifier can prove each access.
+  Accumulation and the write-back of the result into the packet are one loop:
+  whether this contribution completes the slot is known before the loop.
+* `chunk_len` from the parser is re-bounded locally before it is used in
+  pointer arithmetic.
+* `netsum_parse()` and `netsum_add_i32()` are forced inline: BPF does not
+  allow a call while a spin lock is held.
+
+## 11. Observability
+
+`protocol/netsum_stats.h` defines one counter enum used by every path. In the
+kernel it indexes a `BPF_MAP_TYPE_PERCPU_ARRAY` incremented with a plain
+`(*v)++` (no atomics, no cross-CPU cache traffic); readers sum across CPUs.
+agg and paramserver keep the same counters in a plain array and print them as
+one `[stats-all]` JSON line on SIGUSR1 and at exit. CI checks exact counter
+deltas per scenario (`ci/check_stat.py`), not "greater than zero".
+
 ## 7. Slot storage
 
 Userspace (`common/slot_table.h`, shared by agg and paramserver): an
@@ -245,15 +305,15 @@ Slot life cycle: `EMPTY -> ACCUMULATING -> COMPLETED -> EMPTY`, plus
 
 | ID | Bug | Status |
 |---|---|---|
-| C1 | late duplicate after completion re-creates a never-completing slot | fixed in userspace (tombstones); kernel: Phase 3 |
-| C2 | `worker_id` not checked against the fan-in | fixed in parser (all paths using it) |
-| C3 | fan-in taken from the first packet and never cross-checked | fixed in userspace; kernel: Phase 3 |
-| C4 | silent int32 wrap of the accumulator | fixed in userspace (`[overflow]`); kernel: Phase 3 |
+| C1 | late duplicate after completion re-creates a never-completing slot | fixed (tombstones) in userspace and kernel |
+| C2 | `worker_id` not checked against the fan-in | fixed in the shared parser |
+| C3 | fan-in taken from the first packet and never cross-checked | fixed in userspace and kernel |
+| C4 | silent int32 wrap of the accumulator | fixed (`[overflow]`, `OVERFLOW` flag) in userspace and kernel |
 | C5 | paramserver lacked agg's length and fan-in checks | fixed (shared parser) |
 | C6 | slot free broke linear-probe chains | fixed (backward-shift deletion) |
-| C7 | quota failed open after 256 job ids | fixed in userspace (free + fail closed); kernel: Phase 3 |
-| C8 | kernel quota check-then-act race, decrement underflow | kernel: Phase 3 |
-| C9 | forwarded aggregate keeps the worker's source MAC/IP | kernel: Phase 3 |
+| C7 | quota failed open after 256 job ids | fixed (free at zero, fail closed) in userspace and kernel |
+| C8 | kernel quota check-then-act race, decrement underflow | fixed (reserve-before-create, saturating CAS) |
+| C9 | forwarded aggregate keeps the worker's source MAC/IP | fixed (source rewritten from config); redirect to another interface supported |
 | C10 | v1 benchmark measured serial process launches | replaced in Phase 3.5 / 6 |
-| C11 | fuzzer tested copies of the checks | fixed: fuzzes `grad_parse.h`; kernel replay in Phase 3 |
+| C11 | fuzzer tested copies of the checks | fixed: fuzzes `grad_parse.h`; bpf-unit replays the corpus through the loaded program |
 | C12 | a test that could not fail; CI checks weaker than documented | fixed |

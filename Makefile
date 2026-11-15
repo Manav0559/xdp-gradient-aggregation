@@ -18,7 +18,7 @@ else
 BPF_CC = clang
 endif
 
-.PHONY: all clean test unit bpf
+.PHONY: all clean test unit bpf bpf-compat bpf-unit bpf-unit-bin
 
 all: $(BIN_DIR)/worker $(BIN_DIR)/paramserver $(BIN_DIR)/agg
 
@@ -44,9 +44,35 @@ test: all unit
 	python3 tests/test_correctness.py
 	python3 tests/test_protocol_v2.py
 
-bpf: xdp_agg/xdp_agg.c xdp_agg/bpf_compat.h protocol/grad_proto.h
-	$(BPF_CC) -target bpf -Wall -Wextra -O2 -g -c xdp_agg/xdp_agg.c -o xdp_agg/xdp_agg.o
-	@echo "compiled xdp_agg/xdp_agg.o -- codegen only; loading it needs a real Linux kernel (CI does this in .github/workflows/xdp-loadtest.yml, see docs/DEV_ENVIRONMENT.md)"
+# On Linux with libbpf headers installed, build against the real UAPI and
+# libbpf headers; otherwise use the vendored subset in xdp_agg/bpf_compat.h.
+# `make bpf-compat` forces the vendored build (CI compares the two).
+BPF_HDRS = xdp_agg/bpf_compat.h protocol/netsum_maps.h $(HDRS)
+BPF_CFLAGS = -target bpf -mcpu=v3 -Wall -Wextra -O2 -g
+ifeq ($(shell uname -s),Linux)
+ifneq ($(wildcard /usr/include/bpf/bpf_helpers.h),)
+BPF_CFLAGS += -DNETSUM_USE_SYSTEM_LIBBPF
+endif
+endif
+
+bpf: xdp_agg/xdp_agg.c $(BPF_HDRS)
+	$(BPF_CC) $(BPF_CFLAGS) -c xdp_agg/xdp_agg.c -o xdp_agg/xdp_agg.o
+	@echo "compiled xdp_agg/xdp_agg.o; load it with CI or netsum-ctl on Linux (docs/DEV_ENVIRONMENT.md)"
+
+bpf-compat: xdp_agg/xdp_agg.c $(BPF_HDRS)
+	$(BPF_CC) $(filter-out -DNETSUM_USE_SYSTEM_LIBBPF,$(BPF_CFLAGS)) -c xdp_agg/xdp_agg.c -o xdp_agg/xdp_agg_compat.o
+
+# BPF_PROG_TEST_RUN harness (Linux, libbpf, root).
+bpf-unit-bin: tests/bpf/run_xdp_tests.c protocol/netsum_maps.h $(HDRS) | $(BIN_DIR)
+	$(CC) -O2 -g -Wall -Wextra -o $(BIN_DIR)/run_xdp_tests tests/bpf/run_xdp_tests.c -lbpf -lelf -lz
+
+bpf-unit:
+ifeq ($(shell uname -s),Linux)
+	$(MAKE) bpf bpf-unit-bin
+	sudo ./$(BIN_DIR)/run_xdp_tests xdp_agg/xdp_agg.o fuzz/corpus
+else
+	@echo "bpf-unit requires Linux (BPF_PROG_TEST_RUN); it runs in CI (.github/workflows/bpf-unit.yml)"
+endif
 
 clean:
 	rm -rf $(BIN_DIR) xdp_agg/*.o

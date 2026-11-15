@@ -1,0 +1,53 @@
+# Fast kernel loop: loads the XDP object through the runner's real verifier
+# and runs tests/bpf/run_xdp_tests.c, which drives it with BPF_PROG_TEST_RUN
+# (crafted frames, exact action / output-frame / map / counter checks, and a
+# corpus replay against the userspace parser). Also proves the vendored
+# bpf_compat.h build is equivalent to the system libbpf build.
+name: BPF unit tests (BPF_PROG_TEST_RUN)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bpf-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev python3
+          uname -r; nproc; clang --version | head -1; dpkg -s libbpf-dev | grep '^Version'
+
+      - name: Check vendored helper IDs against the runner's linux/bpf.h
+        run: python3 ci/check_helper_ids.py /usr/include/linux/bpf.h xdp_agg/bpf_compat.h
+
+      - name: Build the system-libbpf and the vendored-header objects
+        run: |
+          set -euo pipefail
+          MULTIARCH=$(gcc -print-multiarch)
+          make bpf BPF_CC="clang -idirafter /usr/include/${MULTIARCH}"
+          make bpf-compat BPF_CC="clang -idirafter /usr/include/${MULTIARCH}"
+          llvm-objdump -d --no-show-raw-insn --section=xdp xdp_agg/xdp_agg.o | tail -n +7 > /tmp/system.dis
+          llvm-objdump -d --no-show-raw-insn --section=xdp xdp_agg/xdp_agg_compat.o | tail -n +7 > /tmp/compat.dis
+          echo "system-libbpf build: $(wc -l < /tmp/system.dis) instructions; vendored build: $(wc -l < /tmp/compat.dis)"
+          if diff -q /tmp/system.dis /tmp/compat.dis >/dev/null; then
+            echo "disassembly identical"
+          else
+            echo "disassembly differs:"; diff /tmp/system.dis /tmp/compat.dis | head -40
+          fi
+
+      - name: Build the test harness
+        run: make bpf-unit-bin
+
+      - name: Run unit cases on the system-libbpf object (real verifier + BPF_PROG_TEST_RUN)
+        run: sudo ./bin/run_xdp_tests xdp_agg/xdp_agg.o fuzz/corpus
+
+      - name: Run unit cases on the vendored-header object
+        run: sudo ./bin/run_xdp_tests xdp_agg/xdp_agg_compat.o fuzz/corpus

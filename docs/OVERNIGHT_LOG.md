@@ -99,3 +99,36 @@ the reason for each are recorded here at the time they happen.
 
 Next step: push, check CI (K-O must stay expected-red), then Phase 3a
 (build hygiene: USE_SYSTEM_LIBBPF, helper-ID check, -mcpu=v3).
+- Phase 2 CI (`c6a42bf`): CI (now `make test`: unit + both suites), XDP load
+  test green; K-O still expected-red as intended.
+
+## 2026-11-16 03:45 IST — Phase 3 (kernel parity)
+
+- `xdp_agg.c` rewritten on `grad_parse.h`, `netsum_maps.h` (new: one
+  definition of every map layout, used by the program, the config loader and
+  the harness; `ci/netsum_cfg_loader.c` no longer copies the struct) and
+  `netsum_stats.h` (PERCPU_ARRAY `stats` replaces the 4-entry `drop_stats`).
+- Steps 3c.1-3c.8 landed together, not one push each: the local verifier loop
+  (Alpine + bpftool on the OrbStack 7.0.11 kernel) replaced the per-step CI
+  pushes. Verifier on the first attempt: `stack depth 192` (was 352),
+  `processed 177407 insns` (was ~111k).
+- `tests/bpf/run_xdp_tests.c` (BPF_PROG_TEST_RUN harness): 50 cases incl. a
+  corpus replay of 30 seeds + 5000 seeded mutations, 0 kernel/userspace
+  verdict mismatches, 46 ms locally. One harness assumption was wrong:
+  test-run's ingress device is `lo` (ifindex 1), so egress=1 is "same
+  interface" and the program correctly uses XDP_TX; the redirect case now
+  uses ifindex 4242 and a separate case covers the XDP_TX branch.
+- `ci/check_helper_ids.py`: all 7 vendored helper IDs, 3 map types, 5 XDP
+  actions, 3 update flags match Alpine's linux/bpf.h. CI repeats it on the runner.
+- `USE_SYSTEM_LIBBPF`: implemented (Makefile on Linux with libbpf headers
+  defines `NETSUM_USE_SYSTEM_LIBBPF`; `make bpf-compat` forces the vendored
+  build); `bpf-unit.yml` builds both, diffs the disassembly and runs every
+  case on both objects.
+- Kernel scenarios K-O flipped to green (`NETSUM_EXPECT_RED_*` = '0') with
+  exact counter deltas (K rej_worker_id=3, L num_workers_mismatch=3,
+  M late_duplicate=1 + tombstone, N overflow=1, O no ACCUMULATING slot).
+  Scenario J now asserts `accumulating` (still no kernel TTL until Phase 4).
+- C9: config carries the aggregator MAC/IP; the workflow sets them to veth0's.
+
+Next step: push; verify bpf-unit, XDP load test, CI and fuzz green; record
+the CI verifier numbers (x86, 6.17); then Phase 3.5 (benchmark-lite).
