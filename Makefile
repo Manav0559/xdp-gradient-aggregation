@@ -46,6 +46,7 @@ unit: tests/unit/test_slot_table.c $(HDRS) | $(BIN_DIR)
 test: all unit
 	python3 tests/test_correctness.py
 	python3 tests/test_protocol_v2.py
+	python3 tests/test_reliability.py
 
 # On Linux with libbpf headers installed, build against the real UAPI and
 # libbpf headers; otherwise use the vendored subset in xdp_agg/bpf_compat.h.

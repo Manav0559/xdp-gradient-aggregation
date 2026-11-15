@@ -11,9 +11,10 @@ streaming, multi-tenant, fairness-aware gradient-aggregation mechanism — norma
 built on a Barefoot/Intel Tofino programmable switch — on an ordinary Linux box
 using XDP/eBPF instead. No specialized hardware.
 
-**Scope of the results:** correctness and fairness are tested, including on
-a real kernel in CI. No performance gain from XDP has been measured. See
-[Measured results](#measured-results-what-the-numbers-do-and-dont-show).
+**Scope of the results:** correctness is tested on a real kernel in CI. The
+first XDP measurement (benchmark-lite: one host, veth, generic XDP, open
+loop) is in [Measured results](#measured-results-benchmark-lite-first-xdp-numbers)
+and [`docs/RESULTS.md`](docs/RESULTS.md); it is not a line-rate claim.
 
 **Full project specification:** [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md)
 (also available as a formatted PDF: [`docs/NetSum_Project_Spec.pdf`](docs/NetSum_Project_Spec.pdf))
@@ -184,11 +185,36 @@ read-through. The one deliberately out-of-scope nuance (a stateful
 `slot->chunk_len` consistency check neither extracted function can model
 without a live slot table) is documented in `fuzz/README.md`, not hidden.
 
-### Measured results: what the numbers do and don't show
+### Measured results: benchmark-lite (first XDP numbers)
 
-**Short version:** no latency or throughput gain has been measured for
-aggregation in this repo. The XDP path has been checked for correctness on a
-real kernel only. Its performance has not been benchmarked.
+Open loop, one host, two network namespaces over veth, generic XDP, GitHub
+runner (Linux 7.0, 4 vCPU). Run 43759600920, 288 trials, packet accounting
+balanced in all of them. Full tables, method and caveats: `docs/RESULTS.md`.
+
+* With the sender unpaced, **XDP aggregation completed 1.46x / 1.23x / 1.54x
+  more rounds per second than the userspace aggregator** at 2 / 4 / 8 workers
+  (Holm-adjusted p = 0.0015 each, Cliff's delta 1.0). The sender is the
+  bottleneck on every path, so this measures how much faster one sender can
+  push through each path, not an aggregator ceiling.
+* The userspace aggregator **dropped work at 2 workers unpaced** (median
+  completion 0.85); XDP completed every round in every cell.
+* Inside the kernel the XDP program costs **145-254 ns per packet**; the
+  `agg` process spends 1.5-2.5 us of CPU per packet (not like-for-like:
+  neither includes the receive path before the hook or socket).
+* Up to 400k packets/s paced, all three paths complete every round.
+
+Not shown here: native-mode XDP, physical NICs, closed-loop round times
+(Phase 6 of this branch), and anything at line rate.
+
+### History: v1 benchmark (macOS loopback)
+
+The section below describes the original v1 benchmark and is kept as history.
+
+#### What the v1 numbers do and don't show
+
+**Short version (v1, superseded above):** the v1 benchmark measured no
+latency or throughput gain for aggregation, and it did not include the XDP
+path at all; benchmark-lite above is the first XDP measurement.
 
 **What was measured.** `scripts/benchmark.py` compares two userspace setups.
 In `noagg`, workers send straight to the parameter server. In `useragg`,

@@ -169,3 +169,32 @@ the CI verifier numbers (x86, 6.17); then Phase 3.5 (benchmark-lite).
   seed 1234), ratio of medians with bootstrap 95% CI, Holm within each family.
   Paced cells (100k/200k/400k pps) and per-packet costs are descriptive only;
   open-loop goodput at a paced rate equals the offered rate. 8 trials per cell.
+- Phase 4 plan reviewed before coding. Adopted: (a) close 3.5 first (commit
+  the artifact + write-up); (b) FLUSHED is set in the kernel by a second
+  program run through BPF_PROG_TEST_RUN by the sweeper (no userspace
+  whole-value rewrite), 45-min cap, fallback = guarded BPF_F_LOCK update with
+  the race documented; (c) PS re-sends the stored result for any late packet
+  on a completed key (lost-result liveness), red test first; (d) REGISTER is
+  idempotent and simply re-sent, no new ack kind; (e) ACKs go to the
+  aggregator's gradient port 9876 with the ACK flag (one socket in agg, one
+  dispatch in XDP): ack_port / NETSUM_ACK_PORT removed.
+
+Next step: when bench-lite run (workflow "Benchmark-lite") finishes, download
+artifact bench-lite-<id> into bench/lite/, commit with the run ID, write the
+README/RESULTS lite section and DESIGN_NOTES §15; then Phase 4a in userspace.
+- bench-lite run 43759600920 (head `29acb78`, merge ref `3b0cc35`), Linux
+  `7.0.0-1014-aws`, 4 vCPU Xeon 6975P-C, `xdpgeneric` read back, 8 trials x
+  36 cells = 288 trials, ~7 min. Accounting balanced 288/288.
+  F1 (unpaced goodput xdp/useragg): 1.464 [1.362, 1.512], 1.232 [1.133, 1.384],
+  1.536 [1.467, 1.575] at 2/4/8 workers, p_Holm 0.0015 each, delta 1.0.
+  F2 (unpaced completion): useragg 0.8523 vs xdp 1.0 at 2 workers (p_Holm 0.006);
+  equal (1.0) at 4 and 8. XDP 145-254 ns/run; agg 1.5-2.5 us on-CPU/packet.
+  Every paced cell completed 100% on all paths.
+  Caveat written into RESULTS.md: unpaced goodput ~= sender pps / workers on
+  every path, so F1 shows the sender pushes more through XDP (likely: veth
+  receive work runs on the sending CPU and XDP_DROP ends it before the UDP
+  layer; /proc/softirqs not captured, so marked unverified).
+- Workflow bug: the analysis step ran as the runner user on a root-owned
+  output dir and `| tee` hid the failure, so the artifact has only raw.csv and
+  environment.json. The committed tables are the committed analyzer run on
+  the committed raw.csv. Fix in Phase 6's bench workflow (pipefail, chown).

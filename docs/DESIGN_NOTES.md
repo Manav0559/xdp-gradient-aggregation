@@ -212,13 +212,12 @@ The kernel program runs concurrently on every CPU that receives packets.
 
 ## 6. Verifier constraints
 
-Measured with `bpftool prog load` on the CI runner and on a local 7.0 kernel
-(`-mcpu=v3`, clang 22 on macOS / the runner's clang on Linux):
+Measured with `bpftool prog load` in the XDP load-test workflow (`-mcpu=v3`):
 
-| Version | Stack depth | Instructions processed |
-|---|---|---|
-| v1 (base `f7ea415`) | 352 bytes | 110,791 (CI, 6.17) |
-| v2 (this design) | 192 bytes | 177,407 (local 7.0.11) |
+| Version | Kernel | Stack depth | Instructions processed | Run |
+|---|---|---|---|---|
+| v1 (base `f7ea415`) | 6.17 x86_64 | 352 bytes | 110,791 | 38114728912 |
+| v2 Phase 3 (`96548ae`) | 7.0.0-1017-azure x86_64 | 200 bytes | 158,454 | 43758934811 |
 
 * The 300-byte `struct grad_slot fresh = {0}` stack local is gone: new slots
   are initialised from a zeroed per-CPU template map (`slot_template`). A
@@ -300,6 +299,47 @@ Slot life cycle: `EMPTY -> ACCUMULATING -> COMPLETED -> EMPTY`, plus
   Scenarios for open bugs assert the bug's symptom while their
   `NETSUM_EXPECT_RED_*` flag is set, so a script error or an unexpected fix
   fails the run.
+
+## 15. Benchmark methodology
+
+**Benchmark-lite** (`scripts/bench_lite.sh`, workflow `bench-lite.yml`) is the
+first measurement of the XDP path. It is deliberately small and runs on the
+correctness topology:
+
+* **Topology:** one host, two network namespaces joined by a veth pair. The
+  aggregator side is the root namespace (`veth0`, 10.200.1.1, XDP attached in
+  `xdpgeneric` mode); the parameter server runs in `ns1` (`veth1`, 10.200.1.2).
+  * noagg: the sender (root ns) sends every contribution to the PS: one veth crossing.
+  * useragg: the sender (ns1) sends to `agg` in the root ns, which forwards one aggregate per round to the PS.
+  * xdp: the sender (ns1) sends to `veth0`; the XDP program consumes partial contributions and bounces each completed aggregate back with `XDP_TX`.
+* **Load:** `bench/lite_sender.c`, one process, round-major order (all workers
+  of round r, then r+1), single-chunk rounds of 16 values, paced open loop at
+  100k / 200k / 400k packets/s or unpaced. Nothing waits for results; there is
+  no result path yet.
+* **Per trial:** 25,000 rounds; the PS and agg are restarted and the XDP
+  program reloaded, so every trial starts from empty maps (kernel tombstones
+  are not retired until Phase 4, and 25,000 stays below the 65,536-slot map).
+* **Metrics:** completion ratio (rounds completed at the PS / rounds offered);
+  goodput (completed rounds / time between first and last completion);
+  sender rate achieved; XDP program cost `run_time_ns / run_cnt` from
+  `kernel.bpf_stats_enabled`; on-CPU time of agg and PS from
+  `/proc/<pid>/schedstat` divided by packets they received; UDP
+  `RcvbufErrors` on both sides.
+* **Accounting identity (checked per trial):** every packet sent is either
+  received at the next hop or counted as a socket drop there, and every packet
+  the XDP program sees ends in exactly one outcome counter. Loss is not an
+  imbalance; it lowers the completion ratio.
+* **Statistics:** medians with percentile-bootstrap 95% CIs over trials (the
+  independent unit). Pre-registered tests, per worker count, useragg vs xdp
+  with the sender unpaced: F1 goodput, F2 completion ratio; two-sided
+  permutation test on Cliff's delta (2,000 relabelings, seed 1234), ratio of
+  medians with a bootstrap CI, Holm-Bonferroni within each family. Paced
+  cells are descriptive: in an open loop their goodput equals the offered rate.
+* **Caveats:** GitHub-hosted runners are shared VMs; veth is a software
+  device; generic XDP runs after the kernel has built an skb, so it skips the
+  socket layer but not packet allocation; the sender, the aggregator and the
+  PS share one host's CPUs and nothing is pinned. Numbers compare paths on the
+  same machine in the same run; they are not line-rate claims.
 
 ## 16. Known issues
 

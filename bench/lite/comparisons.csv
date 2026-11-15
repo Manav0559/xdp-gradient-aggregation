@@ -1,0 +1,7 @@
+family,workers,rate_pps,metric,xdp_median,useragg_median,ratio_xdp_over_useragg,ratio_ci_lo,ratio_ci_hi,cliffs_delta,p,p_holm
+F1_goodput_unpaced,2,0,goodput_rounds_per_s,313209,214011,1.46352,1.36207,1.51236,1,0.00049975,0.00149925
+F1_goodput_unpaced,4,0,goodput_rounds_per_s,181625,147368,1.23246,1.1333,1.38364,1,0.0009995,0.00149925
+F1_goodput_unpaced,8,0,goodput_rounds_per_s,107110,69727.2,1.53613,1.46725,1.57549,1,0.00049975,0.00149925
+F2_completion_unpaced,2,0,completion_ratio,1,0.85234,1.17324,1.00982,1.32114,0.875,0.001999,0.005997
+F2_completion_unpaced,4,0,completion_ratio,1,1,1,1,1,0,1,1
+F2_completion_unpaced,8,0,completion_ratio,1,1,1,1,1,0,1,1
