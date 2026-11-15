@@ -196,6 +196,10 @@ static void test_parse(void)
     CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_OK && p.kind == NETSUM_KIND_AGGREGATE, "aggregate");
     h->flags = netsum_htons(NETSUM_FLAGS_V2 | NETSUM_F_RESEND);
     CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_REJ_FLAG_COMBO, "resend aggregate");
+    h->flags = netsum_htons(NETSUM_FLAGS_V2 | NETSUM_F_ACK | NETSUM_F_OVERFLOW);
+    CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_OK && p.kind == NETSUM_KIND_ACK, "overflow result");
+    h->flags = netsum_htons(NETSUM_FLAGS_V2 | NETSUM_F_ACK | NETSUM_F_RESEND);
+    CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_REJ_FLAG_COMBO, "ACK|RESEND");
     h->flags = netsum_htons(NETSUM_FLAGS_V2 | 0x0040);
     CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_REJ_RESERVED_FLAGS, "reserved");
     h->flags = netsum_htons(0x3000);

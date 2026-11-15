@@ -42,7 +42,7 @@ ref_result ref_parse(const std::uint8_t *d, std::size_t n)
         if (bits != REGISTER || aggregate_id) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }
         r.kind = NETSUM_KIND_REGISTER;
     } else if (bits & ACK) {
-        if (bits != ACK || !aggregate_id) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }
+        if ((bits & ~OVERFLOW) != ACK || !aggregate_id) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }
         r.kind = NETSUM_KIND_ACK;
     } else if (aggregate_id) {
         if (bits & (RESEND | FALLBACK)) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }

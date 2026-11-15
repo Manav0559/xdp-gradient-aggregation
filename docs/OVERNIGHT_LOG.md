@@ -198,3 +198,30 @@ README/RESULTS lite section and DESIGN_NOTES §15; then Phase 4a in userspace.
   output dir and `| tee` hid the failure, so the artifact has only raw.csv and
   environment.json. The committed tables are the committed analyzer run on
   the committed raw.csv. Fix in Phase 6's bench workflow (pipefail, chown).
+
+## 2026-11-16 05:45 IST — Phase 4a + 4d in userspace
+
+- `tests/test_reliability.py`: 7 tests written first, all XFAIL on the
+  previous commit (no results, no `--ack-to`, no RESEND handling, no reliable mode).
+- New bug **C13** (found while planning, not in the original audit): a worker
+  whose result is lost could never finish, because the PS ignored late
+  packets for keys it had completed. Fixed: the PS re-sends the stored result
+  on any RESEND / fallback / partial / aggregate for a completed key.
+- Parser: ACK may carry OVERFLOW (an overflowed round still needs a result so
+  workers stop retrying). Fuzzer reference, corpus (`v2_ack_overflow.bin`) and
+  unit test updated in the same commit; 15 s local fuzz clean.
+- PS: REGISTER/direct-sender address book, results to workers and `--ack-to`.
+  agg: ACK retirement, RESEND table (re-send aggregate / flush PARTIAL ->
+  FLUSHED / forward FALLBACK). worker: `--mode reliable` (window, RTO with
+  backoff, RESEND, REGISTER on every retransmit, `--sync`, drop injection,
+  JSON summary with round-time percentiles).
+- Reliable useragg run with drops (3 workers, 8 x 1024 values, drop every 5th
+  tx and 7th result): 128/128 results per worker, 0 mismatches; agg 149 slots
+  created / 149 retired by ACK, 16 partial flushes, 42 fallbacks; PS 21 result
+  re-sends.
+- One test bug fixed on the way (C13 test never drained the PS log before
+  counting `[complete]` lines).
+
+Next step: port ACK / RESEND / FLUSHED rows to xdp_agg.c with bpf-unit cases
+(local Alpine loop), remove ack_port; then the 4b sweeper (kernel-side flush
+program run via BPF_PROG_TEST_RUN); then 4c.

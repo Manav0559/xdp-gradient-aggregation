@@ -164,9 +164,9 @@ static inline unsigned bitmap_span(const uint8_t *bm)
     return 0;
 }
 
-/* FIFO of completed keys, used to retire tombstones after a TTL without
+/* FIFO of completed (or flushed) keys, used to retire tombstones after a TTL without
  * scanning the table. An entry is acted on only if the slot still exists,
- * is COMPLETED, and completed at the recorded time. */
+ * is COMPLETED or FLUSHED, and reached that state at the recorded time. */
 struct tomb_entry {
     struct slot_key key;
     int64_t completed_us;
@@ -193,7 +193,8 @@ static inline int tomb_pop_retire(struct tomb_fifo *f, struct slot_table *t)
     f->head = (f->head + 1) % f->cap;
     f->len--;
     struct slot *s = st_find(t, e.key);
-    if (s && s->state == SLOT_COMPLETED && s->completed_us == e.completed_us) {
+    if (s && (s->state == SLOT_COMPLETED || s->state == SLOT_FLUSHED) &&
+        s->completed_us == e.completed_us) {
         st_delete(t, s);
         return 1;
     }

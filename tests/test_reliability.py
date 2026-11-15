@@ -87,7 +87,6 @@ def start_agg(ps_port, *flags):
 
 # ---- 4a: results and ACK retirement ----------------------------------------
 
-@expect_fail("G1")
 def test_g1_ps_sends_result_to_registered_workers():
     ps, port = start_ps()
     w = [Endpoint(), Endpoint()]
@@ -107,7 +106,6 @@ def test_g1_ps_sends_result_to_registered_workers():
         assert acks[0]["vals"] == [fx(1.5) * 2] and acks[0]["bitmap"] == bitmap(0, 1), acks[0]
 
 
-@expect_fail("G1")
 def test_g1_ack_retires_aggregator_tombstone():
     ps_port = free_port()
     agg, agg_port = start_agg(ps_port)
@@ -128,7 +126,6 @@ def test_g1_ack_retires_aggregator_tombstone():
 
 # ---- C13: a lost result must be recoverable ---------------------------------
 
-@expect_fail("C13")
 def test_c13_resend_after_completion_gets_the_result_again():
     ps, port = start_ps()
     w = [Endpoint(), Endpoint()]
@@ -139,6 +136,7 @@ def test_c13_resend_after_completion_gets_the_result_again():
         first = [e.results() for e in w]
         w[1].send(port, 502, 0, 1, 2, 2.0, flags=RESEND)  # worker 1 lost its result
         again = w[1].results()
+        ps.drain_for(0.1)
     finally:
         ps.stop()
         for e in w:
@@ -151,7 +149,6 @@ def test_c13_resend_after_completion_gets_the_result_again():
 
 # ---- 4d aggregator RESEND table ----------------------------------------------
 
-@expect_fail("G2")
 def test_g2_resend_on_completed_slot_resends_aggregate():
     ps_port = free_port()
     ps = Server([PARAMSERVER, str(ps_port), "agg"])
@@ -174,7 +171,6 @@ def test_g2_resend_on_completed_slot_resends_aggregate():
     assert len(extract_complete_lines(ps.text())) == 1, ps.text()
 
 
-@expect_fail("G2")
 def test_g2_resend_duplicate_flushes_partial_then_falls_back():
     ps_port = free_port()
     ps = Server([PARAMSERVER, str(ps_port), "agg"])
@@ -219,7 +215,6 @@ def run_reliable(target_port, ps_port, job, n, rounds, vector_len, extra=(), tim
     return out
 
 
-@expect_fail("G2")
 def test_g2_reliable_workers_noagg_with_drops():
     ps, port = start_ps("--quiet")
     try:
@@ -231,7 +226,6 @@ def test_g2_reliable_workers_noagg_with_drops():
         assert r["result_mismatches"] == 0 and r["resent"] > 0, r
 
 
-@expect_fail("G2")
 def test_g2_reliable_workers_useragg_with_lost_contributions_and_results():
     ps_port = free_port()
     agg, agg_port = start_agg(ps_port, "--quiet")

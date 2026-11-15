@@ -284,6 +284,62 @@ Slot life cycle: `EMPTY -> ACCUMULATING -> COMPLETED -> EMPTY`, plus
 | ACCUMULATING | add; complete if all workers present | count `duplicate`, drop | count, drop | - | reap (agg `slot_ttl_ms`) |
 | COMPLETED | count `late_duplicate`, drop | count `late_duplicate`, drop | count mismatch, drop | count `late_duplicate`, drop | delete |
 
+## 9. Reliability
+
+NetSum follows ATP's end-host reliability design, adapted to one aggregator
+per path:
+
+* **Result path (ACK).** When the parameter server completes a
+  `(job, round, chunk)` it sends one result packet (`ACK`, `worker_id 0xFFFF`,
+  the sum and the contributor bitmap; `ACK|OVERFLOW` if the sum overflowed)
+  first to the aggregator (`--ack-to`), which retires its slot, then to every
+  worker it knows for that job. Workers make themselves known with an
+  idempotent `REGISTER` packet sent at start-up and again with every
+  retransmission, so a lost registration heals itself; a worker that sends
+  directly to the PS (no aggregator) is also learned from its packets. ACKs
+  for the aggregator go to its normal gradient port (9876) and are told apart
+  by the `ACK` flag: one socket in `agg`, one port dispatch in XDP. ATP uses
+  IGMP multicast for parameters; NetSum unicasts.
+* **Worker (`worker --mode reliable`).** A gradient of `--vector-len` values
+  per round is cut into chunks of up to 64 values. Up to `--window` chunks are
+  in flight; a chunk without a result after its RTO (`--rto-ms`, default 50)
+  is re-sent with `RESEND`, the RTO doubles up to 1 s, and after
+  `--max-retries` (default 10) the worker exits with code 2. `--sync` waits
+  for every result of round r before starting round r+1. In `--fixed` mode the
+  worker checks every result lane against `workers x value`.
+  `--drop-every K` and `--drop-result-every K` simulate the loss of every K-th
+  first transmission and every K-th result.
+* **Aggregator on RESEND** (agg now; XDP in the next step):
+
+| Slot state | RESEND contribution | Action |
+|---|---|---|
+| none | - | create and accept (the original never arrived) |
+| ACCUMULATING | worker not yet in bitmap | accept (the original was lost) |
+| ACCUMULATING | worker already in bitmap | **flush**: send the partial sum and bitmap to the PS as `PARTIAL`, mark the slot `FLUSHED`, release its quota unit |
+| COMPLETED | any | re-send the stored aggregate (the aggregate or the result was lost) |
+| FLUSHED | any (or a new worker) | forward the contribution itself as `FALLBACK`; the PS owns the key now |
+
+* **Parameter server on a key it already completed:** a RESEND, a fallback,
+  a partial or an aggregate means somebody is still waiting, almost always
+  because a result was lost, so the PS re-sends the stored result (bug C13:
+  before this, a worker whose result was lost could never finish). A plain
+  duplicate without RESEND is only counted.
+* **Retry horizon.** A worker gives up after about 50+100+200+400+800 ms +
+  5 x 1 s ~= 6.5 s. The PS keeps completed keys for `--tombstone-ttl-ms`
+  (default 10 s), longer than that, so any resend inside the horizon finds
+  the result. The aggregator's tombstones only need to cover the time until
+  the ACK; after an ACK, a late resend opens a fresh slot, its next resend
+  flushes it as a partial, and the PS answers with the stored result. That
+  costs one extra RTO in the rare lost-result case and keeps the aggregator's
+  state small.
+
+Measured on the userspace path (`tests/test_reliability.py`, 3 workers x 8
+rounds x 1024 values, every 5th first transmission and every 7th result
+dropped): every worker received all 128 results with correct sums; the
+aggregator created 149 slots (21 re-opened by resends after a lost result),
+flushed 16 partials, forwarded 42 fallbacks, and every slot was retired by an
+ACK; the PS re-sent 21 results.
+
 ## 14. Testing strategy
 
 * `tests/test_correctness.py`: end-to-end behaviour of the real binaries.
@@ -357,3 +413,4 @@ correctness topology:
 | C10 | v1 benchmark measured serial process launches | replaced in Phase 3.5 / 6 |
 | C11 | fuzzer tested copies of the checks | fixed: fuzzes `grad_parse.h`; bpf-unit replays the corpus through the loaded program |
 | C12 | a test that could not fail; CI checks weaker than documented | fixed |
+| C13 | a lost result could never be recovered: the PS ignored late packets for keys it had completed | fixed: the PS re-sends the stored result |

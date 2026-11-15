@@ -147,7 +147,7 @@ static void reap_expired(int64_t now)
     }
 }
 
-static void emit_aggregate(const struct slot *s)
+static void emit_aggregate(const struct slot *s, uint16_t extra_flags)
 {
     uint8_t out[NETSUM_MAX_PACKET_SIZE];
     struct grad_hdr *h = (struct grad_hdr *)out;
@@ -158,7 +158,7 @@ static void emit_aggregate(const struct slot *s)
     h->worker_id = htons(NETSUM_WORKER_AGGREGATE);
     h->num_workers = htons(s->fanin);
     h->chunk_len = htons(s->chunk_len);
-    h->flags = htons((uint16_t)(NETSUM_FLAGS_V2 | (s->overflowed ? NETSUM_F_OVERFLOW : 0)));
+    h->flags = htons((uint16_t)(NETSUM_FLAGS_V2 | extra_flags | (s->overflowed ? NETSUM_F_OVERFLOW : 0)));
     for (int i = 0; i < s->chunk_len; i++)
         vals[i] = (int32_t)htonl((uint32_t)s->sum[i]);
     memcpy(out + NETSUM_HDR_SIZE + (size_t)s->chunk_len * 4, s->bitmap, NETSUM_BITMAP_BYTES);
@@ -168,7 +168,48 @@ static void emit_aggregate(const struct slot *s)
         return;
     }
     g.packets_out++;
-    g.stats[NS_TX_AGGREGATE]++;
+    g.stats[(extra_flags & NETSUM_F_PARTIAL) ? NS_TX_PARTIAL : NS_TX_AGGREGATE]++;
+}
+
+/* Forwards a raw contribution unchanged except for the FALLBACK flag, so the
+ * parameter server aggregates it itself. */
+static void forward_fallback(const uint8_t *pkt, const struct netsum_parsed *p)
+{
+    uint8_t out[NETSUM_MAX_PACKET_SIZE];
+    size_t len = NETSUM_HDR_SIZE + p->payload_len;
+    memcpy(out, pkt, len);
+    ((struct grad_hdr *)out)->flags = htons((uint16_t)(p->flags | NETSUM_F_FALLBACK));
+    if (sendto(g.out_sock, out, len, 0, (struct sockaddr *)&g.downstream, sizeof(g.downstream)) >= 0)
+        g.stats[NS_TX_FALLBACK]++;
+}
+
+static void retire_state(struct slot *s, int64_t now, uint8_t state)
+{
+    s->state = state;
+    s->completed_us = now;
+    g.stats[NS_SLOT_RETIRED_TTL] += (uint64_t)tomb_push(&g.tombs, &g.table, s->key, now);
+}
+
+/* ACK from the parameter server: the key is finished everywhere, so drop all
+ * state for it. An ACK for a slot still accumulating means the PS completed
+ * the key without us (fallback or partials); our partial sum is stale. */
+static void handle_ack(const struct netsum_parsed *p)
+{
+    g.stats[NS_ACK_SEEN]++;
+    struct slot *s = st_find(&g.table, (struct slot_key){p->job_id, p->round, p->chunk_id});
+    if (!s) {
+        g.stats[NS_ACK_UNEXPECTED]++;
+        return;
+    }
+    if (s->state == SLOT_ACCUMULATING) {
+        g.stats[NS_ACK_UNEXPECTED]++;
+        uint32_t job_id = s->key.job_id;
+        st_delete(&g.table, s);
+        job_release_slot(job_id);
+        return;
+    }
+    st_delete(&g.table, s);
+    g.stats[NS_SLOT_RETIRED_ACK]++;
 }
 
 static void admission_reject(const struct netsum_parsed *p, enum netsum_stat why)
@@ -225,15 +266,41 @@ static void handle_contribution(const uint8_t *pkt, const struct netsum_parsed *
                     p->job_id, p->round, p->chunk_id, p->worker_id, p->chunk_len, s->chunk_len);
         return;
     }
+    int resend = (p->flags & NETSUM_F_RESEND) != 0;
     if (s->state == SLOT_COMPLETED) {
+        if (resend) {
+            /* The aggregate or the PS's result was lost: send the stored sum again. */
+            g.stats[NS_TX_RESULT_RESEND]++;
+            emit_aggregate(s, 0);
+            return;
+        }
         g.stats[NS_LATE_DUPLICATE]++;
         if (!g.quiet)
             fprintf(stderr, "[late-dup] job=%u round=%u chunk=%u worker=%u -- round already completed\n",
                     p->job_id, p->round, p->chunk_id, p->worker_id);
         return;
     }
+    if (s->state == SLOT_FLUSHED) {
+        if (bitmap_test(s->bitmap, p->worker_id) && !resend) {
+            g.stats[NS_DUPLICATE]++;
+            return;
+        }
+        forward_fallback(pkt, p); /* the PS owns this key now */
+        return;
+    }
+    if (bitmap_test(s->bitmap, p->worker_id) && resend) {
+        /* A worker resending something we hold: the round is stuck on another
+         * worker's lost packet. Hand the partial sum to the PS (ATP's flush). */
+        g.stats[NS_RESEND_DUPLICATE]++;
+        g.stats[NS_SLOT_FLUSHED_PARTIAL]++;
+        emit_aggregate(s, NETSUM_F_PARTIAL);
+        uint32_t job_id = s->key.job_id;
+        retire_state(s, now, SLOT_FLUSHED);
+        job_release_slot(job_id);
+        return;
+    }
     if (bitmap_test(s->bitmap, p->worker_id)) {
-        g.stats[(p->flags & NETSUM_F_RESEND) ? NS_RESEND_DUPLICATE : NS_DUPLICATE]++;
+        g.stats[NS_DUPLICATE]++;
         if (!g.quiet)
             fprintf(stderr, "[dup] job=%u round=%u chunk=%u worker=%u already contributed -- dropping duplicate\n",
                     p->job_id, p->round, p->chunk_id, p->worker_id);
@@ -263,12 +330,10 @@ static void handle_contribution(const uint8_t *pkt, const struct netsum_parsed *
                 p->job_id, p->round, p->chunk_id, s->contributions, netsum_to_double(s->sum[0]),
                 (long long)(now - s->first_us));
     }
-    emit_aggregate(s);
-    s->state = SLOT_COMPLETED;
-    s->completed_us = now;
+    emit_aggregate(s, 0);
     g.stats[NS_SLOT_COMPLETED]++;
+    retire_state(s, now, SLOT_COMPLETED);
     job_release_slot(p->job_id);
-    g.stats[NS_SLOT_RETIRED_TTL] += (uint64_t)tomb_push(&g.tombs, &g.table, key, now);
 }
 
 static void usage(const char *prog)
@@ -396,6 +461,10 @@ int main(int argc, char **argv)
         enum netsum_verdict v = netsum_parse(pkt, pkt + n, &p);
         if (v != NETSUM_OK) {
             g.stats[NS_FROM_VERDICT(v)]++;
+            continue;
+        }
+        if (p.kind == NETSUM_KIND_ACK) {
+            handle_ack(&p);
             continue;
         }
         if (p.kind != NETSUM_KIND_RAW) {

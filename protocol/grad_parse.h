@@ -84,7 +84,7 @@ netsum_parse(const void *data, const void *data_end, struct netsum_parsed *out)
             return NETSUM_REJ_FLAG_COMBO;
         out->kind = NETSUM_KIND_REGISTER;
     } else if (f & NETSUM_F_ACK) {
-        if (f != NETSUM_F_ACK || !agg_id)
+        if ((f & ~NETSUM_F_OVERFLOW) != NETSUM_F_ACK || !agg_id)
             return NETSUM_REJ_FLAG_COMBO;
         out->kind = NETSUM_KIND_ACK;
     } else if (agg_id) {

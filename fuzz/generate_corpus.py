@@ -37,6 +37,7 @@ SEEDS = {
     "v2_aggregate_overflow.bin": pkt(AGG, 3, 4, flags=V2 | OVERFLOW, trailer=bitmap(0, 1, 2)),
     "v2_partial.bin": pkt(AGG, 3, 4, flags=V2 | PARTIAL, trailer=bitmap(0, 1)),
     "v2_ack.bin": pkt(AGG, 3, 4, flags=V2 | ACK),
+    "v2_ack_overflow.bin": pkt(AGG, 3, 4, flags=V2 | ACK | OVERFLOW),
     "v2_register.bin": pkt(1, 3, 0, [], flags=V2 | REGISTER),
     "empty.bin": b"",
     "too_short.bin": b"\x00" * 10,
