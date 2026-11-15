@@ -49,6 +49,9 @@ def main():
     os.makedirs(out, exist_ok=True)
     rng = random.Random(RNG_SEED)
     tp, lat = read(os.path.join(src, "throughput.csv")), read(os.path.join(src, "latency.csv"))
+    if not tp and not lat:
+        print("no benchmark rows found (the run failed before the first trial completed)")
+        return 1
     rounds_rows, fair = read(os.path.join(src, "latency_rounds.csv")), read(os.path.join(src, "fairness.csv"))
     env = {}
     if os.path.exists(os.path.join(src, "environment.json")):
@@ -97,6 +100,8 @@ def main():
                 for i in range(len(rs[0]["net_rx_softirqs_by_cpu"].split("|")))),
         })
     with open(os.path.join(out, "summary_throughput.csv"), "w", newline="") as fh:
+        if not tp_summary:
+            tp_summary = [{"config": "-"}]
         w = csv.DictWriter(fh, fieldnames=list(tp_summary[0].keys()))
         w.writeheader()
         for s in tp_summary:
@@ -131,6 +136,8 @@ def main():
             "xdp_ns_per_run": median(runs) if runs else None,
         })
     with open(os.path.join(out, "summary_latency.csv"), "w", newline="") as fh:
+        if not lat_summary:
+            lat_summary = [{"config": "-"}]
         w = csv.DictWriter(fh, fieldnames=list(lat_summary[0].keys()))
         w.writeheader()
         for s in lat_summary:

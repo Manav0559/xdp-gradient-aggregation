@@ -418,8 +418,10 @@ locked:
 #pragma unroll
         for (int b = 0; b < NETSUM_BITMAP_BYTES; b++)
             slot->bitmap[b] = 0;
-        for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++)
+        for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++) {
             slot->sum[i] = 0;
+            asm volatile("" ::: "memory"); /* keep LLVM from turning this into memset() */
+        }
     }
     int held = (slot->bitmap[(p.worker_id >> 3) & 31] >> (p.worker_id & 7)) & 1;
     if (array && (slot->tag.job_id != key.job_id || slot->tag.round != key.round ||

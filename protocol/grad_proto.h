@@ -21,7 +21,12 @@
 #include <stdint.h>
 
 #define NETSUM_PORT 9876
-#define NETSUM_MAX_CHUNK_LEN 64  /* fixed-point values per packet, at most */
+/* Values per packet, at most. Overridable at build time
+ * (-DNETSUM_MAX_CHUNK_LEN=N) to measure the verifier cost of larger packets;
+ * every component must be built with the same value. */
+#ifndef NETSUM_MAX_CHUNK_LEN
+#define NETSUM_MAX_CHUNK_LEN 64
+#endif
 #define NETSUM_Q_FRAC_BITS 16    /* Q16.16: 16 fractional bits */
 
 /* On-the-wire header. Packed explicitly (no compiler-inserted padding) --

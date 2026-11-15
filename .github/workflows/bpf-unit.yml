@@ -51,3 +51,29 @@ jobs:
 
       - name: Run unit cases on the vendored-header object
         run: sudo ./bin/run_xdp_tests xdp_agg/xdp_agg_compat.o fuzz/corpus
+
+      - name: Verifier cost of larger packets (NETSUM_MAX_CHUNK_LEN 64 / 128 / 256)
+        run: |
+          set -uo pipefail
+          make ctl >/dev/null
+          MULTIARCH=$(gcc -print-multiarch)
+          echo "| max values/packet | program | loaded | insns processed | stack depth |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|---|" | tee -a "$GITHUB_STEP_SUMMARY"
+          for n in 64 128 256; do
+            clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH} -target bpf -mcpu=v3 -O2 -g \
+              -DNETSUM_USE_SYSTEM_LIBBPF -DNETSUM_MAX_CHUNK_LEN=$n -c xdp_agg/xdp_agg.c -o /tmp/x$n.o
+            sudo ./bin/netsum-ctl --json verify --obj /tmp/x$n.o > /tmp/v$n.json 2>/tmp/v$n.err || true
+            python3 - "$n" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          n = sys.argv[1]
+          try:
+              rows = json.load(open(f"/tmp/v{n}.json"))
+          except Exception:
+              rows = []
+          err = open(f"/tmp/v{n}.err").read().strip().splitlines()
+          for r in rows:
+              print(f"| {n} | {r['program']} | {r['loaded']} | {r['insns_processed']} | {r['stack_depth']} |")
+          if not rows or not all(r["loaded"] for r in rows):
+              print(f"| {n} | (verifier) | rejected | {err[-1] if err else '?'} | |")
+          PY
+          done

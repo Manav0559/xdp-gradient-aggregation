@@ -29,10 +29,6 @@ jobs:
           sudo apt-get install -y clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev python3 iproute2
           sudo modprobe veth || true
           sudo modprobe sch_netem || true
-          sudo apt-get install -y linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" || true
-          for f in "/usr/lib/linux-tools/$(uname -r)/bpftool" /usr/lib/linux-tools/*/bpftool; do
-            if [ -x "$f" ]; then echo "BPFTOOL=$f" >> "$GITHUB_ENV"; break; fi
-          done
 
       - name: Build
         run: |
@@ -42,19 +38,10 @@ jobs:
           make all ctl
           llvm-objdump -h xdp_agg/xdp_agg.o
 
-      - name: Verifier evidence (both programs; log kept as an artifact)
+      - name: Verifier evidence (both programs, via libbpf)
         run: |
           set -euo pipefail
-          sudo mkdir -p /sys/fs/bpf/netsum_verify
-          set +e
-          sudo "$BPFTOOL" -d prog loadall xdp_agg/xdp_agg.o /sys/fs/bpf/netsum_verify > /tmp/verifier.log 2>&1
-          RC=$?
-          set -e
-          grep -E "processed [0-9]+ insns|stack depth" /tmp/verifier.log || true
-          sudo "$BPFTOOL" prog show | grep -A2 netsum | tee /tmp/prog_show.log || true
-          sudo rm -rf /sys/fs/bpf/netsum_verify
-          tail -c 200000 /tmp/verifier.log > /tmp/verifier_tail.log
-          [ $RC -eq 0 ] || { tail -60 /tmp/verifier.log; exit 1; }
+          sudo ./bin/netsum-ctl --json verify --obj xdp_agg/xdp_agg.o | tee /tmp/verifier.json
 
       - name: netsum-ctl smoke test (attach, config, stats, sweep, detach on its own veth)
         run: sudo CTL=./bin/netsum-ctl bash ci/test_netsum_ctl.sh
@@ -389,8 +376,7 @@ jobs:
           name: xdp-loadtest-evidence
           if-no-files-found: ignore
           path: |
-            /tmp/verifier_tail.log
-            /tmp/prog_show.log
+            /tmp/verifier.json
             /tmp/attach.json
             /tmp/link_show_veth0.log
             /tmp/ps.log

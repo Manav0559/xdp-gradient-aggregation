@@ -335,3 +335,25 @@ record J2 timeline and H2 resend counts; then 4c (array mode + fallback).
     algorithm ns/pkt, on-CPU ns), NET_RX softirqs per CPU, fairness (Jain's
     index over raw goodput and goodput / demand, retransmissions, in-network
     fraction) under none / quota-drop / quota-fallback / array with 64 slots.
+- xdp-loadtest run 43762839174 (`62db400`) **green**, all scenarios: J2
+  took the FLUSHED -> FALLBACK path (tx_fallback 3, all 3 workers correct,
+  slot absent); H2 (20% loss) 102 retransmissions, 64/64 correct results per
+  worker; I2 (delay+reorder) all correct; G2 fallback_quota=1, tx_fallback=2,
+  drop_quota=0; P (array mode) 32 rounds via reliable workers; O slot_map
+  empty and no charged quota after the sweeper.
+- CI on `7471b21`: bench v2 failed at its first trial (noagg, a worker gave
+  up after 10 retries) and xdp-loadtest failed before any scenario (no
+  bpftool package for that runner's kernel). Causes: (1) the GitHub runner
+  has Docker's iptables `FORWARD DROP` policy, so traffic routed between the
+  namespaces through the root ns was dropped (my local Alpine VM has no such
+  policy); topo.sh now inserts ACCEPT rules for exactly the two links. (2)
+  bpftool is no longer used anywhere: `netsum-ctl verify` loads the object
+  through libbpf with BPF_LOG_STATS and prints insns/stack per program.
+- 7b measured (local 7.0.11, `netsum-ctl verify`): max values/packet 64 ->
+  aggregator 332,972 insns processed, stack 200; 128 -> 671,690; 256 ->
+  rejected (verifier limit 1,000,000). Array mode roughly doubled the
+  aggregator's verifier work (hash and array paths explored separately).
+  Decision: keep 64 as the default; NETSUM_MAX_CHUNK_LEN is a build-time
+  option, and bpf-unit records the table on the CI kernel. At 256 LLVM also
+  turned the array-claim zeroing loop into memset(), which BPF cannot call;
+  an empty asm barrier in the loop prevents it.

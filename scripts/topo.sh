@@ -13,6 +13,10 @@
 set -euo pipefail
 
 down() {
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -D FORWARD -i veth_w0 -o veth_p0 -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -i veth_p0 -o veth_w0 -j ACCEPT 2>/dev/null || true
+    fi
     ip netns del ns_w 2>/dev/null || true
     ip netns del ns_ps 2>/dev/null || true
     ip link del veth_w0 2>/dev/null || true
@@ -40,6 +44,14 @@ up() {
     ip netns exec ns_ps ip link set lo up
     ip netns exec ns_ps ip route add default via 10.10.2.1
     sysctl -qw net.ipv4.ip_forward=1
+    # Hosts with Docker (GitHub runners) set the FORWARD policy to DROP; allow
+    # exactly the two benchmark links to route to each other.
+    if command -v iptables >/dev/null 2>&1; then
+        for pair in "veth_w0 veth_p0" "veth_p0 veth_w0"; do
+            set -- $pair
+            iptables -C FORWARD -i "$1" -o "$2" -j ACCEPT 2>/dev/null || iptables -I FORWARD -i "$1" -o "$2" -j ACCEPT
+        done
+    fi
     for ns in "" ns_w ns_ps; do
         cmd=(sysctl -qw)
         [ -n "$ns" ] && cmd=(ip netns exec "$ns" sysctl -qw)

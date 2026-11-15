@@ -82,7 +82,7 @@ struct job_quota_entry {
 };
 
 NETSUM_STATIC_ASSERT(sizeof(struct grad_slot_key) == 12, "grad_slot_key layout");
-NETSUM_STATIC_ASSERT(sizeof(struct grad_slot) == 328, "grad_slot layout");
+NETSUM_STATIC_ASSERT(sizeof(struct grad_slot) == 72 + 4 * NETSUM_MAX_CHUNK_LEN, "grad_slot layout");
 NETSUM_STATIC_ASSERT(sizeof(struct netsum_config) == 44, "netsum_config layout");
 NETSUM_STATIC_ASSERT(sizeof(struct job_quota_entry) == 8, "job_quota_entry layout");
 

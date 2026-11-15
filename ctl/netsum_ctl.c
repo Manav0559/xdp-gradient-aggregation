@@ -202,6 +202,49 @@ static int cmd_detach(struct ctl *c)
     return 0;
 }
 
+/* Loads the object without attaching or pinning and prints the verifier's
+ * statistics for each program (instructions processed, stack depth). */
+static int cmd_verify(struct ctl *c)
+{
+    libbpf_set_print(capture_libbpf);
+    struct bpf_object *obj = bpf_object__open_file(c->obj_path, NULL);
+    if (!obj)
+        return fail(EXIT_LOAD, "open %s: %s", c->obj_path, strerror(errno));
+    if (c->slots_log2)
+        bpf_map__set_max_entries(bpf_object__find_map_by_name(obj, "agg_array"), 1u << c->slots_log2);
+    static char logs[2][1 << 16];
+    struct bpf_program *prog;
+    int i = 0;
+    bpf_object__for_each_program(prog, obj) {
+        if (i < 2) {
+            bpf_program__set_log_buf(prog, logs[i], sizeof(logs[i]));
+            bpf_program__set_log_level(prog, 4); /* BPF_LOG_STATS */
+        }
+        i++;
+    }
+    int err = bpf_object__load(obj);
+    i = 0;
+    int first = 1;
+    printf("[");
+    bpf_object__for_each_program(prog, obj) {
+        const char *log = i < 2 ? logs[i] : "";
+        const char *p = strstr(log, "processed ");
+        const char *st = strstr(log, "stack depth ");
+        printf("%s{\"program\":\"%s\",\"loaded\":%s,\"insns_processed\":%ld,\"stack_depth\":\"%.*s\"}",
+               first ? "" : ",", bpf_program__name(prog), err ? "false" : "true",
+               p ? strtol(p + 10, NULL, 10) : -1L, st ? (int)strcspn(st + 12, "\n") : 0, st ? st + 12 : "");
+        first = 0;
+        i++;
+    }
+    printf("]\n");
+    if (err) {
+        fprintf(stderr, "%.*s", (int)g_verifier_len, g_verifier_log);
+        return fail(EXIT_LOAD, "verifier rejected %s", c->obj_path);
+    }
+    bpf_object__close(obj);
+    return 0;
+}
+
 /* ---- config ------------------------------------------------------------------ */
 
 static int parse_mac(const char *s, uint8_t mac[6])
@@ -541,6 +584,7 @@ static void usage(void)
             "  attach  --ifname IF [--ifname IF2] [--mode native|generic|auto] [--obj xdp_agg/xdp_agg.o]\n"
             "          [--slots-log2 N]   (size of the array-mode aggregator pool, default 16)\n"
             "  detach  --ifname IF [--unpin]\n"
+            "  verify  [--obj PATH] [--slots-log2 N]   load only; print verifier stats per program\n"
             "  config  --ps-mac MAC --ps-ip IP --ps-port N [--agg-mac MAC --agg-ip IP] [--egress-ifname IF]\n"
             "          [--max-slots-per-job N] [--quota-policy none|drop|fallback] [--slot-ttl-ms N]\n"
             "          [--slot-mode hash|array] | --delete\n"
@@ -619,6 +663,7 @@ int main(int argc, char **argv)
         return EXIT_USAGE;
     }
     const char *cmd = argv[optind];
+    if (!strcmp(cmd, "verify")) return cmd_verify(&c);
     if (!strcmp(cmd, "attach")) return cmd_attach(&c);
     if (!strcmp(cmd, "detach")) return cmd_detach(&c);
     if (!strcmp(cmd, "config")) return cmd_config(&c);
