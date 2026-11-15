@@ -32,8 +32,8 @@ jobs:
         run: |
           set -euo pipefail
           MULTIARCH=$(gcc -print-multiarch)
-          make bpf BPF_CC="clang -idirafter /usr/include/${MULTIARCH}"
-          make bpf-compat BPF_CC="clang -idirafter /usr/include/${MULTIARCH}"
+          make bpf BPF_CC="clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH}"
+          make bpf-compat BPF_CC="clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH}"
           llvm-objdump -d --no-show-raw-insn --section=xdp xdp_agg/xdp_agg.o | tail -n +7 > /tmp/system.dis
           llvm-objdump -d --no-show-raw-insn --section=xdp xdp_agg/xdp_agg_compat.o | tail -n +7 > /tmp/compat.dis
           echo "system-libbpf build: $(wc -l < /tmp/system.dis) instructions; vendored build: $(wc -l < /tmp/compat.dis)"

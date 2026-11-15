@@ -132,3 +132,11 @@ Next step: push, check CI (K-O must stay expected-red), then Phase 3a
 
 Next step: push; verify bpf-unit, XDP load test, CI and fuzz green; record
 the CI verifier numbers (x86, 6.17); then Phase 3.5 (benchmark-lite).
+- Phase 3 CI (`96548ae`): XDP load test run 43758934811 green on
+  `7.0.0-1017-azure` x86_64 (runner kernel moved from 6.17 since the base run),
+  `xdpgeneric`; verifier `stack depth 200`, `processed 158454 insns`.
+  K: rej_worker_id=3, slot_created=0. L: num_workers_mismatch=3, 965 only a
+  tombstone. M: (962,0,0) COMPLETED, late_duplicate=1. N: overflow=1,
+  `[overflow] job=963` at the PS. O: no ACCUMULATING slot for 100/103-106/950/951/962.
+  bpf-unit failed to *build* (glibc `gnu/stubs-32.h` under `-target bpf`);
+  fixed with the same `-D__x86_64__` the other workflows pass.
