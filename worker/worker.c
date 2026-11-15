@@ -89,7 +89,12 @@ int main(int argc, char **argv) {
     uint8_t packet[NETSUM_MAX_PACKET_SIZE];
     struct grad_hdr *hdr = (struct grad_hdr *)packet;
     int32_t *values = (int32_t *)(packet + NETSUM_HDR_SIZE);
-    size_t packet_len = NETSUM_HDR_SIZE + (size_t)chunk_len * sizeof(int32_t);
+    size_t packet_len = NETSUM_HDR_SIZE + (size_t)chunk_len * sizeof(int32_t) + NETSUM_BITMAP_BYTES;
+    /* v2 contributor-bitmap trailer: only this worker's bit. */
+    uint8_t *trailer = packet + NETSUM_HDR_SIZE + (size_t)chunk_len * sizeof(int32_t);
+    memset(trailer, 0, NETSUM_BITMAP_BYTES);
+    if (worker_id < NETSUM_MAX_FANIN)
+        trailer[worker_id / 8] = (uint8_t)(1u << (worker_id % 8));
 
     /* Seed depends on worker_id so different workers generate different
      * (but reproducible) gradient values for the same round. */
@@ -103,7 +108,7 @@ int main(int argc, char **argv) {
         hdr->worker_id = htons(worker_id);
         hdr->num_workers = htons(num_workers);
         hdr->chunk_len = htons(chunk_len);
-        hdr->flags = htons(0);
+        hdr->flags = htons(NETSUM_FLAGS_V2);
 
         for (int i = 0; i < chunk_len; i++) {
             double v = has_fixed_value ? fixed_value : xorshift_double(&rng_state) * max_abs_grad;

@@ -75,7 +75,6 @@ def fnv1a_slot_index(job_id, round_, chunk_id, capacity):
 
 # ---- C1: late duplicate after completion ----------------------------------
 
-@expect_fail("C1")
 def test_c1_late_duplicate_after_completion_leaves_no_slot():
     ps_port = free_port()
     ps = Server([PARAMSERVER, str(ps_port), "agg"])
@@ -95,7 +94,6 @@ def test_c1_late_duplicate_after_completion_leaves_no_slot():
     assert held == 0, f"late duplicate left {held} live slot(s) for job 2: {st}\n{agg.text()}"
 
 
-@expect_fail("C1")
 def test_c1_late_duplicate_counts_against_quota():
     ps_port = free_port()
     ps = Server([PARAMSERVER, str(ps_port), "agg"])
@@ -118,7 +116,6 @@ def test_c1_late_duplicate_counts_against_quota():
 
 # ---- C2: worker_id beyond fan-in -----------------------------------------
 
-@expect_fail("C2")
 def test_c2_worker_id_beyond_fanin_rejected_agg():
     ps_port = free_port()
     ps = Server([PARAMSERVER, str(ps_port), "agg"])
@@ -133,7 +130,6 @@ def test_c2_worker_id_beyond_fanin_rejected_agg():
     assert completes_for(agg.text(), 30) == [], f"worker_ids 10-12 completed a 3-worker round:\n{agg.text()}"
 
 
-@expect_fail("C2")
 def test_c2_worker_id_beyond_fanin_rejected_paramserver():
     port = free_port()
     ps = Server([PARAMSERVER, str(port), "noagg"])
@@ -159,7 +155,6 @@ def _c3_disagreement(text_of, port, job):
     return first
 
 
-@expect_fail("C3")
 def test_c3_num_workers_disagreement_rejected_agg():
     ps_port = free_port()
     ps = Server([PARAMSERVER, str(ps_port), "agg"])
@@ -178,7 +173,6 @@ def test_c3_num_workers_disagreement_rejected_agg():
     assert len(final) == 1 and int(final[0][3]) == 3, f"expected one 3-way completion:\n{agg.text()}"
 
 
-@expect_fail("C3")
 def test_c3_num_workers_disagreement_rejected_paramserver():
     port = free_port()
     ps = Server([PARAMSERVER, str(port), "noagg"])
@@ -195,7 +189,6 @@ def test_c3_num_workers_disagreement_rejected_paramserver():
     assert len(final) == 1 and int(final[0][3]) == 3, f"expected one 3-way completion:\n{ps.text()}"
 
 
-@expect_fail("C3")
 def test_c3_single_claim_closes_round_once_without_zombie():
     """Semantics (DESIGN_NOTES §Admission): the first accepted contribution
     fixes the fan-in, so a fan-in-1 claim legitimately completes the round.
@@ -226,7 +219,6 @@ def _wrong_or_missing_overflow(text, job):
     return wrong, f"[overflow] job={job}" in text
 
 
-@expect_fail("C4")
 def test_c4_overflow_never_produces_wrong_sum_agg():
     ps_port = free_port()
     ps = Server([PARAMSERVER, str(ps_port), "agg"])
@@ -245,7 +237,6 @@ def test_c4_overflow_never_produces_wrong_sum_agg():
     assert flagged, f"overflow was not reported:\n{text}"
 
 
-@expect_fail("C4")
 def test_c4_overflow_never_produces_wrong_sum_paramserver():
     port = free_port()
     ps = Server([PARAMSERVER, str(port), "noagg"])
@@ -262,7 +253,6 @@ def test_c4_overflow_never_produces_wrong_sum_paramserver():
 
 # ---- C5: paramserver parity ----------------------------------------------
 
-@expect_fail("C5")
 def test_c5_paramserver_truncated_packet_not_summed():
     port = free_port()
     ps = Server([PARAMSERVER, str(port), "noagg"])
@@ -276,7 +266,6 @@ def test_c5_paramserver_truncated_packet_not_summed():
     assert completes_for(ps.text(), 60) == [], f"truncated packet was summed from stale bytes:\n{ps.text()}"
 
 
-@expect_fail("C5")
 def test_c5_paramserver_num_workers_zero_rejected():
     port = free_port()
     ps = Server([PARAMSERVER, str(port), "noagg"])
@@ -305,7 +294,6 @@ def _colliding_keys(capacity, job_base):
     raise RuntimeError("no collision found")
 
 
-@expect_fail("C6")
 def test_c6_probe_chain_survives_free():
     cap_log2 = 4
     k1, k2 = _colliding_keys(1 << cap_log2, 70000)
@@ -328,7 +316,6 @@ def test_c6_probe_chain_survives_free():
 
 # ---- C7: quota must not fail open after job-table churn -------------------
 
-@expect_fail("C7")
 def test_c7_quota_survives_job_table_churn():
     ps_port = free_port()
     ps = Server([PARAMSERVER, str(ps_port), "agg"])

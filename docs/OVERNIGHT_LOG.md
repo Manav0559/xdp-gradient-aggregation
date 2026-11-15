@@ -67,3 +67,35 @@ the reason for each are recorded here at the time they happen.
 - Fixed the false "Scenarios A-F/H/I complete or reject cleanly" evidence text.
 - C6 does not apply to the kernel (BPF HASH maps handle collisions). C7's
   kernel scenario (P) deferred to Phase 3.
+- CI on the Phase 1 commit (`3d4c1d0`, XDP run 43756729366, kernel x86 GitHub
+  runner) is green and every red scenario reproduced on the real kernel:
+  K `[complete] job=960 ... sum=3.0` from worker_ids 10-12; L1 961 sum 4.0
+  (includes the fan-in-4 packet); L2 965 left a slot; M (962,0,0) re-created;
+  N 963 `sum[0]=-5536.000000`; O 962 still present.
+
+## 2026-11-16 02:50 IST — Phase 2 (protocol v2, userspace fixes)
+
+- Decision: every v2 packet carries the 32-byte contributor bitmap (raw
+  contributions set their own bit). Chosen up front instead of trying
+  `bpf_xdp_adjust_tail` first: no tailroom dependency in `xdpgeneric`, one
+  packet shape for every kind. Deviation from the brief's order, recorded in
+  DESIGN_NOTES §Wire format.
+- Decision (C7): a job entry lives only while the job has ACCUMULATING slots
+  (tombstones are not charged to the quota, so they do not pin it); full job
+  table fails closed (`drop_job_table_full`).
+- Commit 1 (`201491e`) verified standalone in a scratch worktree: unit test
+  passes, 10/10, all 13 bug tests still XFAIL.
+- agg.c and paramserver.c rewritten on the shared parser and slot table;
+  the worker now sends v2. The per-bug commits the plan lists (C1/C2-3/C4/C5/C7)
+  landed as one commit because all of them are the same rewrite of the
+  admission path; the test markers record which test covers which bug.
+- Result: `make test` -> unit pass, 10/10, 13/13 bug tests pass (no XFAIL).
+- Compatibility: the kernel still emits the v1-style aggregate
+  (worker 0, fan-in 1); the paramserver parses it as a fan-in-1 raw
+  contribution, so Scenarios A-J are unaffected until Phase 3.
+- PS/agg now print `[stats-all]` (every `netsum_stats.h` counter) on SIGUSR1
+  and at exit; `--quiet` suppresses per-slot lines; PS prints a `[summary]`
+  line with first/last completion time on exit (SIGTERM handled).
+
+Next step: push, check CI (K-O must stay expected-red), then Phase 3a
+(build hygiene: USE_SYSTEM_LIBBPF, helper-ID check, -mcpu=v3).
