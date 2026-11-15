@@ -233,6 +233,33 @@ Measured with `bpftool prog load` in the XDP load-test workflow (`-mcpu=v3`):
 * `netsum_parse()` and `netsum_add_i32()` are forced inline: BPF does not
   allow a call while a spin lock is held.
 
+## 10. Fallback
+
+Contributions for one key can reach the parameter server by several paths:
+raw (no aggregator), FALLBACK (an aggregator forwarded a contribution it did
+not aggregate), PARTIAL (an aggregator flushed an incomplete slot) and a
+complete aggregate. Every one of them carries a contributor bitmap, so the PS
+merges by sets and never counts a worker twice:
+
+| Incoming set I vs held set H | Action |
+|---|---|
+| disjoint | add the sum, `H = H u I` |
+| I is a subset of H | drop (`overlap_subset`): nothing new |
+| H is a subset of I | replace H's sum with I's (`overlap_superset`) |
+| any other overlap | reject (`overlap_rejected`); the remaining workers' resends finish the key |
+| key already completed | count `aggregate_conflict` / `late_duplicate` and re-send the stored result |
+
+The superset rule is what keeps loss recovery live. In Scenario J2 the
+sweeper flushes `{0,1}` as a PARTIAL and later retires the FLUSHED slot;
+when the workers retransmit, the aggregator re-creates the slot and completes
+it with `{0,1,2}`. Without the rule the PS rejected that aggregate because it
+overlapped the partial it held, the aggregator re-sent it on every RESEND,
+and the round never completed (bug C14, found by J2 on the CI kernel).
+Integer sums are exact, so replacing is always correct when the incoming
+aggregate covers everything held. A partial overlap could be resolved by
+subtracting per-worker values the PS kept; NetSum does not keep them, and the
+remaining workers' resends, forwarded as fallbacks, complete the key anyway.
+
 ## 11. Observability
 
 `protocol/netsum_stats.h` defines one counter enum used by every path. In the
@@ -441,3 +468,4 @@ correctness topology:
 | C11 | fuzzer tested copies of the checks | fixed: fuzzes `grad_parse.h`; bpf-unit replays the corpus through the loaded program |
 | C12 | a test that could not fail; CI checks weaker than documented | fixed |
 | C13 | a lost result could never be recovered: the PS ignored late packets for keys it had completed | fixed: the PS re-sends the stored result |
+| C14 | the PS rejected a complete aggregate that covered a partial it held, so a flushed-then-retransmitted round never completed (found by Scenario J2) | fixed: superset replaces, subset is dropped |

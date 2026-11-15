@@ -147,6 +147,15 @@ static inline int bitmap_overlaps(const uint8_t *a, const uint8_t *b)
     return 0;
 }
 
+/* 1 iff every bit of a is also set in b. */
+static inline int bitmap_subset(const uint8_t *a, const uint8_t *b)
+{
+    for (int i = 0; i < NETSUM_BITMAP_BYTES; i++)
+        if (a[i] & ~b[i])
+            return 0;
+    return 1;
+}
+
 static inline unsigned bitmap_popcount(const uint8_t *bm)
 {
     unsigned n = 0;

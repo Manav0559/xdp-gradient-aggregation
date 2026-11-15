@@ -266,3 +266,16 @@ program run via BPF_PROG_TEST_RUN); then 4c.
 
 Next step: push, debug CI until xdp-loadtest/bpf-unit/bench-lite are green;
 record J2 timeline and H2 resend counts; then 4c (array mode + fallback).
+- CI run 43761989748 (`72770cb`): bpf-unit 62/62 on both builds (disassembly
+  identical, 1962 instructions for both programs); xdp-loadtest passed the
+  netsum-ctl smoke test and Scenarios A-I including Q, then **J2 failed**:
+  worker 0 gave up after 10 retries. PS log: `[partial] job=952 have=2/3`
+  followed by 14 `[overlap]` rejections. Cause (new bug **C14**): the sweeper
+  retired the FLUSHED slot, the workers' retransmissions re-created and
+  completed it as {0,1,2}, and the PS rejected that aggregate because it
+  overlapped the partial {0,1} it held; the aggregator re-sent it on every
+  RESEND and the round never completed.
+- Fix: PS merge by contributor sets (subset dropped, superset replaces,
+  other overlap rejected). `tests/test_fallback.py` (7 tests); the superset
+  and subset tests fail against the previous paramserver (checked by building
+  `HEAD:paramserver/paramserver.c`) and pass now.

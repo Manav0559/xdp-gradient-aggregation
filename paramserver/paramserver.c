@@ -230,19 +230,38 @@ static void handle(const uint8_t *pkt, const struct netsum_parsed *p, int64_t no
         }
         return;
     }
+    int replace = 0;
     if (bitmap_overlaps(in_bm, s->bitmap)) {
-        if (is_agg) {
-            g.stats[NS_OVERLAP_REJECTED]++;
-            if (!g.quiet)
-                fprintf(stderr, "[overlap] job=%u round=%u chunk=%u -- aggregate overlaps contributors already held, dropping\n",
-                        p->job_id, p->round, p->chunk_id);
-        } else {
+        /* Contributor sets decide the merge (docs/DESIGN_NOTES.md §Fallback):
+         * an incoming set we already cover adds nothing; one that covers all
+         * we hold replaces our partial sum; any other overlap cannot be
+         * separated without per-worker values, so it is rejected and the
+         * remaining workers' resends (forwarded as fallbacks) finish the key. */
+        if (!is_agg) {
             g.stats[NS_DUPLICATE]++;
             if (!g.quiet)
                 fprintf(stderr, "[dup] job=%u round=%u chunk=%u worker=%u already contributed -- dropping duplicate\n",
                         p->job_id, p->round, p->chunk_id, p->worker_id);
+            return;
         }
-        return;
+        if (bitmap_subset(in_bm, s->bitmap)) {
+            g.stats[NS_OVERLAP_SUBSET]++;
+            return;
+        }
+        if (!bitmap_subset(s->bitmap, in_bm)) {
+            g.stats[NS_OVERLAP_REJECTED]++;
+            if (!g.quiet)
+                fprintf(stderr, "[overlap] job=%u round=%u chunk=%u -- aggregate overlaps contributors already held, dropping\n",
+                        p->job_id, p->round, p->chunk_id);
+            return;
+        }
+        g.stats[NS_OVERLAP_SUPERSET]++;
+        replace = 1;
+    }
+    if (replace) {
+        memset(s->sum, 0, sizeof(s->sum));
+        memset(s->bitmap, 0, sizeof(s->bitmap));
+        s->overflowed = 0;
     }
 
     if (is_agg && (p->flags & NETSUM_F_OVERFLOW))
