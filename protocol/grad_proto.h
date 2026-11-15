@@ -37,11 +37,60 @@ struct grad_hdr {
     uint16_t worker_id;    /* 0 .. num_workers-1 */
     uint16_t num_workers;  /* fan-in expected for this (job, round) */
     uint16_t chunk_len;    /* number of Q16.16 values that follow, <= NETSUM_MAX_CHUNK_LEN */
-    uint16_t flags;        /* reserved, must be 0 for now */
+    uint16_t flags;        /* version nibble + NETSUM_F_* bits, see below */
 } __attribute__((packed));
 
 #define NETSUM_HDR_SIZE (sizeof(struct grad_hdr))
-#define NETSUM_MAX_PACKET_SIZE (NETSUM_HDR_SIZE + NETSUM_MAX_CHUNK_LEN * sizeof(int32_t))
+
+/* ---- v2 (docs/DESIGN_NOTES.md §Wire format) -------------------------------
+ * flags, host order: bits 15-12 version (0 = legacy v1, 2 = v2), bits 0-5
+ * NETSUM_F_*, bits 6-11 reserved (must be 0). v1 packets have flags == 0.
+ * Every v2 packet is: grad_hdr | chunk_len int32 values | 32-byte contributor
+ * bitmap (bit w set iff worker w's contribution is included). A raw
+ * contribution sets only its own bit, so an aggregator can turn it into an
+ * aggregate in place without growing the packet. */
+#define NETSUM_VERSION_SHIFT 12
+#define NETSUM_VERSION_V2 2
+#define NETSUM_FLAGS_V2 ((uint16_t)(NETSUM_VERSION_V2 << NETSUM_VERSION_SHIFT))
+#define NETSUM_F_RESEND   0x0001u /* worker retransmission */
+#define NETSUM_F_ACK      0x0002u /* PS result/ACK toward aggregator and workers */
+#define NETSUM_F_OVERFLOW 0x0004u /* aggregate whose accumulation overflowed */
+#define NETSUM_F_FALLBACK 0x0008u /* raw contribution forwarded un-aggregated */
+#define NETSUM_F_PARTIAL  0x0010u /* flushed incomplete aggregate */
+#define NETSUM_F_REGISTER 0x0020u /* worker -> PS registration, no values */
+#define NETSUM_F_KNOWN    0x003Fu
+#define NETSUM_F_RESERVED 0x0FC0u
+
+#define NETSUM_MAX_FANIN 256
+#define NETSUM_BITMAP_BYTES (NETSUM_MAX_FANIN / 8)
+#define NETSUM_WORKER_AGGREGATE 0xFFFFu /* worker_id on aggregator/PS output */
+#define NETSUM_ACK_PORT 9877
+
+#define NETSUM_MAX_PACKET_SIZE \
+    (NETSUM_HDR_SIZE + NETSUM_MAX_CHUNK_LEN * sizeof(int32_t) + NETSUM_BITMAP_BYTES)
+
+#ifdef __cplusplus
+#define NETSUM_STATIC_ASSERT static_assert
+#else
+#define NETSUM_STATIC_ASSERT _Static_assert
+#endif
+NETSUM_STATIC_ASSERT(sizeof(struct grad_hdr) == 20, "grad_hdr must stay 20 bytes");
+NETSUM_STATIC_ASSERT(NETSUM_BITMAP_BYTES == 32, "bitmap trailer is 32 bytes");
+/* Ethernet 14 + IPv4 20 + UDP 8 + max payload must fit a 1500-byte MTU frame. */
+NETSUM_STATIC_ASSERT(20 + 8 + NETSUM_MAX_PACKET_SIZE <= 1500, "max packet exceeds MTU");
+
+/* Forced inlining: BPF forbids calls while a spin lock is held. */
+#ifndef NETSUM_INLINE
+#define NETSUM_INLINE static inline __attribute__((always_inline))
+#endif
+
+/* Wrapping int32 add that reports signed overflow; no C UB (unsigned
+ * arithmetic), no branches, so the same code runs in userspace and BPF. */
+NETSUM_INLINE int netsum_add_i32(int32_t *acc, int32_t v) {
+    uint32_t a = (uint32_t)*acc, b = (uint32_t)v, r = a + b;
+    *acc = (int32_t)r;
+    return (int)(((a ^ r) & (b ^ r)) >> 31);
+}
 
 /* Q16.16 <-> double conversions, used ONLY on the userspace side (worker
  * quantizing a real gradient before send, or a test harness checking

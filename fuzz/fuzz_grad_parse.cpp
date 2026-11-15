@@ -1,107 +1,100 @@
-// Differential libFuzzer harness for NetSum's grad_hdr admission-check
-// logic: feeds the exact same raw bytes to agg_parse_stateless()
-// (userspace_agg/agg.c's per-packet stateless checks) and
-// xdp_parse_stateless() (xdp_agg.c's equivalent, translated from BPF's
-// data/data_end pointer pair to a plain buffer+length -- see
-// parse_shared.h) and asserts they reach the SAME accept/reject verdict on
-// every input.
-//
-// Motivation: both agg.c and xdp_agg.c's own header comments assert they
-// implement "byte-for-byte the same algorithm." Before this harness, that
-// claim was backed only by 9 hand-written example-based unit tests
-// (tests/test_correctness.py) -- not an adversarial search. A prior human
-// adversarial code review already found 10 real bugs in exactly this
-// validation logic (2 critical: an out-of-bounds-write risk in
-// xdp_agg.c's write-back loop, and a truncated-packet stale-read in
-// agg.c). This harness exists to keep searching for the next class of edge
-// case a human reviewer would miss, and to catch any FUTURE change to
-// either file that silently breaks parity with the other.
-//
-// Two things checked on every input:
-//
-//   (a) neither extracted function ever reads outside [data, data+size) --
-//       AddressSanitizer catches this automatically, PROVIDED the
-//       extracted functions never assume a fixed-size buffer beyond what
-//       `size` actually guarantees. parse_shared.h's two functions both
-//       check len >= NETSUM_HDR_SIZE before ever casting to
-//       `struct grad_hdr *` and dereferencing a field -- exactly the
-//       discipline xdp_agg.c's own data_end checks already follow.
-//
-//   (b) agg_parse_stateless() and xdp_parse_stateless() reach the SAME
-//       verdict (and, when both accept, the same parsed chunk_len/
-//       worker_id/num_workers) on every input. Any divergence is a real
-//       parity bug between the two "byte-for-byte the same algorithm"
-//       implementations, so it aborts -- libFuzzer records an abort() as a
-//       crash and saves a minimized reproducer input under this script's
-//       -artifact_prefix.
-//
-// See parse_shared.h's own comment on xdp_parse_stateless for the one
-// known, documented, out-of-scope modeling nuance (the num_workers check's
-// slot-existence dependence in the real xdp_agg.c, unreachable from a pure
-// stateless function) that this harness deliberately does NOT flag as a
-// divergence.
+// Differential fuzzer for the shipped packet parser, protocol/grad_parse.h
+// (the code agg, paramserver and xdp_agg actually call), against a naive
+// reference written independently from the wire-format spec in
+// docs/DESIGN_NOTES.md §Admission and validation. Any verdict or field
+// mismatch aborts; ASan catches out-of-bounds reads.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
-#include "parse_shared.h"
+#include "../protocol/grad_parse.h"
 
 namespace {
 
-// Process-lifetime counters (one DivergingHandler-style summary per whole
-// fuzzing session, not per input) -- printed once at exit so a clean run's
-// stderr says something more useful than silence.
-std::uint64_t g_inputs = 0;
-std::uint64_t g_accepted_both = 0;
-std::uint64_t g_rejected_both = 0;
+std::uint64_t g_inputs, g_accepted;
 
-void print_summary() {
-    std::fprintf(
-        stderr,
-        "[fuzz_grad_parse] inputs=%llu accepted_both=%llu rejected_both=%llu -- "
-        "zero verdict divergences (any divergence aborts immediately, so reaching "
-        "process exit at all means agg_parse_stateless() and xdp_parse_stateless() "
-        "agreed on every input this run saw)\n",
-        static_cast<unsigned long long>(g_inputs),
-        static_cast<unsigned long long>(g_accepted_both),
-        static_cast<unsigned long long>(g_rejected_both));
+struct ref_result {
+    int verdict;
+    unsigned worker_id, num_workers, chunk_len, kind;
+};
+
+unsigned be16(const std::uint8_t *p) { return (unsigned)p[0] << 8 | p[1]; }
+
+// Reference: reads bytes by offset from (data, size), no shared code.
+ref_result ref_parse(const std::uint8_t *d, std::size_t n)
+{
+    ref_result r{};
+    if (n < 20) { r.verdict = NETSUM_REJ_SHORT_HDR; return r; }
+    r.worker_id = be16(d + 12);
+    r.num_workers = be16(d + 14);
+    r.chunk_len = be16(d + 16);
+    unsigned flags = be16(d + 18);
+    unsigned version = flags >> 12, bits = flags & 0x3F;
+    bool v2 = version == 2;
+    if (version != 0 && version != 2) { r.verdict = NETSUM_REJ_VERSION; return r; }
+    if ((version == 0 && flags != 0) || (flags & 0x0FC0)) { r.verdict = NETSUM_REJ_RESERVED_FLAGS; return r; }
+    if (r.num_workers < 1 || r.num_workers > 256) { r.verdict = NETSUM_REJ_NUM_WORKERS; return r; }
+    bool aggregate_id = r.worker_id == 0xFFFF;
+    if (aggregate_id && !v2) { r.verdict = NETSUM_REJ_WORKER_ID; return r; }
+    const unsigned RESEND = 1, ACK = 2, OVERFLOW = 4, FALLBACK = 8, PARTIAL = 16, REGISTER = 32;
+    if (bits & REGISTER) {
+        if (bits != REGISTER || aggregate_id) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }
+        r.kind = NETSUM_KIND_REGISTER;
+    } else if (bits & ACK) {
+        if (bits != ACK || !aggregate_id) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }
+        r.kind = NETSUM_KIND_ACK;
+    } else if (aggregate_id) {
+        if (bits & (RESEND | FALLBACK)) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }
+        r.kind = (bits & PARTIAL) ? NETSUM_KIND_PARTIAL : NETSUM_KIND_AGGREGATE;
+    } else {
+        if (bits & (PARTIAL | OVERFLOW)) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }
+        if (r.worker_id >= r.num_workers) { r.verdict = NETSUM_REJ_WORKER_ID; return r; }
+        r.kind = NETSUM_KIND_RAW;
+    }
+    if (r.chunk_len > 64) { r.verdict = NETSUM_REJ_CHUNK_LEN_MAX; return r; }
+    if (r.chunk_len == 0 && r.kind != NETSUM_KIND_REGISTER) { r.verdict = NETSUM_REJ_CHUNK_LEN_ZERO; return r; }
+    std::size_t need = 20 + 4 * (std::size_t)r.chunk_len + (v2 ? 32 : 0);
+    if (n < need) { r.verdict = NETSUM_REJ_TRUNCATED; return r; }
+    r.verdict = NETSUM_OK;
+    return r;
+}
+
+void print_summary()
+{
+    std::fprintf(stderr, "[fuzz_grad_parse] inputs=%llu accepted=%llu -- no divergence\n",
+                 (unsigned long long)g_inputs, (unsigned long long)g_accepted);
 }
 
 }  // namespace
 
-extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data, std::size_t size) {
+extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data, std::size_t size)
+{
     static const bool registered = (std::atexit(print_summary), true);
     (void)registered;
     ++g_inputs;
-
-    struct netsum_parse_result agg_r = agg_parse_stateless(data, size);
-    struct netsum_parse_result xdp_r = xdp_parse_stateless(data, size);
-
-    if (agg_r.verdict != xdp_r.verdict) {
-        std::fprintf(stderr,
-                      "DIVERGENCE: verdict mismatch on %zu-byte input -- "
-                      "agg_parse_stateless=%s xdp_parse_stateless=%s\n",
-                      size, agg_r.verdict == NETSUM_PARSE_ACCEPT ? "ACCEPT" : "REJECT",
-                      xdp_r.verdict == NETSUM_PARSE_ACCEPT ? "ACCEPT" : "REJECT");
+    // Copy into an exactly-sized heap buffer so ASan flags any read past the end.
+    std::uint8_t *buf = static_cast<std::uint8_t *>(std::malloc(size ? size : 1));
+    if (size)
+        std::memcpy(buf, data, size);
+    struct netsum_parsed p;
+    int got = netsum_parse(buf, buf + size, &p);
+    ref_result want = ref_parse(buf, size);
+    bool fields_differ = got == NETSUM_OK &&
+        (p.worker_id != want.worker_id || p.num_workers != want.num_workers ||
+         p.chunk_len != want.chunk_len || p.kind != want.kind);
+    if (got != want.verdict || fields_differ) {
+        std::fprintf(stderr, "DIVERGENCE on %zu-byte input: netsum_parse=%d reference=%d\n",
+                     size, got, want.verdict);
         std::abort();
     }
-
-    if (agg_r.verdict == NETSUM_PARSE_ACCEPT) {
-        ++g_accepted_both;
-        if (agg_r.chunk_len != xdp_r.chunk_len || agg_r.worker_id != xdp_r.worker_id ||
-            agg_r.num_workers != xdp_r.num_workers) {
-            std::fprintf(
-                stderr,
-                "DIVERGENCE: both ACCEPTed a %zu-byte input but parsed fields differ -- "
-                "agg(chunk_len=%u worker_id=%u num_workers=%u) "
-                "xdp(chunk_len=%u worker_id=%u num_workers=%u)\n",
-                size, agg_r.chunk_len, agg_r.worker_id, agg_r.num_workers, xdp_r.chunk_len,
-                xdp_r.worker_id, xdp_r.num_workers);
-            std::abort();
-        }
-    } else {
-        ++g_rejected_both;
+    if (got == NETSUM_OK) {
+        ++g_accepted;
+        const std::uint8_t *values = buf + NETSUM_HDR_SIZE;
+        volatile std::uint8_t sink = 0;
+        for (unsigned i = 0; i < p.payload_len; i++)  // touch every byte the parser vouched for
+            sink = static_cast<std::uint8_t>(sink ^ values[i]);
     }
-
+    std::free(buf);
     return 0;
 }

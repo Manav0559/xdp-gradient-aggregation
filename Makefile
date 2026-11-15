@@ -18,23 +18,29 @@ else
 BPF_CC = clang
 endif
 
-.PHONY: all clean test bpf
+.PHONY: all clean test unit bpf
 
 all: $(BIN_DIR)/worker $(BIN_DIR)/paramserver $(BIN_DIR)/agg
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
-$(BIN_DIR)/worker: worker/worker.c protocol/grad_proto.h | $(BIN_DIR)
+HDRS = protocol/grad_proto.h protocol/grad_parse.h protocol/netsum_stats.h common/slot_table.h
+
+$(BIN_DIR)/worker: worker/worker.c $(HDRS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ worker/worker.c
 
-$(BIN_DIR)/paramserver: paramserver/paramserver.c protocol/grad_proto.h | $(BIN_DIR)
+$(BIN_DIR)/paramserver: paramserver/paramserver.c $(HDRS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ paramserver/paramserver.c
 
-$(BIN_DIR)/agg: userspace_agg/agg.c protocol/grad_proto.h | $(BIN_DIR)
+$(BIN_DIR)/agg: userspace_agg/agg.c $(HDRS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ userspace_agg/agg.c
 
-test: all
+unit: tests/unit/test_slot_table.c $(HDRS) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $(BIN_DIR)/test_slot_table tests/unit/test_slot_table.c
+	./$(BIN_DIR)/test_slot_table
+
+test: all unit
 	python3 tests/test_correctness.py
 	python3 tests/test_protocol_v2.py
 
