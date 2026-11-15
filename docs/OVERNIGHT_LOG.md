@@ -225,3 +225,44 @@ README/RESULTS lite section and DESIGN_NOTES §15; then Phase 4a in userspace.
 Next step: port ACK / RESEND / FLUSHED rows to xdp_agg.c with bpf-unit cases
 (local Alpine loop), remove ack_port; then the 4b sweeper (kernel-side flush
 program run via BPF_PROG_TEST_RUN); then 4c.
+
+## 2026-11-16 06:40 IST — Phase 4 kernel port, 4b sweeper, Phase 5 netsum-ctl
+
+- xdp_agg.c: ACK handling (retire COMPLETED/FLUSHED, discard stale
+  ACCUMULATING and release its quota), RESEND table (re-send stored
+  aggregate / flush PARTIAL -> FLUSHED / FALLBACK after a flush), one shared
+  rewrite-and-forward tail. `ack_port` and NETSUM_ACK_PORT removed.
+- 4b Design A, refined per review: the sweeper does not write slots from
+  userspace. A second program in the object, `netsum_sweep`, is run by
+  `netsum-ctl sweep` through BPF_PROG_TEST_RUN once per key: under the slot
+  lock it flushes an expired ACCUMULATING slot into a PARTIAL (the frame comes
+  back as XDP_TX and the tool sends it to the PS) and marks it FLUSHED, or
+  deletes an expired COMPLETED/FLUSHED slot. Quota release happens in-kernel.
+  Remaining race: none on slot contents; a contribution that arrives between
+  the sweeper's key snapshot and its step is simply part of the flushed sum
+  or arrives after FLUSHED and is forwarded as FALLBACK.
+- bpf-unit: 62 cases locally (Alpine, 7.0.11), including ACK in every state,
+  RESEND rows, FLUSHED fallback and the sweep program. One old case ("resent
+  duplicate is counted separately") was removed: under the RESEND table that
+  input now flushes, which the new flush case covers.
+- Phase 5 (pulled forward because the sweeper needs it): `ctl/netsum_ctl.c`
+  with attach/detach (libbpf load + pin of both programs and all maps,
+  `bpf_xdp_attach`, mode read back with `bpf_xdp_query`), config, stats (incl.
+  run_cnt/run_time_ns from bpf_obj_get_info), slots (BPF_F_LOCK snapshot),
+  jobs, sweep. No skeleton: bpf_object__open_file + pinning keeps it one file.
+  `ci/test_netsum_ctl.sh` smoke test passes locally (attach generic, config,
+  zero stats, stuck 2/3 round, sweep flushes one PARTIAL to a listener with
+  sum 2.0 and bitmap {0,1}, second sweep retires, detach + unpin).
+- `ci/netsum_cfg_loader.c` deleted; `grep "struct netsum_config {"` finds 1.
+- xdp-loadtest.yml rewritten on netsum-ctl with new scenarios Q (ACK
+  retirement), J2 (sweeper flush + retransmission -> FALLBACK -> completion),
+  H2/I2 (reliable workers under 20% loss / delay+reorder), M and O now
+  "absent after ACK or sweeper" (ACK retirement means a plain duplicate after
+  the ACK reopens a slot; the sweeper reclaims it - same as ATP's switch).
+  H and I kept as H-legacy / I-legacy. accept_local relaxation removed (the
+  aggregate's source is now the aggregator, C9).
+- bench_lite.sh / bench-lite.yml moved to netsum-ctl; the analysis step now
+  chowns the output and uses pipefail (fixes the missing-summary bug).
+
+Next step: push, debug CI until xdp-loadtest/bpf-unit/bench-lite are green;
+record J2 timeline and H2 resend counts; then 4c (array mode + fallback).

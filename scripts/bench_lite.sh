@@ -8,7 +8,6 @@
 set -euo pipefail
 
 OUT=${OUT:-bench-out/lite}
-BPFTOOL=${BPFTOOL:-bpftool}
 ROUNDS=${ROUNDS:-25000}
 TRIALS=${TRIALS:-5}
 WORKERS=${WORKERS:-"2 4 8"}
@@ -21,8 +20,7 @@ mkdir -p "$OUT/stats"
 topo_down() {
     pkill -f "bin/paramserver" 2>/dev/null || true
     pkill -f "bin/agg" 2>/dev/null || true
-    ip link set dev veth0 xdpgeneric off 2>/dev/null || true
-    rm -rf "$PIN"
+    ./bin/netsum-ctl --pin "$PIN" detach --ifname veth0 --unpin 2>/dev/null || true
     ip netns del ns1 2>/dev/null || true
     ip link del veth0 2>/dev/null || true
 }
@@ -46,16 +44,15 @@ topo_up() {
     VETH1_MAC=$(ip netns exec ns1 ip link show veth1 | awk '/link\/ether/ {print $2}')
 }
 
+CTL="./bin/netsum-ctl --pin $PIN"
+
 xdp_up() {
-    rm -rf "$PIN"; mkdir -p "$PIN"
-    "$BPFTOOL" prog load xdp_agg/xdp_agg.o "$PIN/prog" type xdp pinmaps "$PIN" >/dev/null
-    ip link set dev veth0 xdpgeneric pinned "$PIN/prog"
-    /tmp/netsum_cfg_loader "$PIN/config_map" "$VETH1_MAC" 10.200.1.2 9000 0 "$VETH0_MAC" 10.200.1.1 >/dev/null
+    $CTL attach --ifname veth0 --mode generic --obj xdp_agg/xdp_agg.o >/dev/null
+    $CTL config --ps-mac "$VETH1_MAC" --ps-ip 10.200.1.2 --ps-port 9000 --agg-mac "$VETH0_MAC" --agg-ip 10.200.1.1
 }
 
 xdp_down() {
-    ip link set dev veth0 xdpgeneric off
-    rm -rf "$PIN"
+    $CTL detach --ifname veth0 --unpin
 }
 
 udp_rcvbuf_errors() { # $1: "" for root ns, "ns1"
@@ -142,10 +139,9 @@ trial() { # config workers rate trial
 
     local xdp_cnt=0 xdp_ns=0 xdp_rx=0 xdp_acc=0 xdp_tx=0 xdp_done=0 xdp_other=0
     if [ "$cfg" = xdp ]; then
-        local info
-        info=$("$BPFTOOL" -j prog show pinned "$PIN/prog")
-        xdp_cnt=$(json_field "$info" run_cnt); xdp_ns=$(json_field "$info" run_time_ns)
-        "$BPFTOOL" -j map dump pinned "$PIN/stats" > "$OUT/stats/xdp-$tag.json"
+        $CTL --json stats > "$OUT/stats/xdp-$tag.json"
+        xdp_cnt=$(json_field "$(cat "$OUT/stats/xdp-$tag.json")" prog_run_cnt)
+        xdp_ns=$(json_field "$(cat "$OUT/stats/xdp-$tag.json")" prog_run_time_ns)
         read -r xdp_rx xdp_acc xdp_tx xdp_done xdp_other < <(python3 -c "
 import sys; sys.path.insert(0, 'ci'); import netsum_bpf_json as n
 s = n.stats('$OUT/stats/xdp-$tag.json')
@@ -171,7 +167,7 @@ print(s['rx_total'], s['accepted'], s['tx_aggregate'], s['slot_completed'], othe
 main() {
     topo_up
     sysctl -qw kernel.bpf_stats_enabled=1
-    xdp_up; XDP_READBACK=$(ip -d link show veth0 | grep -o 'xdpgeneric\|xdpdrv\|xdpoffload\| xdp ' | head -1); xdp_down
+    xdp_up; XDP_READBACK=$($CTL --json attach --ifname veth0 --mode generic | python3 -c "import json,sys; print(json.load(sys.stdin)['attached'])"); xdp_down
     environment
     echo "config,workers,rate_pps,trial,rounds,chunk_len,offered,sent,send_retries,send_elapsed_us,achieved_pps,ps_completed,ps_first_complete_us,ps_last_complete_us,ps_rx_packets,ps_rcvbuf_errors,root_rcvbuf_errors,ps_cpu_ns,agg_cpu_ns,agg_rx_packets,agg_tx_aggregates,xdp_run_cnt,xdp_run_time_ns,xdp_rx_total,xdp_accepted,xdp_other_outcomes,xdp_tx_aggregate,xdp_slot_completed,ps_overflow_lines" > "$OUT/raw.csv"
     for t in $(seq 1 "$TRIALS"); do          # trials outermost: drift spreads across cells

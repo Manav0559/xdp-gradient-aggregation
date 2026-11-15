@@ -340,6 +340,33 @@ aggregator created 149 slots (21 re-opened by resends after a lost result),
 flushed 16 partials, forwarded 42 fallbacks, and every slot was retired by an
 ACK; the PS re-sent 21 results.
 
+## 12. Control plane
+
+`ctl/netsum_ctl.c` (`make ctl`, Linux) is the only tool that loads, attaches
+and inspects the program; CI and the benchmarks use nothing else.
+
+* `attach --ifname IF [--ifname IF2] --mode native|generic|auto` loads the
+  object with libbpf, pins both programs and every map under `--pin`
+  (default `/sys/fs/bpf/netsum`) and attaches with `bpf_xdp_attach`. It then
+  reads the mode back with `bpf_xdp_query` and prints what the kernel chose,
+  never what was asked for. A second `attach` reuses the pinned program, so
+  one program and one set of maps can serve several interfaces.
+* `config`, `stats` (per-CPU counters summed, plus `run_cnt` and
+  `run_time_ns` when `kernel.bpf_stats_enabled` is on), `slots` (consistent
+  snapshot with `BPF_F_LOCK`), `jobs`; `--json` on everything.
+* `sweep --ttl-ms N --interval-ms M [--once | --duration-ms D]` is the TTL
+  reclaimer. It snapshots the keys of `slot_map`, then runs the in-kernel
+  `netsum_sweep` program once per key through `BPF_PROG_TEST_RUN`. Under the
+  slot lock that program flushes an expired ACCUMULATING slot as a PARTIAL
+  (returned as `XDP_TX`; the tool sends it to the PS) and marks it FLUSHED, or
+  deletes an expired COMPLETED/FLUSHED slot (`XDP_DROP`). Doing the
+  transition in the kernel means userspace never rewrites a slot, so a
+  contribution or completion racing the sweeper is never lost, and the quota
+  release uses the same atomic path as the data plane. ATP's switch checks
+  aggregator timestamps in the data plane; a BPF program cannot run without a
+  packet or timer, and this keeps the program free of `bpf_timer`.
+* Struct layouts come from `protocol/netsum_maps.h`; there is no second copy.
+
 ## 14. Testing strategy
 
 * `tests/test_correctness.py`: end-to-end behaviour of the real binaries.

@@ -156,13 +156,64 @@ static __always_inline uint16_t ip_checksum(const struct netsum_ip *iph)
 
 enum outcome {
     OUT_ACCEPTED = 0,
-    OUT_COMPLETED,
+    OUT_COMPLETED,       /* forward the aggregate */
+    OUT_RESEND_RESULT,   /* RESEND on a completed slot: forward the stored aggregate again */
+    OUT_FLUSH,           /* RESEND of a held worker: forward the partial, slot -> FLUSHED */
+    OUT_FALLBACK,        /* contribution to a FLUSHED slot: forward it raw, flagged FALLBACK */
     OUT_DUPLICATE,
     OUT_RESEND_DUPLICATE,
     OUT_LATE,
     OUT_FANIN_MISMATCH,
     OUT_CHUNK_LEN_MISMATCH,
 };
+
+/* Copies a slot's sum (and, for v2, its contributor bitmap) into the packet.
+ * Called with the slot lock held: no helpers, bounds checked per access. */
+static __always_inline void copy_slot_out(struct grad_slot *slot, int32_t *values, uint16_t chunk_len,
+                                          int v2, void *data_end)
+{
+    for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++) {
+        if (i >= chunk_len)
+            break;
+        if ((void *)(values + i + 1) > data_end)
+            break;
+        values[i] = (int32_t)netsum_htonl((uint32_t)slot->sum[i]);
+    }
+    if (!v2)
+        return;
+    uint8_t *bm = (uint8_t *)(values + chunk_len);
+    if ((void *)(bm + NETSUM_BITMAP_BYTES) > data_end)
+        return;
+#pragma unroll
+    for (int b = 0; b < NETSUM_BITMAP_BYTES; b++)
+        bm[b] = slot->bitmap[b];
+}
+
+/* ACK from the parameter server: the key is finished, drop our state. An ACK
+ * for a slot that is still accumulating means the PS completed the key from
+ * fallbacks or partials, so our partial sum is stale. */
+static __always_inline int handle_ack(const struct netsum_parsed *p)
+{
+    stat_inc(NS_ACK_SEEN);
+    struct grad_slot_key key = {p->job_id, p->round, p->chunk_id};
+    struct grad_slot *slot = bpf_map_lookup_elem(&slot_map, &key);
+    if (!slot) {
+        stat_inc(NS_ACK_UNEXPECTED);
+        return XDP_DROP;
+    }
+    int accumulating, charged;
+    bpf_spin_lock(&slot->lock);
+    accumulating = slot->state == NETSUM_SLOT_ACCUMULATING;
+    charged = slot->charged;
+    slot->charged = 0;
+    slot->state = NETSUM_SLOT_EMPTY;
+    bpf_spin_unlock(&slot->lock);
+    bpf_map_delete_elem(&slot_map, &key);
+    if (charged)
+        quota_release(p->job_id);
+    stat_inc(accumulating ? NS_ACK_UNEXPECTED : NS_SLOT_RETIRED_ACK);
+    return XDP_DROP;
+}
 
 SEC("xdp")
 int netsum_xdp_aggregate(struct xdp_md *ctx)
@@ -212,7 +263,9 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
         stat_inc(NS_FROM_VERDICT(v));
         return XDP_DROP;
     }
-    if (p.kind == NETSUM_KIND_REGISTER || p.kind == NETSUM_KIND_ACK) {
+    if (p.kind == NETSUM_KIND_ACK)
+        return handle_ack(&p);
+    if (p.kind == NETSUM_KIND_REGISTER) {
         stat_inc(NS_PASS_CONTROL);
         return XDP_PASS;
     }
@@ -223,6 +276,8 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
     uint16_t chunk_len = p.chunk_len;
     if (chunk_len > NETSUM_MAX_CHUNK_LEN)
         return XDP_DROP; /* already guaranteed by the parser; bounds it for the verifier */
+    int v2 = p.version == NETSUM_VERSION_V2;
+    int resend = (p.flags & NETSUM_F_RESEND) != 0;
 
     uint32_t cfg_key = 0;
     struct netsum_config *cfg = bpf_map_lookup_elem(&config_map, &cfg_key);
@@ -272,19 +327,37 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
 
     int32_t *values = (int32_t *)((uint8_t *)payload + NETSUM_HDR_SIZE);
     int outcome = OUT_ACCEPTED;
-    int release_quota = 0;
-    int overflowed = 0;
+    int release_quota = 0, overflowed = 0, copy_out = 0;
     uint16_t fanin = 0;
 
     bpf_spin_lock(&slot->lock);
+    int held = (slot->bitmap[(p.worker_id >> 3) & 31] >> (p.worker_id & 7)) & 1;
     if (p.num_workers != slot->fanin) {
         outcome = OUT_FANIN_MISMATCH;
     } else if (chunk_len != slot->chunk_len) {
         outcome = OUT_CHUNK_LEN_MISMATCH;
+    } else if (slot->state == NETSUM_SLOT_COMPLETED) {
+        if (resend) { /* the aggregate or the PS's result was lost */
+            outcome = OUT_RESEND_RESULT;
+            copy_out = 1;
+        } else {
+            outcome = OUT_LATE;
+        }
+    } else if (slot->state == NETSUM_SLOT_FLUSHED) {
+        outcome = (held && !resend) ? OUT_DUPLICATE : (v2 ? OUT_FALLBACK : OUT_LATE);
     } else if (slot->state != NETSUM_SLOT_ACCUMULATING) {
         outcome = OUT_LATE;
-    } else if (slot->bitmap[(p.worker_id >> 3) & 31] & (1u << (p.worker_id & 7))) {
-        outcome = (p.flags & NETSUM_F_RESEND) ? OUT_RESEND_DUPLICATE : OUT_DUPLICATE;
+    } else if (held) {
+        if (resend && v2) { /* stuck round: hand the partial to the PS (ATP flush) */
+            outcome = OUT_FLUSH;
+            copy_out = 1;
+            slot->state = NETSUM_SLOT_FLUSHED;
+            slot->last_touched_ns = now;
+            release_quota = slot->charged;
+            slot->charged = 0;
+        } else {
+            outcome = resend ? OUT_RESEND_DUPLICATE : OUT_DUPLICATE;
+        }
     } else {
         int completing = slot->contributors + 1 == slot->fanin;
         for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++) {
@@ -304,11 +377,9 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
         if (completing) {
             outcome = OUT_COMPLETED;
             slot->state = NETSUM_SLOT_COMPLETED;
-            overflowed = slot->overflowed;
-            fanin = slot->fanin;
             release_quota = slot->charged;
             slot->charged = 0;
-            if (p.version == NETSUM_VERSION_V2) {
+            if (v2) {
                 uint8_t *bm = (uint8_t *)(values + chunk_len);
                 if ((void *)(bm + NETSUM_BITMAP_BYTES) <= data_end) {
 #pragma unroll
@@ -318,8 +389,16 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
             }
         }
     }
+    if (copy_out)
+        copy_slot_out(slot, values, chunk_len, v2, data_end);
+    overflowed = slot->overflowed;
+    fanin = slot->fanin;
     bpf_spin_unlock(&slot->lock);
 
+    if (release_quota)
+        quota_release(p.job_id);
+
+    uint16_t agg_flags = 0;
     switch (outcome) {
     case OUT_ACCEPTED:
         stat_inc(NS_ACCEPTED);
@@ -339,16 +418,24 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
     case OUT_CHUNK_LEN_MISMATCH:
         stat_inc(NS_CHUNK_LEN_MISMATCH);
         return XDP_DROP;
-    default:
+    case OUT_COMPLETED:
+        stat_inc(NS_ACCEPTED);
+        stat_inc(NS_SLOT_COMPLETED);
+        if (overflowed)
+            stat_inc(NS_OVERFLOW);
+        break;
+    case OUT_RESEND_RESULT:
+        stat_inc(NS_TX_RESULT_RESEND);
+        break;
+    case OUT_FLUSH:
+        stat_inc(NS_RESEND_DUPLICATE);
+        stat_inc(NS_SLOT_FLUSHED_PARTIAL);
+        agg_flags = NETSUM_F_PARTIAL;
+        break;
+    default: /* OUT_FALLBACK */
         break;
     }
 
-    stat_inc(NS_ACCEPTED);
-    stat_inc(NS_SLOT_COMPLETED);
-    if (release_quota)
-        quota_release(p.job_id);
-    if (overflowed)
-        stat_inc(NS_OVERFLOW);
     if (!cfg) {
         stat_inc(NS_DROP_NO_CONFIG);
         return XDP_DROP;
@@ -357,22 +444,26 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
         stat_inc(NS_REJ_TTL);
         return XDP_DROP;
     }
-
-    /* Turn the completing contribution into the aggregate, in place. */
     struct grad_hdr *h = payload;
     if ((void *)(h + 1) > data_end)
         return XDP_DROP;
-    if (p.version == NETSUM_VERSION_V2) {
+    if (outcome == OUT_FALLBACK) {
+        h->flags = netsum_htons((uint16_t)(p.flags | NETSUM_F_FALLBACK));
+        stat_inc(NS_TX_FALLBACK);
+    } else if (v2) {
         h->worker_id = netsum_htons(NETSUM_WORKER_AGGREGATE);
         h->num_workers = netsum_htons(fanin);
-        h->flags = netsum_htons((uint16_t)(NETSUM_FLAGS_V2 | (overflowed ? NETSUM_F_OVERFLOW : 0)));
+        h->flags = netsum_htons((uint16_t)(NETSUM_FLAGS_V2 | agg_flags | (overflowed ? NETSUM_F_OVERFLOW : 0)));
+        stat_inc(agg_flags ? NS_TX_PARTIAL : NS_TX_AGGREGATE);
     } else {
         if (overflowed)
             return XDP_DROP; /* v1 cannot signal overflow; counted above */
         h->worker_id = 0;  /* legacy v1 aggregate: worker 0 of fan-in 1 */
         h->num_workers = netsum_htons(1);
+        stat_inc(NS_TX_AGGREGATE);
     }
 
+    /* Shared forwarding tail: address everything we emit to the PS. */
     for (int i = 0; i < 6; i++)
         eth->h_dest[i] = cfg->ps_mac[i];
     if (cfg->agg_mac[0] | cfg->agg_mac[1] | cfg->agg_mac[2] | cfg->agg_mac[3] | cfg->agg_mac[4] | cfg->agg_mac[5])
@@ -386,9 +477,70 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
     iph->check = ip_checksum(iph);
     udp->dest = cfg->ps_port;
     udp->check = 0; /* optional for IPv4 (RFC 768) */
-    stat_inc(NS_TX_AGGREGATE);
-
     if (cfg->egress_ifindex && cfg->egress_ifindex != ctx->ingress_ifindex)
         return bpf_redirect(cfg->egress_ifindex, 0);
     return XDP_TX;
+}
+
+/* TTL sweeper step, run from userspace with BPF_PROG_TEST_RUN (never
+ * attached). Input: a frame whose payload is a grad_hdr naming the key,
+ * followed by the TTL in ns (u64, host order) and room for a full packet.
+ * Under the slot lock, an ACCUMULATING slot idle for longer than the TTL is
+ * flushed: the frame is rewritten into a PARTIAL aggregate (XDP_TX tells the
+ * caller to send it to the PS) and the slot becomes FLUSHED. An expired
+ * COMPLETED or FLUSHED slot is deleted (XDP_DROP). Otherwise XDP_PASS.
+ * Doing the transition here keeps every slot write under the kernel lock. */
+SEC("xdp")
+int netsum_sweep(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct grad_hdr *h = (struct grad_hdr *)((uint8_t *)data + NETSUM_SWEEP_PAYLOAD_OFFSET);
+    int32_t *values = (int32_t *)(h + 1);
+    if ((void *)(values + NETSUM_MAX_CHUNK_LEN) + NETSUM_BITMAP_BYTES > data_end)
+        return XDP_ABORTED;
+    uint64_t ttl_ns;
+    __builtin_memcpy(&ttl_ns, values, sizeof(ttl_ns));
+    struct grad_slot_key key = {netsum_ntohl(h->job_id), netsum_ntohl(h->round), netsum_ntohl(h->chunk_id)};
+    struct grad_slot *slot = bpf_map_lookup_elem(&slot_map, &key);
+    if (!slot)
+        return XDP_PASS;
+    uint64_t now = bpf_ktime_get_ns();
+    int action = XDP_PASS, release_quota = 0, overflowed = 0;
+    uint16_t fanin = 0, chunk_len = 0;
+
+    bpf_spin_lock(&slot->lock);
+    if (now - slot->last_touched_ns >= ttl_ns) {
+        if (slot->state == NETSUM_SLOT_ACCUMULATING) {
+            action = XDP_TX;
+            slot->state = NETSUM_SLOT_FLUSHED;
+            slot->last_touched_ns = now;
+            release_quota = slot->charged;
+            slot->charged = 0;
+            fanin = slot->fanin;
+            chunk_len = slot->chunk_len;
+            overflowed = slot->overflowed;
+            if (chunk_len > NETSUM_MAX_CHUNK_LEN)
+                chunk_len = NETSUM_MAX_CHUNK_LEN;
+            copy_slot_out(slot, values, chunk_len, 1, data_end);
+        } else {
+            action = XDP_DROP;
+        }
+    }
+    bpf_spin_unlock(&slot->lock);
+
+    if (action == XDP_DROP) {
+        bpf_map_delete_elem(&slot_map, &key);
+        stat_inc(NS_SLOT_RETIRED_TTL);
+    } else if (action == XDP_TX) {
+        if (release_quota)
+            quota_release(key.job_id);
+        h->worker_id = netsum_htons(NETSUM_WORKER_AGGREGATE);
+        h->num_workers = netsum_htons(fanin);
+        h->chunk_len = netsum_htons(chunk_len);
+        h->flags = netsum_htons((uint16_t)(NETSUM_FLAGS_V2 | NETSUM_F_PARTIAL | (overflowed ? NETSUM_F_OVERFLOW : 0)));
+        stat_inc(NS_SLOT_FLUSHED_PARTIAL);
+        stat_inc(NS_TX_PARTIAL);
+    }
+    return action;
 }

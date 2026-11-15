@@ -20,7 +20,7 @@
 #include "../../protocol/netsum_maps.h"
 #include "../../protocol/netsum_stats.h"
 
-static int prog_fd, slot_fd, config_fd, quota_fd, stats_fd, ncpus;
+static int prog_fd, sweep_fd, slot_fd, config_fd, quota_fd, stats_fd, ncpus;
 static int cases, failures;
 static uint64_t snap[NS_STAT__COUNT];
 static const char *current = "";
@@ -181,7 +181,6 @@ static void set_config(uint32_t max_slots, uint32_t egress)
     c.ps_ip = __builtin_bswap32(PS_IP);
     c.agg_ip = __builtin_bswap32(AGG_IP);
     c.ps_port = __builtin_bswap16(PS_PORT);
-    c.ack_port = __builtin_bswap16(NETSUM_ACK_PORT);
     c.egress_ifindex = egress;
     c.max_slots_per_job = max_slots;
     c.quota_policy = max_slots ? NETSUM_QUOTA_DROP : NETSUM_QUOTA_NONE;
@@ -216,9 +215,9 @@ static void test_pass_paths(void)
     begin("REGISTER passes as control");
     CHECK(send_frame(F(.job = 1, .wid = 0, .nw = 2, .chunk_len = 0, .flags = NETSUM_F_REGISTER), out) == XDP_PASS, "action");
     CHECK(delta(NS_PASS_CONTROL) == 1, "pass_control");
-    begin("ACK passes as control");
-    CHECK(send_frame(F(.job = 1, .wid = 0xFFFF, .nw = 2, .chunk_len = 1, .flags = NETSUM_F_ACK), out) == XDP_PASS, "action");
-    CHECK(delta(NS_PASS_CONTROL) == 1, "pass_control");
+    begin("ACK for an unknown key is consumed and counted");
+    CHECK(send_frame(F(.job = 1, .wid = 0xFFFF, .nw = 2, .chunk_len = 1, .flags = NETSUM_F_ACK), out) == XDP_DROP, "action");
+    CHECK(delta(NS_ACK_SEEN) == 1 && delta(NS_ACK_UNEXPECTED) == 1, "ack counters");
     begin("aggregate arriving at an aggregator passes, counted rej_kind");
     CHECK(send_frame(F(.job = 1, .wid = 0xFFFF, .nw = 2, .chunk_len = 1), out) == XDP_PASS, "action");
     CHECK(delta(NS_REJ_KIND) == 1, "rej_kind");
@@ -302,9 +301,6 @@ static void test_state_machine(void)
     begin("duplicate worker is counted, not summed");
     CHECK(send_frame(F(.job = 101, .wid = 0, .nw = 3, .chunk_len = 4, .val = 10), out) == XDP_DROP, "action");
     CHECK(delta(NS_DUPLICATE) == 1, "duplicate");
-    begin("resent duplicate is counted separately");
-    CHECK(send_frame(F(.job = 101, .wid = 0, .nw = 3, .chunk_len = 4, .val = 10, .flags = NETSUM_F_RESEND), out) == XDP_DROP, "action");
-    CHECK(delta(NS_RESEND_DUPLICATE) == 1, "resend_duplicate");
     begin("fan-in disagreement is rejected (C3)");
     CHECK(send_frame(F(.job = 101, .wid = 1, .nw = 4, .chunk_len = 4, .val = 10), out) == XDP_DROP, "action");
     CHECK(delta(NS_NUM_WORKERS_MISMATCH) == 1, "mismatch");
@@ -447,11 +443,123 @@ static void test_config_and_forwarding(void)
     set_config(0, 0);
 }
 
+/* ---- result path: ACK, RESEND, FLUSHED -------------------------------------- */
+
+static void test_ack_and_resend(void)
+{
+    uint8_t out[4096];
+    struct grad_slot s;
+
+    begin("ACK retires a COMPLETED tombstone");
+    send_frame(F(.job = 500, .nw = 1, .chunk_len = 2, .val = 5), out);
+    CHECK(send_frame(F(.job = 500, .wid = 0xFFFF, .nw = 1, .chunk_len = 2, .flags = NETSUM_F_ACK), out) == XDP_DROP, "action");
+    CHECK(!slot_get(500, 0, 0, &s), "slot deleted");
+    CHECK(delta(NS_SLOT_RETIRED_ACK) == 1, "slot_retired_ack");
+
+    begin("ACK for an ACCUMULATING slot discards it and releases its quota unit");
+    set_config(4, 0);
+    send_frame(F(.job = 501, .wid = 0, .nw = 2, .chunk_len = 1, .val = 1), out);
+    CHECK(quota_of(501) == 1, "charged");
+    CHECK(send_frame(F(.job = 501, .wid = 0xFFFF, .nw = 2, .chunk_len = 1, .flags = NETSUM_F_ACK), out) == XDP_DROP, "action");
+    CHECK(!slot_get(501, 0, 0, &s), "slot deleted");
+    CHECK(quota_of(501) == 0xFFFFFFFFu, "quota released");
+    CHECK(delta(NS_ACK_UNEXPECTED) == 1, "ack_unexpected");
+    set_config(0, 0);
+
+    begin("RESEND on a COMPLETED slot re-sends the stored aggregate");
+    send_frame(F(.job = 502, .wid = 0, .nw = 2, .chunk_len = 3, .val = 10), out);
+    send_frame(F(.job = 502, .wid = 1, .nw = 2, .chunk_len = 3, .val = 20), out);
+    CHECK(send_frame(F(.job = 502, .wid = 1, .nw = 2, .chunk_len = 3, .val = 999, .flags = NETSUM_F_RESEND), out) == XDP_TX, "action");
+    check_aggregate_frame(out, 2, 3, 30, 0);
+    CHECK(delta(NS_TX_RESULT_RESEND) == 1, "tx_result_resend");
+    begin("plain duplicate on a COMPLETED slot stays a late duplicate");
+    CHECK(send_frame(F(.job = 502, .wid = 1, .nw = 2, .chunk_len = 3, .val = 20), out) == XDP_DROP, "action");
+    CHECK(delta(NS_LATE_DUPLICATE) == 1, "late");
+
+    begin("RESEND of a held worker flushes the partial (ATP) and marks FLUSHED");
+    set_config(4, 0);
+    send_frame(F(.job = 503, .wid = 0, .nw = 3, .chunk_len = 2, .val = 100), out);
+    send_frame(F(.job = 503, .wid = 1, .nw = 3, .chunk_len = 2, .val = 200), out);
+    CHECK(send_frame(F(.job = 503, .wid = 1, .nw = 3, .chunk_len = 2, .val = 200, .flags = NETSUM_F_RESEND), out) == XDP_TX, "action");
+    const uint8_t *pl = out + 14 + 20 + 8;
+    CHECK(get16(pl + 12) == 0xFFFF && get16(pl + 14) == 3, "aggregate header");
+    CHECK((get16(pl + 18) & NETSUM_F_PARTIAL) && get16(pl + 18) >> 12 == 2, "PARTIAL flag");
+    CHECK((int32_t)get32(pl + 20) == 300 && (int32_t)get32(pl + 24) == 302, "partial sum, not the resent values");
+    CHECK(pl[20 + 8] == 0x03, "bitmap {0,1}");
+    CHECK(slot_get(503, 0, 0, &s) && s.state == NETSUM_SLOT_FLUSHED, "FLUSHED");
+    CHECK(quota_of(503) == 0xFFFFFFFFu, "quota released on flush");
+    CHECK(delta(NS_SLOT_FLUSHED_PARTIAL) == 1 && delta(NS_TX_PARTIAL) == 1, "counters");
+    set_config(0, 0);
+
+    begin("a new worker's contribution to a FLUSHED slot goes to the PS as FALLBACK");
+    CHECK(send_frame(F(.job = 503, .wid = 2, .nw = 3, .chunk_len = 2, .val = 400), out) == XDP_TX, "action");
+    CHECK(get16(pl + 12) == 2 && (get16(pl + 18) & NETSUM_F_FALLBACK), "raw worker 2, FALLBACK");
+    CHECK((int32_t)get32(pl + 20) == 400, "own values kept");
+    CHECK(memcmp(out, PS_MAC, 6) == 0 && get32(out + 14 + 16) == PS_IP, "addressed to the PS");
+    CHECK(delta(NS_TX_FALLBACK) == 1, "tx_fallback");
+    begin("a held worker's plain duplicate to a FLUSHED slot is dropped");
+    CHECK(send_frame(F(.job = 503, .wid = 0, .nw = 3, .chunk_len = 2, .val = 100), out) == XDP_DROP, "action");
+    CHECK(delta(NS_DUPLICATE) == 1, "duplicate");
+    begin("ACK retires a FLUSHED slot");
+    CHECK(send_frame(F(.job = 503, .wid = 0xFFFF, .nw = 3, .chunk_len = 2, .flags = NETSUM_F_ACK), out) == XDP_DROP, "action");
+    CHECK(!slot_get(503, 0, 0, &s) && delta(NS_SLOT_RETIRED_ACK) == 1, "retired");
+}
+
+static int sweep(uint32_t job, uint64_t ttl_ns, uint8_t *out)
+{
+    uint8_t in[NETSUM_SWEEP_FRAME_SIZE];
+    memset(in, 0, sizeof(in));
+    uint8_t *h = in + NETSUM_SWEEP_PAYLOAD_OFFSET;
+    put32(h, job);
+    memcpy(h + 20, &ttl_ns, 8);
+    LIBBPF_OPTS(bpf_test_run_opts, o, .data_in = in, .data_size_in = sizeof(in),
+                .data_out = out, .data_size_out = 4096, .repeat = 1);
+    if (bpf_prog_test_run_opts(sweep_fd, &o)) {
+        fprintf(stderr, "sweep test run: %s\n", strerror(errno));
+        exit(2);
+    }
+    return (int)o.retval;
+}
+
+static void test_sweep(void)
+{
+    uint8_t out[4096];
+    struct grad_slot s;
+    begin("sweep leaves a fresh slot alone");
+    send_frame(F(.job = 600, .wid = 1, .nw = 3, .chunk_len = 2, .val = 7), out);
+    CHECK(sweep(600, 60ull * 1000000000ull, out) == XDP_PASS, "action");
+    CHECK(slot_get(600, 0, 0, &s) && s.state == NETSUM_SLOT_ACCUMULATING, "untouched");
+    begin("sweep flushes an expired ACCUMULATING slot as PARTIAL");
+    set_config(4, 0);
+    send_frame(F(.job = 601, .wid = 1, .nw = 3, .chunk_len = 2, .val = 7), out);
+    CHECK(quota_of(601) == 1, "charged");
+    CHECK(sweep(601, 0, out) == XDP_TX, "action");
+    const uint8_t *pl = out + NETSUM_SWEEP_PAYLOAD_OFFSET;
+    CHECK(get32(pl) == 601 && get16(pl + 12) == 0xFFFF && get16(pl + 14) == 3 && get16(pl + 16) == 2, "header");
+    CHECK(get16(pl + 18) == (NETSUM_FLAGS_V2 | NETSUM_F_PARTIAL), "flags");
+    CHECK((int32_t)get32(pl + 20) == 7 && (int32_t)get32(pl + 24) == 8 && pl[28] == 0x02, "sum and bitmap {1}");
+    CHECK(slot_get(601, 0, 0, &s) && s.state == NETSUM_SLOT_FLUSHED, "FLUSHED");
+    CHECK(quota_of(601) == 0xFFFFFFFFu, "quota released");
+    CHECK(delta(NS_SLOT_FLUSHED_PARTIAL) == 1, "counted");
+    set_config(0, 0);
+    begin("sweep deletes an expired FLUSHED slot");
+    CHECK(sweep(601, 0, out) == XDP_DROP, "action");
+    CHECK(!slot_get(601, 0, 0, &s) && delta(NS_SLOT_RETIRED_TTL) == 1, "deleted");
+    begin("sweep deletes an expired COMPLETED tombstone");
+    send_frame(F(.job = 602, .nw = 1, .chunk_len = 1, .val = 1), out);
+    CHECK(sweep(602, 0, out) == XDP_DROP, "action");
+    CHECK(!slot_get(602, 0, 0, &s), "deleted");
+    begin("sweep on a missing key does nothing");
+    CHECK(sweep(603, 0, out) == XDP_PASS, "action");
+}
+
 /* ---- corpus replay: kernel verdicts vs the userspace parser -------------- */
 
 static int expected_action_ok(const struct netsum_parsed *p)
 {
-    return p->kind == NETSUM_KIND_RAW ? -1 /* DROP or TX */ : XDP_PASS;
+    if (p->kind == NETSUM_KIND_RAW)
+        return -1; /* DROP or TX, depending on slot state */
+    return p->kind == NETSUM_KIND_ACK ? XDP_DROP : XDP_PASS; /* ACKs are consumed */
 }
 
 static void replay_one(const uint8_t *payload, size_t len, int *mismatches)
@@ -537,12 +645,13 @@ int main(int argc, char **argv)
     }
     struct bpf_program *prog = bpf_object__find_program_by_name(obj, "netsum_xdp_aggregate");
     prog_fd = bpf_program__fd(prog);
+    sweep_fd = bpf_program__fd(bpf_object__find_program_by_name(obj, "netsum_sweep"));
     slot_fd = bpf_object__find_map_fd_by_name(obj, "slot_map");
     config_fd = bpf_object__find_map_fd_by_name(obj, "config_map");
     quota_fd = bpf_object__find_map_fd_by_name(obj, "job_quota_map");
     stats_fd = bpf_object__find_map_fd_by_name(obj, "stats");
     ncpus = libbpf_num_possible_cpus();
-    if (prog_fd < 0 || slot_fd < 0 || config_fd < 0 || quota_fd < 0 || stats_fd < 0 || ncpus <= 0 || ncpus > 512) {
+    if (prog_fd < 0 || sweep_fd < 0 || slot_fd < 0 || config_fd < 0 || quota_fd < 0 || stats_fd < 0 || ncpus <= 0 || ncpus > 512) {
         fprintf(stderr, "program or maps not found\n");
         return 2;
     }
@@ -554,6 +663,8 @@ int main(int argc, char **argv)
     test_overflow();
     test_quota();
     test_config_and_forwarding();
+    test_ack_and_resend();
+    test_sweep();
     test_corpus(argv[2]);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);

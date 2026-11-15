@@ -7,7 +7,7 @@ kernel-verifier-approved xdp_agg.o is actually tracking per-job
 concurrent-slot counts in job_quota_map, not just rejecting packets for
 some other reason.
 
-Tolerates the same two bpftool JSON renderings check_drop_stat.py already
+Tolerates netsum-ctl --json jobs output and the two bpftool JSON renderings it
 documents: with BTF, key/value come back as decoded JSON
 scalars/objects (key: int, value: {"concurrent_slots": N}); without BTF,
 as arrays of "0x.." hex byte strings in map-native (little-endian) order
@@ -46,6 +46,8 @@ def main():
         data = json.load(f)
 
     for entry in data:
+        if "concurrent_slots" in entry:  # netsum-ctl --json jobs
+            entry = {"key": entry["job_id"], "value": entry["concurrent_slots"]}
         key_job_id = to_int(entry["key"]) if not isinstance(entry["key"], dict) else int(entry["key"]["job_id"])
         if key_job_id == expect_job_id:
             got = concurrent_slots_of(entry["value"])

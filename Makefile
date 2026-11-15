@@ -18,7 +18,7 @@ else
 BPF_CC = clang
 endif
 
-.PHONY: all clean test unit bpf bpf-compat bpf-unit bpf-unit-bin
+.PHONY: all clean test unit bpf bpf-compat bpf-unit bpf-unit-bin ctl
 
 all: $(BIN_DIR)/worker $(BIN_DIR)/paramserver $(BIN_DIR)/agg $(BIN_DIR)/lite_sender
 
@@ -65,6 +65,14 @@ bpf: xdp_agg/xdp_agg.c $(BPF_HDRS)
 
 bpf-compat: xdp_agg/xdp_agg.c $(BPF_HDRS)
 	$(BPF_CC) $(filter-out -DNETSUM_USE_SYSTEM_LIBBPF,$(BPF_CFLAGS)) -c xdp_agg/xdp_agg.c -o xdp_agg/xdp_agg_compat.o
+
+# Control plane (Linux, libbpf).
+ctl: ctl/netsum_ctl.c protocol/netsum_maps.h $(HDRS) | $(BIN_DIR)
+ifeq ($(shell uname -s),Linux)
+	$(CC) -O2 -g -Wall -Wextra -o $(BIN_DIR)/netsum-ctl ctl/netsum_ctl.c -lbpf -lelf -lz
+else
+	@echo "netsum-ctl requires Linux and libbpf"
+endif
 
 # BPF_PROG_TEST_RUN harness (Linux, libbpf, root).
 bpf-unit-bin: tests/bpf/run_xdp_tests.c protocol/netsum_maps.h $(HDRS) | $(BIN_DIR)

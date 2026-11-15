@@ -55,12 +55,17 @@ struct netsum_config {
     uint32_t ps_ip;
     uint32_t agg_ip;           /* 0: keep the frame's source IP */
     uint16_t ps_port;
-    uint16_t ack_port;
+    uint16_t _pad2;
     uint32_t egress_ifindex;   /* 0 or ingress: XDP_TX; otherwise bpf_redirect */
     uint32_t max_slots_per_job;/* 0: no quota */
     uint32_t quota_policy;     /* enum netsum_quota_policy */
     uint32_t slot_ttl_ms;      /* read by the userspace sweeper */
 };
+
+/* netsum_sweep input frame: the grad_hdr naming the key starts here (after
+ * Ethernet, IPv4 and UDP headers the sweeper fills with zeros). */
+#define NETSUM_SWEEP_PAYLOAD_OFFSET 42
+#define NETSUM_SWEEP_FRAME_SIZE (NETSUM_SWEEP_PAYLOAD_OFFSET + NETSUM_MAX_PACKET_SIZE)
 
 struct job_quota_entry {
     uint32_t concurrent_slots; /* charged ACCUMULATING slots */

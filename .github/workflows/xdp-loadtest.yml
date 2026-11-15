@@ -1,107 +1,67 @@
+# End-to-end scenarios against the real kernel: xdp_agg.o goes through the
+# verifier, is attached to a veth with netsum-ctl, and real UDP traffic from a
+# second network namespace exercises aggregation, admission, loss recovery,
+# ACK retirement and the TTL sweeper. Every assertion checks exact counter
+# deltas (netsum-ctl --json stats) or exact slot states (netsum-ctl --json slots).
+# Topology and helpers: ci/lib.sh. Scenario list: docs/DESIGN_NOTES.md §Testing strategy.
 name: XDP real-kernel load test
 
-# Closes the single biggest open gap in this repo: xdp_agg/xdp_agg.c has
-# only ever been compiled to BPF bytecode with `clang -target bpf` on a
-# macOS dev machine (codegen success) -- it has never been run through a
-# real Linux kernel's in-kernel BPF *verifier*, which proves categorically
-# stronger properties (pointer-provenance bounds, loop-termination, map
-# safety) that codegen alone cannot check. ubuntu-latest GitHub Actions
-# runners are real Linux boxes with a real verifier -- this workflow loads
-# xdp_agg.o onto a veth pair via that real verifier, sends real UDP
-# gradient packets through it (including the exact adversarial inputs an
-# earlier adversarial code review found real bugs in), and asserts on the
-# real, measured result -- not a simulation of one.
 on:
   workflow_dispatch:
   push:
     branches: [main]
   pull_request:
 
-env:
-  NETSUM_EXPECT_RED_K: '0'
-  NETSUM_EXPECT_RED_L: '0'
-  NETSUM_EXPECT_RED_M: '0'
-  NETSUM_EXPECT_RED_N: '0'
-  NETSUM_EXPECT_RED_O: '0'
-
 jobs:
   xdp-loadtest:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show real kernel + verifier evidence environment
-        run: |
-          uname -a
-          cat /proc/version
+      - name: Kernel
+        run: uname -a; nproc
 
       - name: Install dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y clang llvm gcc libbpf-dev libelf-dev python3 iproute2
+          sudo apt-get install -y clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev python3 iproute2
           sudo modprobe veth || true
-          sudo modprobe sch_netem || true  # netem qdisc for the loss/reorder sweep, below
-          sudo apt-get install -y bpftool || \
-            sudo apt-get install -y linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" || true
-          # Gotcha: Ubuntu's /usr/sbin/bpftool is a wrapper script that gates
-          # any kernel-interacting subcommand (prog load, map dump, ...)
-          # behind an EXACT `uname -r` directory match under
-          # /usr/lib/linux-tools/<version>/bpftool, but silently still runs
-          # harmless subcommands like `version` even when that match fails
-          # (this runner's actual running kernel string doesn't line up
-          # with the archive package's directory name, a real, observed
-          # mismatch on this exact GitHub-hosted runner image -- NOT a
-          # hypothetical). Resolve and use the real binary directly,
-          # bypassing that wrapper's gate, for every subsequent step.
-          REAL_BPFTOOL=""
+          sudo modprobe sch_netem || true
+          sudo apt-get install -y linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" || true
           for f in "/usr/lib/linux-tools/$(uname -r)/bpftool" /usr/lib/linux-tools/*/bpftool; do
-            if [ -x "$f" ]; then REAL_BPFTOOL="$f"; break; fi
+            if [ -x "$f" ]; then echo "BPFTOOL=$f" >> "$GITHUB_ENV"; break; fi
           done
-          if [ -z "$REAL_BPFTOOL" ]; then
-            echo "FATAL: no real bpftool binary found under /usr/lib/linux-tools/*"
-            exit 1
-          fi
-          echo "resolved real bpftool binary: $REAL_BPFTOOL"
-          sudo "$REAL_BPFTOOL" version
-          echo "BPFTOOL=$REAL_BPFTOOL" >> "$GITHUB_ENV"
 
-      - name: Build BPF object (real verifier target) and userspace binaries
-        run: |
-          # Plain `clang -target bpf` on Linux doesn't know the host's
-          # multiarch include path, so glibc's stdint.h -> bits/libc-header-
-          # start.h (which lives under /usr/include/<triplet>/, not
-          # /usr/include/ directly) fails to resolve. -idirafter fixes that.
-          # Second-order issue once that resolves: glibc's gnu/stubs.h picks
-          # its 32- vs 64-bit stub header based on whether __x86_64__ is
-          # defined, which clang does NOT define for the freestanding "bpf"
-          # target (correctly -- it isn't x86_64) -- so it falls into the
-          # 32-bit branch, which needs gnu/stubs-32.h, not installed on a
-          # 64-bit-only runner. -D__x86_64__ is a preprocessor-only define
-          # here (it does not change actual BPF codegen/ISA, only which
-          # glibc header branch is textually selected) that makes it take
-          # the 64-bit branch instead, which does exist and matches the
-          # 64-bit int/long/pointer widths the BPF VM actually uses.
-          MULTIARCH=$(gcc -print-multiarch)
-          echo "host multiarch: $MULTIARCH"
-          make bpf BPF_CC="clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH}"
-          make
-          llvm-objdump -h xdp_agg/xdp_agg.o
-          ls -la xdp_agg/xdp_agg.o bin/
-
-      - name: Build config-map loader helper (libbpf bpf_obj_get/bpf_map_update_elem)
-        run: |
-          gcc -O2 -Wall -Wextra -o /tmp/netsum_cfg_loader ci/netsum_cfg_loader.c -lbpf
-          /tmp/netsum_cfg_loader 2>&1 | head -1 || true  # prints usage, exit 1 expected here
-
-      - name: Set up veth pair + network namespace (real wire, not loopback)
+      - name: Build
         run: |
           set -euo pipefail
-          # See the workflow header: veth0 stays in the root netns (XDP is
-          # attached here); veth1 moves into ns1. Sending FROM ns1 TO
-          # veth0's address genuinely transmits over the wire instead of
-          # short-circuiting via loopback delivery, which is what makes
-          # this a real ingress test of the XDP hook.
+          MULTIARCH=$(gcc -print-multiarch)
+          make bpf BPF_CC="clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH}"
+          make all ctl
+          llvm-objdump -h xdp_agg/xdp_agg.o
+
+      - name: Verifier evidence (both programs; log kept as an artifact)
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /sys/fs/bpf/netsum_verify
+          set +e
+          sudo "$BPFTOOL" -d prog loadall xdp_agg/xdp_agg.o /sys/fs/bpf/netsum_verify > /tmp/verifier.log 2>&1
+          RC=$?
+          set -e
+          grep -E "processed [0-9]+ insns|stack depth" /tmp/verifier.log || true
+          sudo "$BPFTOOL" prog show | grep -A2 netsum | tee /tmp/prog_show.log || true
+          sudo rm -rf /sys/fs/bpf/netsum_verify
+          tail -c 200000 /tmp/verifier.log > /tmp/verifier_tail.log
+          [ $RC -eq 0 ] || { tail -60 /tmp/verifier.log; exit 1; }
+
+      - name: netsum-ctl smoke test (attach, config, stats, sweep, detach on its own veth)
+        run: sudo CTL=./bin/netsum-ctl bash ci/test_netsum_ctl.sh
+
+      - name: Set up veth pair and namespace
+        run: |
+          set -euo pipefail
           sudo ip link add veth0 type veth peer name veth1
           sudo ip netns add ns1
           sudo ip link set veth1 netns ns1
@@ -110,470 +70,312 @@ jobs:
           sudo ip netns exec ns1 ip addr add 10.200.1.2/24 dev veth1
           sudo ip netns exec ns1 ip link set veth1 up
           sudo ip netns exec ns1 ip link set lo up
-          # This minimal test topology puts BOTH the sending worker and the
-          # receiving paramserver inside ns1 (see workflow header), which
-          # means the completed/forwarded packet xdp_agg.c retargets ends
-          # up with saddr == daddr == 10.200.1.2 -- it only ever rewrites
-          # iph->daddr, never iph->saddr, which is correct for a REAL
-          # deployment (a real parameter server has a genuinely different
-          # IP than any worker) but means this specific test topology's
-          # loopback-shaped traffic needs the kernel's default
-          # "martian packet" protections (accept_local=0, rp_filter)
-          # relaxed on veth1, or the completed packet gets silently
-          # dropped by the IP stack for looking spoofed -- not an
-          # xdp_agg.c bug, a consequence of this test intentionally
-          # colocating both endpoints in one namespace.
-          sudo ip netns exec ns1 sysctl -qw net.ipv4.conf.veth1.accept_local=1
+          # Workers and the PS share ns1; aggregates bounce back with XDP_TX.
           sudo ip netns exec ns1 sysctl -qw net.ipv4.conf.veth1.rp_filter=0
           sudo ip netns exec ns1 sysctl -qw net.ipv4.conf.all.rp_filter=0
-          echo "--- veth0 (root ns) ---"
-          ip addr show veth0
-          echo "--- veth1 (ns1) ---"
-          sudo ip netns exec ns1 ip addr show veth1
 
-      - name: Load xdp_agg.o through the real kernel verifier (capture the log)
+      - name: Attach with netsum-ctl and configure
         run: |
           set -euo pipefail
-          sudo mkdir -p /sys/fs/bpf/netsum
-          set +e
-          sudo "$BPFTOOL" -d prog load xdp_agg/xdp_agg.o /sys/fs/bpf/netsum/prog \
-              type xdp pinmaps /sys/fs/bpf/netsum > /tmp/verifier.log 2>&1
-          LOAD_RC=$?
-          set -e
-          echo "================ verifier / loader log (rc=$LOAD_RC) ================"
-          cat /tmp/verifier.log
-          echo "======================================================================="
-          echo "--- dmesg tail (extra evidence, verifier messages sometimes land here too) ---"
-          sudo dmesg | tail -n 60 > /tmp/dmesg_after_load.log || true
-          cat /tmp/dmesg_after_load.log || true
-          if [ $LOAD_RC -ne 0 ]; then
-            echo "FAIL: the real Linux BPF verifier rejected xdp_agg.o -- see log above"
-            exit 1
-          fi
-          echo "--- bpftool prog show (loaded_at/tag/xlated+jited sizes = proof it's really loaded) ---"
-          sudo "$BPFTOOL" prog show pinned /sys/fs/bpf/netsum/prog | tee /tmp/prog_show.log
-          echo "--- pinned maps ---"
-          sudo ls -la /sys/fs/bpf/netsum
-
-      - name: Attach the verified program to veth0's real ingress path
-        run: |
-          set -euo pipefail
-          if sudo ip link set dev veth0 xdpgeneric pinned /sys/fs/bpf/netsum/prog 2>/tmp/attach.log; then
-            echo "attached in xdpgeneric (SKB) mode"
-            echo "XDP_MODE=xdpgeneric" >> "$GITHUB_ENV"
-          else
-            echo "xdpgeneric attach failed:"; cat /tmp/attach.log
-            echo "falling back to plain 'xdp' (auto-negotiates generic if native unsupported)"
-            sudo ip link set dev veth0 xdp pinned /sys/fs/bpf/netsum/prog
-            echo "XDP_MODE=xdp" >> "$GITHUB_ENV"
-          fi
+          source ci/lib.sh
+          ctl_json attach --ifname veth0 --mode generic --obj xdp_agg/xdp_agg.o | tee /tmp/attach.json
           ip -d link show veth0 | tee /tmp/link_show_veth0.log
-
-      - name: Populate config_map with veth1's real MAC/IP + paramserver port
-        run: |
-          set -euo pipefail
-          VETH1_MAC=$(sudo ip netns exec ns1 ip link show veth1 | awk '/link\/ether/ {print $2}')
-          echo "veth1 MAC: $VETH1_MAC"
-          echo "VETH1_MAC=$VETH1_MAC" >> "$GITHUB_ENV"
-          # NETSUM_PORT (9876) is fixed and is where `worker` sends gradient
-          # traffic TO (filtered on by xdp_agg.c itself); ps_port here is the
-          # separate, configurable port the COMPLETED/forwarded packet gets
-          # retargeted to, which is where `paramserver` listens below.
           VETH0_MAC=$(ip link show veth0 | awk '/link\/ether/ {print $2}')
+          VETH1_MAC=$(in_ns1 ip link show veth1 | awk '/link\/ether/ {print $2}')
           echo "VETH0_MAC=$VETH0_MAC" >> "$GITHUB_ENV"
-          # Aggregates leave with the aggregator's own MAC/IP as source (C9).
-          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 0 "$VETH0_MAC" 10.200.1.1
-          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/config_map
+          echo "VETH1_MAC=$VETH1_MAC" >> "$GITHUB_ENV"
+          echo "CFG=--ps-mac $VETH1_MAC --ps-ip 10.200.1.2 --ps-port 9000 --agg-mac $VETH0_MAC --agg-ip 10.200.1.1" >> "$GITHUB_ENV"
+          ctl_json config --ps-mac "$VETH1_MAC" --ps-ip 10.200.1.2 --ps-port 9000 --agg-mac "$VETH0_MAC" --agg-ip 10.200.1.1
 
-      - name: Start paramserver inside ns1 (receives XDP_TX'd completions)
+      - name: Start the parameter server (results to workers, ACKs to the aggregator)
         run: |
           set -euo pipefail
-          sudo ip netns exec ns1 ./bin/paramserver 9000 agg > /tmp/ps.log 2>&1 &
-          disown || true
-          for i in $(seq 1 50); do
-            grep -q "listening" /tmp/ps.log 2>/dev/null && break
-            sleep 0.1
-          done
-          grep -q "listening" /tmp/ps.log || { echo "paramserver never became ready"; cat /tmp/ps.log; exit 1; }
-          cat /tmp/ps.log
+          sudo ip netns exec ns1 ./bin/paramserver --ack-to 10.200.1.1:9876 9000 agg > /tmp/ps.log 2>&1 &
+          for i in $(seq 1 50); do grep -q listening /tmp/ps.log 2>/dev/null && break; sleep 0.1; done
+          grep -q listening /tmp/ps.log
 
-      - name: "Scenario A: real multi-worker round completes and sums correctly through the real kernel"
+      - name: "Scenario A: a 3-worker round sums correctly through the kernel"
         run: |
           set -euo pipefail
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 100 0 3 1 4 1.0 0.25
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 100 1 3 1 4 1.0 0.25
+          source ci/lib.sh
+          send 100 0 3 0.25 1 4; send 100 1 3 0.25 1 4
           sleep 0.3
-          echo "--- slot_map after 2 of 3 contributions (expect ONE entry, not yet complete) ---"
-          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 100 2 3 1 4 1.0 0.25
+          slots_to /tmp/slots_a.json
+          python3 ci/check_slot_present.py /tmp/slots_a.json 100 accumulating
+          send 100 2 3 0.25 1 4
           sleep 1
-          echo "--- slot_map after all 3 (expect one COMPLETED tombstone for job 100) ---"
-          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map
-          echo "--- veth0 (root ns) counters after the round ---"
-          ip -s link show veth0
-          echo "--- veth1 (ns1) counters after the round ---"
-          sudo ip netns exec ns1 ip -s link show veth1
-          echo "--- paramserver log so far ---"
-          cat /tmp/ps.log
           python3 ci/assert_paramserver.py /tmp/ps.log 100 require 3 0.75
 
-      - name: "Scenario B (adversarial): chunk_len mismatch between workers is rejected, not silently summed"
+      - name: "Scenario Q (G1): the PS's ACK retires the completed slot"
         run: |
           set -euo pipefail
-          # Regression test for the critical out-of-bounds-write finding
-          # xdp_agg.c's header comment documents: worker 0 establishes the
-          # slot with chunk_len=4; worker 1's hand-crafted packet claims a
-          # different chunk_len=2 for the SAME slot. The slot->chunk_len
-          # check must reject it -- the slot must never complete.
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 101 0 2 1 4 1.0 1.0
+          source ci/lib.sh
+          stats_to /tmp/stats_q0.json
+          for w in 0 1 2; do send 970 "$w" 3 1.0; done
+          sleep 1
+          stats_to /tmp/stats_q1.json; slots_to /tmp/slots_q.json
+          python3 ci/assert_paramserver.py /tmp/ps.log 970 require 3 3.0
+          python3 ci/check_slot_present.py /tmp/slots_q.json 970 absent
+          python3 ci/check_stat.py /tmp/stats_q0.json /tmp/stats_q1.json --delta slot_completed=1 ack_seen=1 slot_retired_ack=1
+
+      - name: "Scenario B: chunk_len mismatch between workers is rejected"
+        run: |
+          set -euo pipefail
+          source ci/lib.sh
+          send 101 0 2 1.0 1 4
           sleep 0.3
-          sudo ip netns exec ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 101 0 0 1 2 2 65536 65536
+          in_ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 101 0 0 1 2 2 65536 65536
           sleep 1
           python3 ci/assert_paramserver.py /tmp/ps.log 101 forbid
 
-      - name: "Scenario C (adversarial): truncated packet is dropped, not summed as stale bytes"
+      - name: "Scenario C: a truncated packet is dropped, not summed as stale bytes"
         run: |
           set -euo pipefail
-          # Mirrors tests/test_correctness.py's
-          # test_truncated_packet_not_summed_as_stale_bytes: a packet that
-          # declares chunk_len=4 but carries zero payload bytes must fail
-          # xdp_agg.c's (values + chunk_len) > data_end bounds check and be
-          # dropped outright -- never reaching the slot/accumulate logic.
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 102 1 2 1 4 1.0 1.0
+          source ci/lib.sh
+          send 102 1 2 1.0 1 4
           sleep 0.3
-          sudo ip netns exec ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 102 0 0 0 2 4
+          in_ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 102 0 0 0 2 4
           sleep 1
           python3 ci/assert_paramserver.py /tmp/ps.log 102 forbid
 
-      - name: "Scenario D1 (adversarial): num_workers=0 is rejected before a slot is ever created"
+      - name: "Scenario D: fan-in 0 and fan-in 1000 never create a slot"
         run: |
           set -euo pipefail
-          sudo ip netns exec ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 103 0 0 0 0 1 65536
+          source ci/lib.sh
+          stats_to /tmp/stats_d0.json
+          in_ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 103 0 0 0 0 1 65536
+          in_ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 104 0 0 0 1000 1 65536
           sleep 1
+          stats_to /tmp/stats_d1.json
           python3 ci/assert_paramserver.py /tmp/ps.log 103 forbid
-
-      - name: "Scenario D2 (adversarial): oversized num_workers is rejected, not a permanent slot leak"
-        run: |
-          set -euo pipefail
-          sudo ip netns exec ns1 python3 ci/send_raw_packet.py 10.200.1.1 9876 104 0 0 0 1000 1 65536
-          sleep 1
           python3 ci/assert_paramserver.py /tmp/ps.log 104 forbid
+          python3 ci/check_stat.py /tmp/stats_d0.json /tmp/stats_d1.json --delta rej_num_workers=2 slot_created=0
 
-      - name: "Scenario E (adversarial): missing config_map drops the completion AND counts it"
+      - name: "Scenario E: a missing config drops the completion and counts it"
         run: |
           set -euo pipefail
-          # Regression test for the "silent, unacknowledged data loss" fix:
-          # temporarily empty config_map, then complete a real 2-worker
-          # round. The completed aggregation must be dropped (never
-          # forwarded -- paramserver sees nothing) AND
-          # the drop_no_config counter must be bumped exactly once, proving
-          # this isn't just silent packet loss on the real kernel path.
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_e0.json
-          sudo "$BPFTOOL" map delete pinned /sys/fs/bpf/netsum/config_map key hex 00 00 00 00
-          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/config_map || echo "(confirmed: config_map is empty)"
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 105 0 2 1 1 1.0 0.5
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 105 1 2 1 1 1.0 0.5
+          source ci/lib.sh
+          stats_to /tmp/stats_e0.json
+          ctl_json config --delete
+          send 105 0 2 0.5; send 105 1 2 0.5
           sleep 1
+          stats_to /tmp/stats_e1.json
           python3 ci/assert_paramserver.py /tmp/ps.log 105 forbid
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_e1.json
           python3 ci/check_stat.py /tmp/stats_e0.json /tmp/stats_e1.json --delta drop_no_config=1 slot_completed=1
-          # Restore config for the recovery scenario below.
-          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 0 "$VETH0_MAC" 10.200.1.1
+          ctl_json config $CFG
 
-      - name: "Scenario F: recovery -- normal completion works again after config_map is restored"
+      - name: "Scenario F: completion works again once config is restored"
         run: |
           set -euo pipefail
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 106 0 2 1 1 1.0 0.5
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 106 1 2 1 1 1.0 0.5
+          source ci/lib.sh
+          send 106 0 2 0.5; send 106 1 2 0.5
           sleep 1
           python3 ci/assert_paramserver.py /tmp/ps.log 106 require 2 1.0
 
-      - name: "Scenario G: kernel-side fairness quota rejects a greedy job's excess slots, isolating a second job"
+      - name: "Scenario G: the per-job quota (drop policy) isolates a greedy job"
         run: |
           set -euo pipefail
-          # Kernel port of tests/test_correctness.py's
-          # test_fairness_quota_isolates_greedy_job, replayed against the
-          # REAL loaded xdp_agg.o instead of only the userspace binary.
-          # Set max_slots_per_job=2 in config_map (same ps_mac/ip/port as
-          # before, plus the new field) -- the only place this quota is
-          # configured from, per xdp_agg.c's new struct netsum_config field.
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_g0.json
-          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 2 "$VETH0_MAC" 10.200.1.1
-          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/config_map
-          # Job 900: greedy job opening 3 concurrent incomplete slots
-          # (rounds 0-2, only worker_id=0 of num_workers=2 ever sends, so
-          # none of these slots ever completes/frees). With quota=2,
-          # round 2's slot-creation attempt must be rejected outright.
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 900 0 2 3 1 1.0 0.5
+          source ci/lib.sh
+          stats_to /tmp/stats_g0.json
+          ctl_json config $CFG --max-slots-per-job 2 --quota-policy drop
+          send 900 0 2 0.5 3      # three rounds, worker 1 never sends: 2 admitted, 1 dropped
           sleep 0.5
-          # Job 901: a different job_id's single, well-behaved,
-          # self-contained round (num_workers=1) -- must complete normally,
-          # unaffected by job 900 already sitting at its own quota.
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 901 0 1 1 1 1.0 2.0
+          send 901 0 1 2.0
           sleep 1
-          echo "--- slot_map (expect exactly 2 stuck entries for job 900, rounds 0 and 1) ---"
-          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map
-          echo "--- job_quota_map (expect job 900 concurrent_slots=2, the quota ceiling) ---"
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/job_quota_map > /tmp/job_quota.json
-          cat /tmp/job_quota.json
-          python3 ci/check_job_quota.py /tmp/job_quota.json 900 2
-          echo "--- stats (expect drop_quota bumped exactly once) ---"
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_g1.json
+          stats_to /tmp/stats_g1.json
+          ctl_json jobs > /tmp/jobs_g.json
+          python3 ci/check_job_quota.py /tmp/jobs_g.json 900 2
           python3 ci/check_stat.py /tmp/stats_g0.json /tmp/stats_g1.json --delta drop_quota=1
-          # Job 900 must never complete (worker 1 never sends); job 901 must.
           python3 ci/assert_paramserver.py /tmp/ps.log 900 forbid
           python3 ci/assert_paramserver.py /tmp/ps.log 901 require 1 2.0
-          # Reset the quota to unlimited (0) so it doesn't affect the netem
-          # sweep scenarios below, which use fresh job_ids of their own but
-          # should otherwise see the same default (pre-Scenario-G) behavior.
-          sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000 0 "$VETH0_MAC" 10.200.1.1
+          ctl_json config $CFG
 
-      - name: "Scenario H: netem 20% loss -- a full round still completes correctly via redundant sends"
+      - name: "Scenario H-legacy: 20% netem loss, redundant one-shot sends"
         run: |
           set -euo pipefail
-          # netem is applied on veth1 (the ns1 end where worker/paramserver
-          # run), per the workflow's own veth0(root)/veth1(ns1) split --
-          # this genuinely perturbs traffic reaching/leaving the
-          # XDP-attached veth0, not a no-op on the wrong interface.
-          sudo ip netns exec ns1 tc qdisc add dev veth1 root netem loss 20%
-          sudo ip netns exec ns1 tc qdisc show dev veth1
-          # Experimental design: with a real, uncontrolled 20% per-packet
-          # loss rate, a single send per worker would only complete
-          # ~51% of the time (0.8^3 for 3 independent single-packet
-          # sends). Rather than accept a flaky ~50% pass rate, each
-          # worker's single round is sent 5 times (all 5 identical
-          # packets land on the same slot; xdp_agg.c's seen_worker dedup
-          # bitmap silently absorbs the duplicates that do arrive) --
-          # per-worker delivery failure probability drops to 0.2^5 =
-          # 0.00032, i.e. round failure probability across all 3 workers
-          # is bounded by ~0.001, low enough not to flake CI while still
-          # exercising the REAL netem-perturbed path.
-          for worker_id in 0 1 2; do
-            for attempt in 1 2 3 4 5; do
-              sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 950 "$worker_id" 3 1 1 1.0 1.0 || true
-            done
-          done
+          source ci/lib.sh
+          in_ns1 tc qdisc add dev veth1 root netem loss 20%
+          for w in 0 1 2; do for a in 1 2 3 4 5; do send 950 "$w" 3 1.0 || true; done; done
           sleep 1.5
           python3 ci/assert_paramserver.py /tmp/ps.log 950 require 3 3.0
-          echo "--- veth1 (ns1) counters after the lossy round ---"
-          sudo ip netns exec ns1 ip -s link show veth1
 
-      - name: "Scenario I: netem delay+reorder -- a full round still completes correctly (sum is order-independent)"
+      - name: "Scenario I-legacy: netem delay and reordering, redundant one-shot sends"
         run: |
           set -euo pipefail
-          # Swap the qdisc for delay+reorder: `reorder` on its own is a
-          # documented netem no-op without a correlated `delay` term (a
-          # reordered packet needs something to reorder AROUND), so this
-          # is the standard idiom for exercising real packet reordering.
-          sudo ip netns exec ns1 tc qdisc change dev veth1 root netem delay 50ms 20ms reorder 25% 50%
-          sudo ip netns exec ns1 tc qdisc show dev veth1
-          # Same redundant-send design as Scenario H (belt-and-suspenders
-          # against any residual loss from the delay jitter); the actual
-          # property under test here is that xdp_agg.c's slot/accumulate
-          # logic is commutative in arrival order -- summing worker
-          # contributions in whatever order they truly arrive, reordered
-          # or not, must produce the same total.
-          for worker_id in 0 1 2; do
-            for attempt in 1 2 3; do
-              sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 951 "$worker_id" 3 1 1 1.0 1.0 || true
-            done
-          done
+          source ci/lib.sh
+          in_ns1 tc qdisc change dev veth1 root netem delay 50ms 20ms reorder 25% 50%
+          for w in 0 1 2; do for a in 1 2 3; do send 951 "$w" 3 1.0 || true; done; done
           sleep 2
           python3 ci/assert_paramserver.py /tmp/ps.log 951 require 3 3.0
+          in_ns1 tc qdisc del dev veth1 root
 
-      - name: "Scenario J (honest finding): a netem-dropped worker packet leaves its slot stuck forever -- no TTL"
+      - name: "Scenario J2: a lost contribution is flushed by the sweeper, then recovered by retransmission"
         run: |
           set -euo pipefail
-          # This is the actually-interesting, expected-to-be-real finding
-          # this scenario exists to measure, not assert away: xdp_agg.c
-          # has no TTL/eviction mechanism at all (see its header comment
-          # and userspace_agg.c's, which explicitly call this out as
-          # separate, out-of-scope follow-up work needing bpf_timer on a
-          # 5.15+ kernel). A worker whose contribution is permanently lost
-          # mid-round should leave its slot stuck in slot_map forever --
-          # this proves that empirically against the REAL loaded program,
-          # rather than leaving it a theoretical risk.
-          #
-          # Deterministic construction (not relying on netem's own random
-          # loss rate to happen to hit the right packet, which would be
-          # flaky): send workers 0 and 1 with netem CLEAN (loss 0%), then
-          # switch netem to loss 100% for worker 2's single send -- that
-          # packet is now genuinely, certainly dropped by netem itself
-          # (not just "we chose not to send it"), simulating a real
-          # dropped-worker-packet loss event. Then restore netem to clean.
-          sudo ip netns exec ns1 tc qdisc change dev veth1 root netem loss 0%
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 952 0 3 1 1 1.0 1.0
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 952 1 3 1 1 1.0 1.0
-          sleep 0.3
-          sudo ip netns exec ns1 tc qdisc change dev veth1 root netem loss 100%
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 952 2 3 1 1 1.0 1.0
-          sleep 0.3
-          sudo ip netns exec ns1 tc qdisc change dev veth1 root netem loss 0%
-          sleep 1
-          echo "--- paramserver log (job 952 must never appear -- its 3rd contribution never arrived) ---"
-          python3 ci/assert_paramserver.py /tmp/ps.log 952 forbid
-          echo "--- slot_map (measure, don't assume: confirm job 952's incomplete slot is STILL there) ---"
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_952.json
-          cat /tmp/slot_map_952.json
-          python3 ci/check_slot_present.py /tmp/slot_map_952.json 952 accumulating
-          # Teardown -- remove the netem qdisc so it doesn't outlive this
-          # scenario (the netns is torn down at the end of the job anyway,
-          # but doing it explicitly documents the impairment window).
-          sudo ip netns exec ns1 tc qdisc del dev veth1 root || true
+          source ci/lib.sh
+          stats_to /tmp/stats_j0.json
+          T0=$(date +%s%N)
+          # Worker 2's first transmission is lost; its RTO (1.5 s) is longer than
+          # the aggregator's TTL (300 ms), so the sweeper flushes {0,1} first.
+          for w in 0 1; do reliable_bg 952 "$w" 3 1 64 --rto-ms 1500; done
+          reliable_bg 952 2 3 1 64 --rto-ms 1500 --drop-every 1
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --ttl-ms 300 --interval-ms 100 --duration-ms 3500 > /tmp/sweep_j2.log &
+          SWEEP=$!
+          wait $(jobs -p | grep -v "^$SWEEP$") 2>/dev/null || true
+          wait $SWEEP || true
+          sleep 0.5
+          cat /tmp/sweep_j2.log
+          stats_to /tmp/stats_j1.json; slots_to /tmp/slots_j2.json
+          check_reliable 952 3 1
+          grep -E "^\[partial\] job=952 round=0 chunk=0 have=2/3$" /tmp/ps.log
+          python3 ci/assert_paramserver.py /tmp/ps.log 952 require 3 1.5
+          python3 ci/check_slot_present.py /tmp/slots_j2.json 952 absent
+          python3 - <<'PY'
+          import sys; sys.path.insert(0, "ci"); import netsum_bpf_json as n
+          a, b = n.stats("/tmp/stats_j0.json"), n.stats("/tmp/stats_j1.json")
+          d = {k: b[k] - a.get(k, 0) for k in b if b[k] != a.get(k, 0)}
+          print("J2 counter deltas:", d)
+          # >= 1, not == 1: a late RESEND from worker 0 or 1 can reopen the key after the
+          # ACK, and the sweeper then flushes that slot too (the PS re-sends the result).
+          assert d.get("slot_flushed_partial", 0) >= 1, d
+          assert d.get("tx_fallback", 0) >= 1 and d.get("slot_retired_ack", 0) >= 1, d
+          PY
+          echo "J2 timeline (PS log order):"; grep -nE "job=952" /tmp/ps.log
+          echo "elapsed: $(( ($(date +%s%N) - T0) / 1000000 )) ms"
 
-      # Scenarios K-O pin the confirmed bugs C1-C4 on the real kernel. While a
-      # bug is open its NETSUM_EXPECT_RED_* flag is '1' and the step asserts
-      # the bug's exact symptom (so a broken scenario or an unexpected fix
-      # fails the run); the fixing commit flips the flag to '0'.
-      - name: "Scenario K (C2): worker_id beyond fan-in must not complete a round"
+      - name: "Scenario K (C2): worker_id beyond fan-in never completes a round"
         run: |
           set -euo pipefail
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_k0.json
-          for w in 10 11 12; do
-            sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 960 "$w" 3 1 1 1.0 1.0
-          done
+          source ci/lib.sh
+          stats_to /tmp/stats_k0.json
+          for w in 10 11 12; do send 960 "$w" 3 1.0; done
           sleep 1
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_k1.json
-          if [ "$NETSUM_EXPECT_RED_K" = "1" ]; then
-            python3 ci/assert_paramserver.py /tmp/ps.log 960 require 3 3.0
-            echo "RED as expected (C2): worker_ids 10,11,12 completed job 960"
-          else
-            python3 ci/assert_paramserver.py /tmp/ps.log 960 forbid
-            python3 ci/check_stat.py /tmp/stats_k0.json /tmp/stats_k1.json --delta rej_worker_id=3 slot_created=0
-          fi
+          stats_to /tmp/stats_k1.json
+          python3 ci/assert_paramserver.py /tmp/ps.log 960 forbid
+          python3 ci/check_stat.py /tmp/stats_k0.json /tmp/stats_k1.json --delta rej_worker_id=3 slot_created=0
+
       - name: "Scenario L (C3): fan-in disagreement is rejected; a fan-in-1 claim closes the round once"
         run: |
           set -euo pipefail
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_l0.json
-          # L1: worker 1 claims fan-in 4 while the round was opened with 3.
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 961 0 3 1 1 1.0 1.0
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 961 1 4 1 1 1.0 2.0
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 961 2 3 1 1 1.0 1.0
+          source ci/lib.sh
+          stats_to /tmp/stats_l0.json
+          send 961 0 3 1.0; send 961 1 4 2.0; send 961 2 3 1.0
           sleep 1
-          if [ "$NETSUM_EXPECT_RED_L" = "1" ]; then
-            python3 ci/assert_paramserver.py /tmp/ps.log 961 require 3 4.0
-            echo "RED as expected (C3/L1): job 961 completed using the fan-in-4 contribution"
-          else
-            python3 ci/assert_paramserver.py /tmp/ps.log 961 forbid
-            sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 961 1 3 1 1 1.0 2.0
-            sleep 1
-            python3 ci/assert_paramserver.py /tmp/ps.log 961 require 3 4.0
-          fi
-          # L2: a fan-in-1 claim completes the round; later fan-in-3 workers
-          # must be absorbed, not open a slot that can never complete.
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 965 0 1 1 1 1.0 1.0
+          python3 ci/assert_paramserver.py /tmp/ps.log 961 forbid
+          send 961 1 3 2.0
+          sleep 1
+          python3 ci/assert_paramserver.py /tmp/ps.log 961 require 3 4.0
+          send 965 0 1 1.0
           sleep 0.3
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 965 1 3 1 1 1.0 1.0
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 965 2 3 1 1 1.0 1.0
+          send 965 1 3 1.0; send 965 2 3 1.0
           sleep 1
+          stats_to /tmp/stats_l1.json
           python3 ci/assert_paramserver.py /tmp/ps.log 965 require 1 1.0
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_965.json
-          if [ "$NETSUM_EXPECT_RED_L" = "1" ]; then
-            python3 ci/check_slot_present.py /tmp/slot_map_965.json 965 present
-            echo "RED as expected (C3/L2): job 965 left a never-completing slot"
-          else
-            python3 ci/check_slot_present.py /tmp/slot_map_965.json 965 no-accumulating
-            sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_l1.json
-            python3 ci/check_stat.py /tmp/stats_l0.json /tmp/stats_l1.json --delta num_workers_mismatch=3
-          fi
-      - name: "Scenario M (C1): a late duplicate after completion must not re-create the slot"
+          python3 ci/check_stat.py /tmp/stats_l0.json /tmp/stats_l1.json --delta num_workers_mismatch=1
+          # 965's ACK retired the slot before workers 1 and 2 arrived, so they
+          # open a 2-of-3 slot that the sweeper must reclaim (see Scenario O).
+
+      - name: "Scenario M (C1): a late duplicate never leaves a slot behind"
         run: |
           set -euo pipefail
-          for w in 0 1 2; do
-            sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 962 "$w" 3 1 1 1.0 1.0
-          done
-          sleep 0.2
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_m0.json
-          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 962 1 3 1 1 1.0 1.0
-          sleep 1
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_m1.json
+          source ci/lib.sh
+          for w in 0 1 2; do send 962 "$w" 3 1.0; done
+          sleep 0.5
+          send 962 1 3 1.0                # late duplicate, after the ACK retired the slot
+          sleep 0.3
+          slots_to /tmp/slots_m0.json
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 0   # flush
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 0   # retire
+          sleep 0.3
+          slots_to /tmp/slots_m1.json
+          python3 ci/check_slot_present.py /tmp/slots_m1.json 962 absent
           python3 ci/assert_paramserver.py /tmp/ps.log 962 require 3 3.0
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_962.json
-          if [ "$NETSUM_EXPECT_RED_M" = "1" ]; then
-            python3 ci/check_slot_present.py /tmp/slot_map_962.json 962 present
-            echo "RED as expected (C1): the late duplicate re-created slot (962,0,0)"
-          else
-            python3 ci/check_slot_present.py /tmp/slot_map_962.json 962 completed
-            python3 ci/check_stat.py /tmp/stats_m0.json /tmp/stats_m1.json --delta late_duplicate=1 slot_created=0
-          fi
-      - name: "Scenario N (C4): accumulator overflow must never be reported as a sum"
+
+      - name: "Scenario N (C4): accumulator overflow is flagged, never reported as a sum"
         run: |
           set -euo pipefail
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_n0.json
-          for w in 0 1 2; do
-            sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 963 "$w" 3 1 1 20000.0 20000.0 2>/dev/null
-          done
+          source ci/lib.sh
+          stats_to /tmp/stats_n0.json
+          for w in 0 1 2; do in_ns1 ./bin/worker 10.200.1.1 9876 963 "$w" 3 1 1 20000.0 20000.0 2>/dev/null; done
           sleep 1
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_n1.json
-          if [ "$NETSUM_EXPECT_RED_N" = "1" ]; then
-            python3 ci/assert_paramserver.py /tmp/ps.log 963 require 3 -5536.0
-            echo "RED as expected (C4): 3 x 20000.0 wrapped to -5536.0"
-          else
-            python3 ci/assert_paramserver.py /tmp/ps.log 963 forbid
-            grep "\[overflow\] job=963" /tmp/ps.log
-            python3 ci/check_stat.py /tmp/stats_n0.json /tmp/stats_n1.json --delta overflow=1 tx_aggregate=1
-          fi
-      - name: "Scenario O (C1 hygiene): scenarios that finish cleanly leave no slot behind"
+          stats_to /tmp/stats_n1.json
+          python3 ci/assert_paramserver.py /tmp/ps.log 963 forbid
+          grep "\[overflow\] job=963" /tmp/ps.log
+          python3 ci/check_stat.py /tmp/stats_n0.json /tmp/stats_n1.json --delta overflow=1 tx_aggregate=1
+
+      - name: "Scenario H2 (G2): reliable workers complete every round under 20% loss"
         run: |
           set -euo pipefail
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_o.json
-          if [ "$NETSUM_EXPECT_RED_O" = "1" ]; then
-            python3 ci/check_slot_present.py /tmp/slot_map_o.json 962 present
-            echo "RED as expected (C1): completed jobs still hold slots"
-          else
-            for j in 100 103 104 105 106 950 951 962; do
-              python3 ci/check_slot_present.py /tmp/slot_map_o.json "$j" no-accumulating
-            done
-          fi
-      - name: "Red/green ledger"
-        if: always()
+          source ci/lib.sh
+          in_ns1 tc qdisc add dev veth1 root netem loss 20%
+          for w in 0 1 2; do reliable_bg 980 "$w" 3 16 256 --rto-ms 50 --window 16; done
+          wait
+          in_ns1 tc qdisc del dev veth1 root
+          check_reliable 980 3 64
+          python3 - <<'PY'
+          import json
+          resent = sum(json.loads(open(f"/tmp/rw-980-{w}.json").read().strip().splitlines()[-1])["resent"] for w in range(3))
+          assert resent > 0, "20% loss but no retransmissions?"
+          PY
+
+      - name: "Scenario I2 (G2): reliable workers complete every round under delay and reordering"
         run: |
-          for s in K L M N O; do
-            v="NETSUM_EXPECT_RED_$s"
-            if [ "${!v}" = "1" ]; then echo "scenario $s: expected RED (bug open)"; else echo "scenario $s: GREEN"; fi
-          done | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Collect final evidence (paramserver log, verifier log, map state)
+          set -euo pipefail
+          source ci/lib.sh
+          in_ns1 tc qdisc add dev veth1 root netem delay 20ms 10ms reorder 25% 50%
+          for w in 0 1 2; do reliable_bg 981 "$w" 3 16 256 --rto-ms 200 --window 16; done
+          wait
+          in_ns1 tc qdisc del dev veth1 root
+          check_reliable 981 3 64
+
+      - name: "Scenario O (C1 hygiene): the TTL sweeper leaves no slot behind"
+        run: |
+          set -euo pipefail
+          source ci/lib.sh
+          slots_to /tmp/slots_o0.json
+          echo "before sweeping:"; cat /tmp/slots_o0.json
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 0   # flush ACCUMULATING
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 0   # retire FLUSHED/COMPLETED
+          sleep 0.5
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 0   # any re-opened by late ACKs
+          slots_to /tmp/slots_o1.json
+          python3 -c "import json; d=json.load(open('/tmp/slots_o1.json')); assert d == [], d; print('PASS: slot_map empty')"
+          ctl_json jobs | python3 -c "import json,sys; d=json.load(sys.stdin); assert all(j['concurrent_slots']==0 for j in d), d; print('PASS: no charged quota left', d)"
+
+      - name: Collect final evidence
         if: always()
         run: |
           set +e
-          echo "--- full paramserver log ---"
+          source ci/lib.sh
           cat /tmp/ps.log
-          echo "--- final stats (per-CPU counters, netsum_stats.h order) ---"
-          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/stats > /tmp/stats_final.json 2>&1
-          python3 -c "import sys; sys.path.insert(0,'ci'); import netsum_bpf_json as n; print({k: v for k, v in n.stats('/tmp/stats_final.json').items() if v})"
-          echo "--- final slot_map (intended leftovers: 900x2 from G, 952 from J; anything else is a bug -- see Scenarios M and O) ---"
-          sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_final.json 2>&1
-          cat /tmp/slot_map_final.json
+          stats_to /tmp/stats_final.json; cat /tmp/stats_final.json
+          slots_to /tmp/slots_final.json; cat /tmp/slots_final.json
           exit 0
 
-      - name: Upload verifier + run evidence as build artifact
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: xdp-loadtest-evidence
           if-no-files-found: ignore
           path: |
-            /tmp/verifier.log
-            /tmp/dmesg_after_load.log
+            /tmp/verifier_tail.log
             /tmp/prog_show.log
-            /tmp/attach.log
+            /tmp/attach.json
             /tmp/link_show_veth0.log
             /tmp/ps.log
             /tmp/stats_*.json
-            /tmp/slot_map_final.json
-            /tmp/job_quota.json
-            /tmp/slot_map_952.json
-            /tmp/slot_map_96*.json
-            /tmp/slot_map_o.json
+            /tmp/slots_*.json
+            /tmp/jobs_*.json
+            /tmp/sweep_*.log
+            /tmp/rw-*.json
 
-      - name: Tear down netns/veth/pinned objects
+      - name: Tear down
         if: always()
         run: |
           set +e
-          sudo pkill -f "bin/paramserver"
-          sudo ip link set dev veth0 xdpgeneric off 2>/dev/null
-          sudo ip link set dev veth0 xdp off 2>/dev/null
+          sudo pkill -f bin/paramserver
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum detach --ifname veth0 --unpin
           sudo ip netns del ns1
           sudo ip link del veth0
-          sudo rm -rf /sys/fs/bpf/netsum
           exit 0

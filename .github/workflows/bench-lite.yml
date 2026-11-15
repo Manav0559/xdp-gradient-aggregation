@@ -26,25 +26,23 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev python3 iproute2
-          sudo apt-get install -y linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" || true
-          for f in "/usr/lib/linux-tools/$(uname -r)/bpftool" /usr/lib/linux-tools/*/bpftool; do
-            if [ -x "$f" ]; then echo "BPFTOOL=$f" >> "$GITHUB_ENV"; break; fi
-          done
 
       - name: Build
         run: |
           set -euo pipefail
           MULTIARCH=$(gcc -print-multiarch)
           make bpf BPF_CC="clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH}"
-          make all
-          gcc -O2 -Wall -Wextra -o /tmp/netsum_cfg_loader ci/netsum_cfg_loader.c -lbpf
+          make all ctl
 
       - name: Run benchmark-lite
         run: sudo -E env "PATH=$PATH" OUT=bench-out/lite TRIALS=8 ROUNDS=25000 bash scripts/bench_lite.sh
 
       - name: Analyse
         if: always()
-        run: python3 scripts/bench_lite_analyze.py bench-out/lite/raw.csv bench-out/lite/summary | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          set -o pipefail
+          sudo chown -R "$(id -u):$(id -g)" bench-out
+          python3 scripts/bench_lite_analyze.py bench-out/lite/raw.csv bench-out/lite/summary | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload results
         if: always()

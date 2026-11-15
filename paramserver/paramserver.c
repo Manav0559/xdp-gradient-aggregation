@@ -259,6 +259,9 @@ static void handle(const uint8_t *pkt, const struct netsum_parsed *p, int64_t no
     s->contributions++;
     s->touched_us = now;
     g.stats[NS_ACCEPTED]++;
+    if (p->kind == NETSUM_KIND_PARTIAL && !g.quiet)
+        fprintf(stderr, "[partial] job=%u round=%u chunk=%u have=%u/%u\n", p->job_id, p->round, p->chunk_id,
+                s->contributors, s->fanin);
     if (s->contributors == s->fanin)
         complete(s, now);
 }

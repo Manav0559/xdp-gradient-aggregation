@@ -64,7 +64,6 @@ struct grad_hdr {
 #define NETSUM_MAX_FANIN 256
 #define NETSUM_BITMAP_BYTES (NETSUM_MAX_FANIN / 8)
 #define NETSUM_WORKER_AGGREGATE 0xFFFFu /* worker_id on aggregator/PS output */
-#define NETSUM_ACK_PORT 9877
 
 #define NETSUM_MAX_PACKET_SIZE \
     (NETSUM_HDR_SIZE + NETSUM_MAX_CHUNK_LEN * sizeof(int32_t) + NETSUM_BITMAP_BYTES)

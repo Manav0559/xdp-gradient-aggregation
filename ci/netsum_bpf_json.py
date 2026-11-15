@@ -1,6 +1,6 @@
-"""Readers for `bpftool -j map dump` output of NetSum's maps. bpftool emits
-each entry with raw little-endian hex bytes and, when the object has BTF, a
-decoded "formatted" object; both are handled. Counter names come from
+"""Readers for NetSum map dumps: `netsum-ctl --json stats|slots|jobs` output,
+or `bpftool -j map dump` output (raw little-endian hex bytes plus, with BTF,
+a decoded "formatted" object). Counter names come from
 protocol/netsum_stats.h so there is one list of names."""
 import json
 import os
@@ -33,10 +33,13 @@ def stat_names():
 
 
 def stats(path):
-    """{name: sum over CPUs} from a dump of the PERCPU_ARRAY `stats` map."""
+    """{name: sum over CPUs} from `netsum-ctl --json stats` or a bpftool dump."""
+    data = load(path)
+    if isinstance(data, dict):
+        return data
     names = stat_names()
     out = {}
-    for e in load(path):
+    for e in data:
         f = e.get("formatted", e)
         key = f["key"] if isinstance(f["key"], int) else _le(f["key"])
         vals = f.get("values", [])
@@ -53,6 +56,9 @@ def slots(path):
     """[(job_id, round, chunk_id, state_name, contributors)] from a slot_map dump."""
     out = []
     for e in load(path):
+        if "state" in e:  # netsum-ctl --json slots
+            out.append((e["job_id"], e["round"], e["chunk_id"], e["state"], e["contributors"]))
+            continue
         f = e.get("formatted", e)
         k, v = f["key"], f["value"]
         if isinstance(k, dict):
