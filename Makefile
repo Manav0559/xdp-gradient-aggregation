@@ -36,6 +36,7 @@ $(BIN_DIR)/agg: userspace_agg/agg.c protocol/grad_proto.h | $(BIN_DIR)
 
 test: all
 	python3 tests/test_correctness.py
+	python3 tests/test_protocol_v2.py
 
 bpf: xdp_agg/xdp_agg.c xdp_agg/bpf_compat.h protocol/grad_proto.h
 	$(BPF_CC) -target bpf -Wall -Wextra -O2 -g -c xdp_agg/xdp_agg.c -o xdp_agg/xdp_agg.o

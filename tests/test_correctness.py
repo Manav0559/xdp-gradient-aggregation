@@ -16,6 +16,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from netsum_packets import grad_packet  # noqa: E402
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(REPO_ROOT, "bin")
 WORKER = os.path.join(BIN, "worker")
@@ -182,9 +185,11 @@ def test_agg_basic_sum():
     assert int(contributions) == 1, "paramserver in agg mode should see exactly 1 (already-summed) contribution"
     expected = num_workers * fixed_value
     assert abs(float(total) - expected) < sum_tolerance(num_workers), f"expected {expected}, got {total}"
-    assert "packets in, " in agg.text() and f"{num_workers} packets in" in agg.text().replace(
-        f"{num_workers} packets in", f"{num_workers} packets in"
-    ) or True  # summary line format checked loosely; core assertion is the paramserver sum above
+    agg_completes = [c for c in extract_complete_lines(agg.text()) if c[0] == "2"]
+    assert len(agg_completes) == 1 and int(agg_completes[0][3]) == num_workers, (
+        f"aggregator must complete job 2 exactly once from {num_workers} contributions, "
+        f"got {agg_completes}\nfull log:\n{agg.text()}"
+    )
     print("PASS: test_agg_basic_sum")
 
 
@@ -291,18 +296,8 @@ def test_aggregator_reduces_packet_count():
 
 def _raw_grad_packet(job_id, round_, chunk_id, worker_id, num_workers, declared_chunk_len,
                       values=None):
-    """Builds a raw grad_hdr + payload byte string by hand (bypassing the
-    worker binary entirely), so a test can send something the worker
-    binary would never construct on its own -- specifically, a header that
-    LIES about chunk_len relative to how many values actually follow (or
-    none at all). `values` is a list of real int32 fixed-point values to
-    append; declared_chunk_len is what the header claims, independently of
-    len(values), which is exactly the mismatch these tests need to
-    trigger."""
-    header = struct.pack(">IIIHHHH", job_id, round_, chunk_id, worker_id,
-                          num_workers, declared_chunk_len, 0)
-    payload = b"".join(struct.pack(">i", v) for v in (values or []))
-    return header + payload
+    return grad_packet(job_id, round_, chunk_id, worker_id, num_workers,
+                       declared_chunk_len, values)
 
 
 def test_truncated_packet_not_summed_as_stale_bytes():

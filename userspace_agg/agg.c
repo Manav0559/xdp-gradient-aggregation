@@ -127,6 +127,8 @@ typedef struct {
 } slot_t;
 
 static slot_t g_slots[SLOT_TABLE_CAPACITY];
+/* Active capacity; --slot-capacity-log2 shrinks it so tests can force collisions. */
+static size_t g_slot_capacity = SLOT_TABLE_CAPACITY;
 
 /* Multi-tenant fairness -- this is ATP's actual headline contribution
  * (its title is literally "...for Multi-tenant Learning"), reproduced
@@ -195,8 +197,8 @@ static uint64_t slot_key(uint32_t job_id, uint32_t round, uint32_t chunk_id) {
 
 static slot_t *find_or_create_slot(uint32_t job_id, uint32_t round, uint32_t chunk_id) {
     uint64_t h = slot_key(job_id, round, chunk_id);
-    for (size_t probe = 0; probe < SLOT_TABLE_CAPACITY; probe++) {
-        size_t idx = (h + probe) & (SLOT_TABLE_CAPACITY - 1);
+    for (size_t probe = 0; probe < g_slot_capacity; probe++) {
+        size_t idx = (h + probe) & (g_slot_capacity - 1);
         slot_t *s = &g_slots[idx];
         if (!s->in_use) {
             /* About to CREATE a brand-new slot for this job -- this is the
@@ -316,9 +318,20 @@ static void reap_expired_slots(long slot_ttl_ms) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 2 && strcmp(argv[1], "--slot-capacity-log2") == 0) {
+        int log2 = atoi(argv[2]);
+        if (log2 < 4 || log2 > 16) {
+            fprintf(stderr, "--slot-capacity-log2 must be in [4, 16]\n");
+            return 1;
+        }
+        g_slot_capacity = (size_t)1 << log2;
+        argv[2] = argv[0];
+        argv += 2;
+        argc -= 2;
+    }
     if (argc < 4) {
         fprintf(stderr,
-            "usage: %s <listen_port> <downstream_ip> <downstream_port> [max_packets=0] [max_slots_per_job=0] [slot_ttl_ms=0]\n"
+            "usage: %s [--slot-capacity-log2 N] <listen_port> <downstream_ip> <downstream_port> [max_packets=0] [max_slots_per_job=0] [slot_ttl_ms=0]\n"
             "  max_slots_per_job: fairness admission quota -- caps how many\n"
             "  concurrently-incomplete slots a single job_id may occupy (0 =\n"
             "  unlimited, the original behavior). Reproduces ATP's actual\n"

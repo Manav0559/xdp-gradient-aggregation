@@ -17,6 +17,13 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  NETSUM_EXPECT_RED_K: '1'
+  NETSUM_EXPECT_RED_L: '1'
+  NETSUM_EXPECT_RED_M: '1'
+  NETSUM_EXPECT_RED_N: '1'
+  NETSUM_EXPECT_RED_O: '1'
+
 jobs:
   xdp-loadtest:
     runs-on: ubuntu-latest
@@ -266,7 +273,7 @@ jobs:
           python3 ci/assert_paramserver.py /tmp/ps.log 105 forbid
           sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/drop_stats > /tmp/drop_stats.json
           cat /tmp/drop_stats.json
-          python3 ci/check_drop_stat.py /tmp/drop_stats.json 0
+          python3 ci/check_drop_stat.py /tmp/drop_stats.json 0 1
           # Restore config for the recovery scenario below.
           sudo /tmp/netsum_cfg_loader /sys/fs/bpf/netsum/config_map "$VETH1_MAC" 10.200.1.2 9000
 
@@ -309,7 +316,7 @@ jobs:
           echo "--- drop_stats (expect STAT_DROPPED_FAIRNESS_QUOTA=1 bumped exactly once) ---"
           sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/drop_stats > /tmp/drop_stats_quota.json
           cat /tmp/drop_stats_quota.json
-          python3 ci/check_drop_stat.py /tmp/drop_stats_quota.json 1
+          python3 ci/check_drop_stat.py /tmp/drop_stats_quota.json 1 1
           # Job 900 must never complete (worker 1 never sends); job 901 must.
           python3 ci/assert_paramserver.py /tmp/ps.log 900 forbid
           python3 ci/assert_paramserver.py /tmp/ps.log 901 require 1 2.0
@@ -411,6 +418,105 @@ jobs:
           # but doing it explicitly documents the impairment window).
           sudo ip netns exec ns1 tc qdisc del dev veth1 root || true
 
+      # Scenarios K-O pin the confirmed bugs C1-C4 on the real kernel. While a
+      # bug is open its NETSUM_EXPECT_RED_* flag is '1' and the step asserts
+      # the bug's exact symptom (so a broken scenario or an unexpected fix
+      # fails the run); the fixing commit flips the flag to '0'.
+      - name: "Scenario K (C2): worker_id beyond fan-in must not complete a round"
+        run: |
+          set -euo pipefail
+          for w in 10 11 12; do
+            sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 960 "$w" 3 1 1 1.0 1.0
+          done
+          sleep 1
+          if [ "$NETSUM_EXPECT_RED_K" = "1" ]; then
+            python3 ci/assert_paramserver.py /tmp/ps.log 960 require 3 3.0
+            echo "RED as expected (C2): worker_ids 10,11,12 completed job 960"
+          else
+            python3 ci/assert_paramserver.py /tmp/ps.log 960 forbid
+          fi
+      - name: "Scenario L (C3): fan-in disagreement is rejected; a fan-in-1 claim closes the round once"
+        run: |
+          set -euo pipefail
+          # L1: worker 1 claims fan-in 4 while the round was opened with 3.
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 961 0 3 1 1 1.0 1.0
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 961 1 4 1 1 1.0 2.0
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 961 2 3 1 1 1.0 1.0
+          sleep 1
+          if [ "$NETSUM_EXPECT_RED_L" = "1" ]; then
+            python3 ci/assert_paramserver.py /tmp/ps.log 961 require 3 4.0
+            echo "RED as expected (C3/L1): job 961 completed using the fan-in-4 contribution"
+          else
+            python3 ci/assert_paramserver.py /tmp/ps.log 961 forbid
+            sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 961 1 3 1 1 1.0 2.0
+            sleep 1
+            python3 ci/assert_paramserver.py /tmp/ps.log 961 require 3 4.0
+          fi
+          # L2: a fan-in-1 claim completes the round; later fan-in-3 workers
+          # must be absorbed, not open a slot that can never complete.
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 965 0 1 1 1 1.0 1.0
+          sleep 0.3
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 965 1 3 1 1 1.0 1.0
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 965 2 3 1 1 1.0 1.0
+          sleep 1
+          python3 ci/assert_paramserver.py /tmp/ps.log 965 require 1 1.0
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_965.json
+          if [ "$NETSUM_EXPECT_RED_L" = "1" ]; then
+            python3 ci/check_slot_present.py /tmp/slot_map_965.json 965 present
+            echo "RED as expected (C3/L2): job 965 left a never-completing slot"
+          else
+            python3 ci/check_slot_present.py /tmp/slot_map_965.json 965 absent
+          fi
+      - name: "Scenario M (C1): a late duplicate after completion must not re-create the slot"
+        run: |
+          set -euo pipefail
+          for w in 0 1 2; do
+            sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 962 "$w" 3 1 1 1.0 1.0
+          done
+          sleep 0.2
+          sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 962 1 3 1 1 1.0 1.0
+          sleep 1
+          python3 ci/assert_paramserver.py /tmp/ps.log 962 require 3 3.0
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_962.json
+          if [ "$NETSUM_EXPECT_RED_M" = "1" ]; then
+            python3 ci/check_slot_present.py /tmp/slot_map_962.json 962 present
+            echo "RED as expected (C1): the late duplicate re-created slot (962,0,0)"
+          else
+            python3 ci/check_slot_present.py /tmp/slot_map_962.json 962 absent
+          fi
+      - name: "Scenario N (C4): accumulator overflow must never be reported as a sum"
+        run: |
+          set -euo pipefail
+          for w in 0 1 2; do
+            sudo ip netns exec ns1 ./bin/worker 10.200.1.1 9876 963 "$w" 3 1 1 20000.0 20000.0 2>/dev/null
+          done
+          sleep 1
+          if [ "$NETSUM_EXPECT_RED_N" = "1" ]; then
+            python3 ci/assert_paramserver.py /tmp/ps.log 963 require 3 -5536.0
+            echo "RED as expected (C4): 3 x 20000.0 wrapped to -5536.0"
+          else
+            python3 ci/assert_paramserver.py /tmp/ps.log 963 forbid
+            grep -q "\[overflow\] job=963" /tmp/ps.log
+          fi
+      - name: "Scenario O (C1 hygiene): scenarios that finish cleanly leave no slot behind"
+        run: |
+          set -euo pipefail
+          sudo "$BPFTOOL" -j map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_o.json
+          if [ "$NETSUM_EXPECT_RED_O" = "1" ]; then
+            python3 ci/check_slot_present.py /tmp/slot_map_o.json 962 present
+            echo "RED as expected (C1): completed jobs still hold slots"
+          else
+            for j in 100 103 104 105 106 950 951 962; do
+              python3 ci/check_slot_present.py /tmp/slot_map_o.json "$j" absent
+            done
+          fi
+      - name: "Red/green ledger"
+        if: always()
+        run: |
+          for s in K L M N O; do
+            v="NETSUM_EXPECT_RED_$s"
+            if [ "${!v}" = "1" ]; then echo "scenario $s: expected RED (bug open)"; else echo "scenario $s: GREEN"; fi
+          done | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Collect final evidence (paramserver log, verifier log, map state)
         if: always()
         run: |
@@ -420,7 +526,7 @@ jobs:
           echo "--- final drop_stats ---"
           sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/drop_stats > /tmp/drop_stats_final.json 2>&1
           cat /tmp/drop_stats_final.json
-          echo "--- final slot_map (Scenarios A-F/H/I complete or reject cleanly; Scenario G leaves 2 stuck job-900 entries -- fairness quota rejects admission, it does not evict; Scenario J leaves 1 stuck job-952 entry -- the documented, no-TTL leak) ---"
+          echo "--- final slot_map (intended leftovers: 900x2 from G, 952 from J; anything else is a bug -- see Scenarios M and O) ---"
           sudo "$BPFTOOL" map dump pinned /sys/fs/bpf/netsum/slot_map > /tmp/slot_map_final.json 2>&1
           cat /tmp/slot_map_final.json
           exit 0
@@ -444,6 +550,8 @@ jobs:
             /tmp/job_quota.json
             /tmp/drop_stats_quota.json
             /tmp/slot_map_952.json
+            /tmp/slot_map_96*.json
+            /tmp/slot_map_o.json
 
       - name: Tear down netns/veth/pinned objects
         if: always()
