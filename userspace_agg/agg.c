@@ -49,6 +49,8 @@ static struct {
     int out_sock;
     struct sockaddr_in downstream;
     long packets_out;
+    int profile;
+    uint64_t profile_ns, profile_pkts;
 } g;
 
 static volatile sig_atomic_t g_dump_requested, g_stop;
@@ -119,8 +121,10 @@ static void dump_stats(void)
     fprintf(stderr, "[stats-all] {");
     for (int i = 0; i < NS_STAT__COUNT; i++)
         fprintf(stderr, "\"%s\":%llu,", netsum_stat_names[i], (unsigned long long)g.stats[i]);
-    fprintf(stderr, "\"slots_accumulating\":%zu,\"slots_completed\":%zu,\"slots_flushed\":%zu}\n",
-            by_state[SLOT_ACCUMULATING], by_state[SLOT_COMPLETED], by_state[SLOT_FLUSHED]);
+    fprintf(stderr, "\"slots_accumulating\":%zu,\"slots_completed\":%zu,\"slots_flushed\":%zu,"
+            "\"profile_ns\":%llu,\"profile_pkts\":%llu}\n",
+            by_state[SLOT_ACCUMULATING], by_state[SLOT_COMPLETED], by_state[SLOT_FLUSHED],
+            (unsigned long long)g.profile_ns, (unsigned long long)g.profile_pkts);
     fflush(stderr);
 }
 
@@ -339,7 +343,7 @@ static void handle_contribution(const uint8_t *pkt, const struct netsum_parsed *
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s [--slot-capacity-log2 N] [--tombstone-ttl-ms N] [--quiet]\n"
+            "usage: %s [--slot-capacity-log2 N] [--tombstone-ttl-ms N] [--quiet] [--profile]\n"
             "          <listen_port> <downstream_ip> <downstream_port>\n"
             "          [max_packets=0] [max_slots_per_job=0] [slot_ttl_ms=0]\n"
             "  max_slots_per_job: per-job cap on ACCUMULATING slots (0 = none)\n"
@@ -358,6 +362,8 @@ int main(int argc, char **argv)
     for (; a < argc && strncmp(argv[a], "--", 2) == 0; a++) {
         if (strcmp(argv[a], "--quiet") == 0) {
             g.quiet = 1;
+        } else if (strcmp(argv[a], "--profile") == 0) {
+            g.profile = 1;
         } else if (strcmp(argv[a], "--slot-capacity-log2") == 0 && a + 1 < argc) {
             cap_log2 = (unsigned)atoi(argv[++a]);
             if (cap_log2 < 4 || cap_log2 > 22) {
@@ -471,7 +477,16 @@ int main(int argc, char **argv)
             g.stats[NS_REJ_KIND]++;
             continue;
         }
-        handle_contribution(pkt, &p, now_us());
+        if (g.profile) { /* algorithm cost only: excludes recvfrom, includes the forward sendto */
+            struct timespec t1, t2;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            handle_contribution(pkt, &p, now_us());
+            clock_gettime(CLOCK_MONOTONIC, &t2);
+            g.profile_ns += (uint64_t)((t2.tv_sec - t1.tv_sec) * 1000000000LL + (t2.tv_nsec - t1.tv_nsec));
+            g.profile_pkts++;
+        } else {
+            handle_contribution(pkt, &p, now_us());
+        }
     }
     fprintf(stderr, "userspace aggregator: %ld packets in, %ld aggregated packets out\n",
             packets_in, g.packets_out);

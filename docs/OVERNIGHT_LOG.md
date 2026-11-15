@@ -37,7 +37,7 @@ the reason for each are recorded here at the time they happen.
   fast local verifier loop; VM disk has ~250 MB free, so containers are
   ephemeral and nothing of the owner's is pruned. CI stays the source of truth.
 
-## 2026-11-16 02:10 IST — Phase 1 (red tests)
+## 2026-11-16 01:42 IST — Phase 1 (red tests)
 
 - `tests/netsum_packets.py`: one packet builder; `test_correctness.py` now
   imports it instead of defining its own.
@@ -73,7 +73,7 @@ the reason for each are recorded here at the time they happen.
   (includes the fan-in-4 packet); L2 965 left a slot; M (962,0,0) re-created;
   N 963 `sum[0]=-5536.000000`; O 962 still present.
 
-## 2026-11-16 02:50 IST — Phase 2 (protocol v2, userspace fixes)
+## 2026-11-16 01:54 IST — Phase 2 (protocol v2, userspace fixes)
 
 - Decision: every v2 packet carries the 32-byte contributor bitmap (raw
   contributions set their own bit). Chosen up front instead of trying
@@ -102,7 +102,7 @@ Next step: push, check CI (K-O must stay expected-red), then Phase 3a
 - Phase 2 CI (`c6a42bf`): CI (now `make test`: unit + both suites), XDP load
   test green; K-O still expected-red as intended.
 
-## 2026-11-16 03:45 IST — Phase 3 (kernel parity)
+## 2026-11-16 02:05 IST — Phase 3 (kernel parity)
 
 - `xdp_agg.c` rewritten on `grad_parse.h`, `netsum_maps.h` (new: one
   definition of every map layout, used by the program, the config loader and
@@ -145,7 +145,7 @@ the CI verifier numbers (x86, 6.17); then Phase 3.5 (benchmark-lite).
   instructions, **disassembly identical**; 50/50 cases on each object
   (57 ms / 59 ms), corpus replay 30 seeds + 5000 mutations with no mismatch.
 
-## 2026-11-16 04:40 IST — Phase 3.5 (benchmark-lite)
+## 2026-11-16 02:12 IST — Phase 3.5 (benchmark-lite)
 
 - `bench/lite_sender.c` (paced open-loop sender, sendmmsg batches of 32),
   `scripts/bench_lite.sh` (topology, trials, counters), `scripts/netsum_stats.py`
@@ -199,7 +199,7 @@ README/RESULTS lite section and DESIGN_NOTES §15; then Phase 4a in userspace.
   environment.json. The committed tables are the committed analyzer run on
   the committed raw.csv. Fix in Phase 6's bench workflow (pipefail, chown).
 
-## 2026-11-16 05:45 IST — Phase 4a + 4d in userspace
+## 2026-11-16 02:27 IST — Phase 4a + 4d in userspace
 
 - `tests/test_reliability.py`: 7 tests written first, all XFAIL on the
   previous commit (no results, no `--ack-to`, no RESEND handling, no reliable mode).
@@ -226,7 +226,7 @@ Next step: port ACK / RESEND / FLUSHED rows to xdp_agg.c with bpf-unit cases
 (local Alpine loop), remove ack_port; then the 4b sweeper (kernel-side flush
 program run via BPF_PROG_TEST_RUN); then 4c.
 
-## 2026-11-16 06:40 IST — Phase 4 kernel port, 4b sweeper, Phase 5 netsum-ctl
+## 2026-11-16 02:38 IST — Phase 4 kernel port, 4b sweeper, Phase 5 netsum-ctl
 
 - xdp_agg.c: ACK handling (retire COMPLETED/FLUSHED, discard stale
   ACCUMULATING and release its quota), RESEND table (re-send stored
@@ -297,3 +297,41 @@ record J2 timeline and H2 resend counts; then 4c (array mode + fallback).
   policy) and P (array mode, reliable workers).
 - Deferred: array mode in the userspace agg (the benchmark compares hash mode
   in both paths; XDP array mode is an extra configuration).
+- Correction: the section times above were first written from estimates and
+  were wrong (up to four hours late); they now match the commit times
+  (`git log --date=format:%H:%M`). Times from here on come from `date`.
+
+## 2026-11-16 03:07 IST — Phase 6 (v2 benchmark), pre-registration
+
+- New: scripts/topo.sh (three namespaces, routed through the root ns, no
+  rp_filter/accept_local relaxation; GRO on the PS-side veth so native-mode
+  redirect delivers), scripts/bench_v2.sh, scripts/bench_analyze.py,
+  workflow bench.yml (path-filtered; results directory excluded).
+- Load generator: the reliable worker itself (one process per logical worker,
+  closed loop, results returned in every configuration). A first attempt at
+  a --duration-ms mode was removed: workers of one synchronous job stopped at
+  different rounds and the last round could never complete. Trials are fixed
+  work (rounds x 1024 values) instead; fairness uses absolute round end times.
+- Local checks (OrbStack 7.0.11, not committed): generic and native XDP both
+  attach on veth and redirect into veth_p0 works in both modes with GRO on
+  veth_p1; a scaled-down run of the whole matrix finished with XDP accounting
+  balanced in 36/36 trials. Found and fixed on the way: `netsum-ctl detach`
+  sent no mode flag, so the kernel detached "native" and left a generic
+  program attached (next native attach: "File exists"); it now queries the
+  attach mode and detaches that.
+- v1 benchmark moved to scripts/legacy/ and bench/v1-macos-loopback/ (the
+  dashboard's data paths updated so the live page keeps working).
+- **Pre-registered comparisons (written before the CI run):**
+  - Family T (throughput, window 64): per worker count {2,4,8}, xdp-generic vs
+    useragg and xdp-native vs useragg on aggregated values delivered per
+    second per job; 8 trials per cell; permutation test on |Cliff's delta|
+    (2000 iterations, seed 1234), ratio of medians with bootstrap 95% CI,
+    Holm over the family.
+  - Family L (latency, synchronous rounds): same pairs, per-trial median round
+    completion time at the worker; 5 trials per cell; same tests, Holm over
+    the family. Pooled p50/p95/p99 (p99 only with >= 1000 samples) with
+    bootstrap CIs resampling trials.
+  - Descriptive only: noagg, xdp-array, per-packet costs (XDP ns/run, agg
+    algorithm ns/pkt, on-CPU ns), NET_RX softirqs per CPU, fairness (Jain's
+    index over raw goodput and goodput / demand, retransmissions, in-network
+    fraction) under none / quota-drop / quota-fallback / array with 64 slots.

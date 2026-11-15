@@ -179,7 +179,14 @@ static int cmd_detach(struct ctl *c)
         unsigned ifindex = if_nametoindex(c->ifnames[i]);
         if (!ifindex)
             return fail(EXIT_ENV, "no interface %s", c->ifnames[i]);
-        if (bpf_xdp_detach((int)ifindex, 0, NULL))
+        /* Detach in the mode it is attached in: with no mode flag the kernel
+         * picks native on veth and would leave a generic program in place. */
+        LIBBPF_OPTS(bpf_xdp_query_opts, q);
+        if (bpf_xdp_query((int)ifindex, 0, &q))
+            return fail(EXIT_RUNTIME, "query %s: %s", c->ifnames[i], strerror(errno));
+        __u32 flags = q.attach_mode == XDP_ATTACHED_SKB ? XDP_FLAGS_SKB_MODE
+                    : q.attach_mode == XDP_ATTACHED_DRV ? XDP_FLAGS_DRV_MODE : 0;
+        if (q.attach_mode != XDP_ATTACHED_NONE && bpf_xdp_detach((int)ifindex, flags, NULL))
             return fail(EXIT_ENV, "detach %s: %s", c->ifnames[i], strerror(errno));
     }
     if (c->unpin) {

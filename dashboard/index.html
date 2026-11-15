@@ -407,7 +407,7 @@
   }
 
   function loadBenchSection() {
-    fetchCSV("../bench/results.csv").then(function (data) {
+    fetchCSV("../bench/v1-macos-loopback/results.csv").then(function (data) {
       var rows = data.rows;
       if (rows.length === 0) {
         ["packetsChart", "reductionChart", "latencyChart"].forEach(function (id) {
@@ -482,7 +482,7 @@
   }
 
   function loadPercentilesSection() {
-    fetchCSV("../bench/results_percentiles.csv").then(function (data) {
+    fetchCSV("../bench/v1-macos-loopback/results_percentiles.csv").then(function (data) {
       var rows = data.rows;
       if (rows.length === 0) {
         ["latencyPercentilesNoagg", "latencyPercentilesUseragg"].forEach(function (id) {
@@ -535,7 +535,7 @@
   }
 
   function loadFairnessSection() {
-    fetchCSV("../bench/fairness_results.csv").then(function (data) {
+    fetchCSV("../bench/v1-macos-loopback/fairness_results.csv").then(function (data) {
       var rows = data.rows;
       if (rows.length === 0) {
         ["fairnessChart", "fairnessSlotsChart"].forEach(function (id) {

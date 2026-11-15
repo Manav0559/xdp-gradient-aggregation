@@ -158,6 +158,7 @@ struct rel {
     uint16_t worker, workers, chunk_len, last_len;
     uint32_t rounds, chunks_per_round;
     unsigned window, max_retries, drop_every, drop_result_every;
+    int emit_rounds;
     int64_t rto_us;
     int sync, has_fixed;
     double fixed;
@@ -316,6 +317,7 @@ static int reliable_main(int argc, char **argv)
     for (int a = 1; a < argc; a++) {
         const char *k = argv[a], *v = a + 1 < argc ? argv[a + 1] : NULL;
         if (!strcmp(k, "--sync")) { r.sync = 1; continue; }
+        if (!strcmp(k, "--emit-rounds")) { r.emit_rounds = 1; continue; }
         if (!v) { fprintf(stderr, "missing value for %s\n", k); return 1; }
         a++;
         if (!strcmp(k, "--to")) have_to = parse_hostport(v, &r.to) == 0;
@@ -340,7 +342,9 @@ static int reliable_main(int argc, char **argv)
         fprintf(stderr,
                 "usage: worker --mode reliable --to IP:PORT --ps IP:PORT --job J --worker W --workers N\n"
                 "         [--rounds R] [--vector-len V] [--chunk-len C<=64] [--window W] [--rto-ms MS]\n"
-                "         [--max-retries K] [--fixed X | --seed S] [--sync] [--drop-every K] [--drop-result-every K]\n");
+                "         [--max-retries K] [--fixed X | --seed S] [--sync] [--drop-every K] [--drop-result-every K]\n"
+                "         [--emit-rounds]\n"
+                "  --emit-rounds: also print each round's duration and CLOCK_MONOTONIC end time (us)\n");
         return 1;
     }
     if (vector_len == 0)
@@ -435,16 +439,27 @@ static int reliable_main(int argc, char **argv)
         }
     }
     int64_t elapsed = mono_us() - t0;
-    int64_t *rt = calloc(r.rounds, sizeof(int64_t));
-    for (uint32_t i = 0; i < r.rounds; i++)
+    uint32_t rounds_done = (uint32_t)(total / r.chunks_per_round);
+    int64_t *rt = calloc(rounds_done ? rounds_done : 1, sizeof(int64_t));
+    for (uint32_t i = 0; i < rounds_done; i++)
         rt[i] = r.round_end[i] - r.round_start[i];
-    qsort(rt, r.rounds, sizeof(int64_t), cmp_i64);
+    if (r.emit_rounds) { /* per-round completion times in round order, before sorting */
+        fprintf(stdout, "{\"worker_id\":%u,\"round_us\":[", r.worker);
+        for (uint32_t i = 0; i < rounds_done; i++)
+            fprintf(stdout, "%s%lld", i ? "," : "", (long long)rt[i]);
+        fprintf(stdout, "],\"round_end_us\":[");
+        for (uint32_t i = 0; i < rounds_done; i++)
+            fprintf(stdout, "%s%lld", i ? "," : "", (long long)r.round_end[i]);
+        fprintf(stdout, "]}\n");
+    }
+    qsort(rt, rounds_done ? rounds_done : 1, sizeof(int64_t), cmp_i64);
+    r.rounds = rounds_done ? rounds_done : 1;
 #define PCT(p) rt[(size_t)((double)(r.rounds - 1) * (p))]
     printf("{\"worker_id\":%u,\"rounds\":%u,\"chunks\":%llu,\"sent\":%llu,\"resent\":%llu,\"results\":%llu,"
            "\"dup_results\":%llu,\"result_mismatches\":%llu,\"overflow_results\":%llu,\"dropped_tx\":%llu,"
            "\"dropped_rx\":%llu,\"verified\":%s,\"elapsed_us\":%lld,\"round_us_p50\":%lld,\"round_us_p95\":%lld,"
            "\"round_us_p99\":%lld,\"round_us_max\":%lld}\n",
-           r.worker, r.rounds, (unsigned long long)total, (unsigned long long)r.sent, (unsigned long long)r.resent,
+           r.worker, rounds_done, (unsigned long long)total, (unsigned long long)r.sent, (unsigned long long)r.resent,
            (unsigned long long)r.results, (unsigned long long)r.dup_results, (unsigned long long)r.mismatches,
            (unsigned long long)r.overflow_results, (unsigned long long)r.dropped_tx, (unsigned long long)r.dropped_rx,
            r.has_fixed ? "true" : "false", (long long)elapsed, (long long)PCT(0.50), (long long)PCT(0.95),
