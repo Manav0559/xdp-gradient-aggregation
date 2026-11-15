@@ -51,12 +51,14 @@ static struct {
     long packets_out;
 } g;
 
-static volatile sig_atomic_t g_dump_requested;
+static volatile sig_atomic_t g_dump_requested, g_stop;
 
-static void on_sigusr1(int sig)
+static void on_signal(int sig)
 {
-    (void)sig;
-    g_dump_requested = 1;
+    if (sig == SIGUSR1)
+        g_dump_requested = 1;
+    else
+        g_stop = 1;
 }
 
 static int64_t now_us(void)
@@ -322,9 +324,11 @@ int main(int argc, char **argv)
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_sigusr1; /* no SA_RESTART: recvfrom returns EINTR */
+    sa.sa_handler = on_signal; /* no SA_RESTART: recvfrom returns EINTR */
     sigemptyset(&sa.sa_mask);
     sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
 
     int in_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (in_sock < 0) {
@@ -370,7 +374,7 @@ int main(int argc, char **argv)
     uint8_t pkt[NETSUM_MAX_PACKET_SIZE + 1];
     long packets_in = 0;
     int64_t last_reap = now_us();
-    while (max_packets == 0 || packets_in < max_packets) {
+    while (!g_stop && (max_packets == 0 || packets_in < max_packets)) {
         int64_t now = now_us();
         if (g.slot_ttl_ms > 0 && now - last_reap >= (int64_t)tick_ms * 1000) {
             reap_expired(now);

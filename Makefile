@@ -20,7 +20,7 @@ endif
 
 .PHONY: all clean test unit bpf bpf-compat bpf-unit bpf-unit-bin
 
-all: $(BIN_DIR)/worker $(BIN_DIR)/paramserver $(BIN_DIR)/agg
+all: $(BIN_DIR)/worker $(BIN_DIR)/paramserver $(BIN_DIR)/agg $(BIN_DIR)/lite_sender
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -32,6 +32,9 @@ $(BIN_DIR)/worker: worker/worker.c $(HDRS) | $(BIN_DIR)
 
 $(BIN_DIR)/paramserver: paramserver/paramserver.c $(HDRS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ paramserver/paramserver.c
+
+$(BIN_DIR)/lite_sender: bench/lite_sender.c $(HDRS) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ bench/lite_sender.c
 
 $(BIN_DIR)/agg: userspace_agg/agg.c $(HDRS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ userspace_agg/agg.c

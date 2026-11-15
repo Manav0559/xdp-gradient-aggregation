@@ -140,3 +140,32 @@ the CI verifier numbers (x86, 6.17); then Phase 3.5 (benchmark-lite).
   `[overflow] job=963` at the PS. O: no ACCUMULATING slot for 100/103-106/950/951/962.
   bpf-unit failed to *build* (glibc `gnu/stubs-32.h` under `-target bpf`);
   fixed with the same `-D__x86_64__` the other workflows pass.
+- bpf-unit CI run 43759200542 (x86_64, libbpf 1.3.0): helper-ID check "all
+  vendored IDs match"; system-libbpf and vendored builds both 1220
+  instructions, **disassembly identical**; 50/50 cases on each object
+  (57 ms / 59 ms), corpus replay 30 seeds + 5000 mutations with no mismatch.
+
+## 2026-11-16 04:40 IST — Phase 3.5 (benchmark-lite)
+
+- `bench/lite_sender.c` (paced open-loop sender, sendmmsg batches of 32),
+  `scripts/bench_lite.sh` (topology, trials, counters), `scripts/netsum_stats.py`
+  (stats moved out of the v1 benchmark; adds Holm and ratio-of-medians CIs),
+  `scripts/bench_lite_analyze.py`, workflow `bench-lite.yml` (path-filtered).
+- Per the advisor: kernel tombstones are not retired until Phase 4, so each
+  trial uses 25,000 rounds (< 65,536 slots) and a freshly loaded program;
+  agg and paramserver are restarted per trial.
+- Paths: noagg = sender in root ns -> veth -> PS in ns1 (one crossing);
+  useragg = sender in ns1 -> veth -> agg in root -> veth -> PS;
+  xdp = sender in ns1 -> veth0 XDP hook -> XDP_TX -> PS. Open loop, no result path.
+- Local dry run (OrbStack VM, not committed) found two analysis bugs before any
+  CI data existed: (1) the accounting identity treated loss as imbalance;
+  it now checks that every packet is either received or counted dropped at
+  each hop and that every packet the XDP program saw has exactly one outcome
+  counter; loss is reported as completion ratio. (2) /proc/pid/stat CPU ticks
+  (10 ms) were too coarse; now /proc/pid/schedstat (ns).
+- **Pre-registered comparisons (before the CI run):** per worker count
+  {2,4,8}, useragg vs xdp with the sender unpaced: F1 goodput (rounds/s),
+  F2 completion ratio; permutation test on |Cliff's delta| (2000 iterations,
+  seed 1234), ratio of medians with bootstrap 95% CI, Holm within each family.
+  Paced cells (100k/200k/400k pps) and per-packet costs are descriptive only;
+  open-loop goodput at a paced rate equals the offered rate. 8 trials per cell.
