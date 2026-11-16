@@ -467,3 +467,10 @@ report in the PR body and here, then the verdict page.
   suites). Pages deploys the whole repo (`path: .`), so the dashboard's
   training panel works on the live site. No stray helper scripts tracked; the
   regenerated PDF holds no local path.
+- Mistake found in the final CI check: the comment edit to fuzz.yml in
+  `507ebcc` replaced the header comment "up to the next blank line", and there
+  was none before `on:`, so the trigger block was deleted. GitHub then
+  rejected the file ("workflow file issue") and the fuzzer did not run for
+  `94155a8` and `d6af32b`. The local YAML parse accepted it (a file without
+  `on:` is valid YAML). Fixed by restoring the triggers; the fuzz run on the
+  fix is recorded below.

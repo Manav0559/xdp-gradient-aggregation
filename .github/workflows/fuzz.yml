@@ -5,6 +5,11 @@ name: Differential fuzz -- grad_hdr admission checks
 # crash or verdict divergence. The loaded XDP program gets the same corpus in
 # bpf-unit.yml. See fuzz/README.md.
 
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
