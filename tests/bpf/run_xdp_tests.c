@@ -387,49 +387,6 @@ static void test_overflow(void)
     check_aggregate_frame(out, 3, 1, 0, 1);
 }
 
-/* ---- wire v3: per-chunk shared exponent ------------------------------------ */
-static void test_scaled_v3(void)
-{
-    uint8_t out[4096];
-    struct grad_slot s;
-    const uint8_t *pl = out + 14 + 20 + 8;
-
-    begin("v3 at e=40 sums and the aggregate keeps the exponent");
-    CHECK(send_frame(F(.job = 900, .wid = 0, .nw = 2, .chunk_len = 2, .val = 1099512, .v3 = 1, .e = 40), out) == XDP_DROP, "first");
-    CHECK(slot_get(900, 0, 0, &s) && s.frac_bits == 40 && s.version == NETSUM_VERSION_V3, "slot records e and version");
-    CHECK(send_frame(F(.job = 900, .wid = 1, .nw = 2, .chunk_len = 2, .val = 1099512, .v3 = 1, .e = 40), out) == XDP_TX, "completes");
-    CHECK(get16(pl + 18) == netsum_wire_flags(NETSUM_VERSION_V3, 40, 0), "flags 0x%04x", get16(pl + 18));
-    CHECK((int32_t)get32(pl + 20) == 2199024 && (int32_t)get32(pl + 24) == 2199026, "sum at e=40");
-    CHECK(get16(pl + 12) == 0xFFFF && pl[28] == 0x03, "aggregate with bitmap {0,1}");
-
-    begin("v3 exponent disagreement is rejected, slot untouched");
-    send_frame(F(.job = 901, .wid = 0, .nw = 2, .chunk_len = 1, .val = 1, .v3 = 1, .e = 20), out);
-    CHECK(send_frame(F(.job = 901, .wid = 1, .nw = 2, .chunk_len = 1, .val = 1, .v3 = 1, .e = 24), out) == XDP_DROP, "action");
-    CHECK(delta(NS_SCALE_MISMATCH) == 1, "scale_mismatch counted");
-    CHECK(slot_get(901, 0, 0, &s) && s.contributors == 1, "not summed");
-    begin("a v2 contribution (e=16) cannot join a v3 slot at another exponent");
-    CHECK(send_frame(F(.job = 901, .wid = 1, .nw = 2, .chunk_len = 1, .val = 1), out) == XDP_DROP, "action");
-    CHECK(delta(NS_SCALE_MISMATCH) == 1, "scale_mismatch counted");
-
-    begin("a v3 worker's saturation marks the aggregate OVERFLOW");
-    send_frame(F(.job = 902, .wid = 0, .nw = 2, .chunk_len = 1, .val = 2147483647, .v3 = 1, .e = 30, .flags = NETSUM_F_OVERFLOW), out);
-    CHECK(send_frame(F(.job = 902, .wid = 1, .nw = 2, .chunk_len = 1, .val = -5, .v3 = 1, .e = 30), out) == XDP_TX, "action");
-    CHECK(get16(pl + 18) == netsum_wire_flags(NETSUM_VERSION_V3, 30, NETSUM_F_OVERFLOW), "flags 0x%04x", get16(pl + 18));
-    CHECK(delta(NS_OVERFLOW) == 1, "overflow counted");
-
-    begin("sweep flushes a v3 slot as a v3 PARTIAL at its exponent");
-    send_frame(F(.job = 903, .wid = 1, .nw = 3, .chunk_len = 2, .val = 7, .v3 = 1, .e = 45), out);
-    CHECK(sweep(903, 0, out) == XDP_TX, "action");
-    const uint8_t *sp = out + NETSUM_SWEEP_PAYLOAD_OFFSET;
-    CHECK(get16(sp + 18) == netsum_wire_flags(NETSUM_VERSION_V3, 45, NETSUM_F_PARTIAL), "flags 0x%04x", get16(sp + 18));
-    CHECK((int32_t)get32(sp + 20) == 7, "partial sum");
-
-    begin("RESEND flush of a v3 slot keeps the exponent");
-    send_frame(F(.job = 904, .wid = 0, .nw = 2, .chunk_len = 1, .val = 9, .v3 = 1, .e = 50), out);
-    CHECK(send_frame(F(.job = 904, .wid = 0, .nw = 2, .chunk_len = 1, .val = 9, .v3 = 1, .e = 50, .flags = NETSUM_F_RESEND), out) == XDP_TX, "action");
-    CHECK(get16(pl + 18) == netsum_wire_flags(NETSUM_VERSION_V3, 50, NETSUM_F_PARTIAL), "flags 0x%04x", get16(pl + 18));
-}
-
 static void clear_quota_map(void)
 {
     uint32_t k, next;
@@ -608,6 +565,49 @@ static void test_sweep(void)
 }
 
 /* ---- array mode (ATP-style aggregators) and fallback ------------------------- */
+
+/* ---- wire v3: per-chunk shared exponent ------------------------------------ */
+static void test_scaled_v3(void)
+{
+    uint8_t out[4096];
+    struct grad_slot s;
+    const uint8_t *pl = out + 14 + 20 + 8;
+
+    begin("v3 at e=40 sums and the aggregate keeps the exponent");
+    CHECK(send_frame(F(.job = 900, .wid = 0, .nw = 2, .chunk_len = 2, .val = 1099512, .v3 = 1, .e = 40), out) == XDP_DROP, "first");
+    CHECK(slot_get(900, 0, 0, &s) && s.frac_bits == 40 && s.version == NETSUM_VERSION_V3, "slot records e and version");
+    CHECK(send_frame(F(.job = 900, .wid = 1, .nw = 2, .chunk_len = 2, .val = 1099512, .v3 = 1, .e = 40), out) == XDP_TX, "completes");
+    CHECK(get16(pl + 18) == netsum_wire_flags(NETSUM_VERSION_V3, 40, 0), "flags 0x%04x", get16(pl + 18));
+    CHECK((int32_t)get32(pl + 20) == 2199024 && (int32_t)get32(pl + 24) == 2199026, "sum at e=40");
+    CHECK(get16(pl + 12) == 0xFFFF && pl[28] == 0x03, "aggregate with bitmap {0,1}");
+
+    begin("v3 exponent disagreement is rejected, slot untouched");
+    send_frame(F(.job = 901, .wid = 0, .nw = 2, .chunk_len = 1, .val = 1, .v3 = 1, .e = 20), out);
+    CHECK(send_frame(F(.job = 901, .wid = 1, .nw = 2, .chunk_len = 1, .val = 1, .v3 = 1, .e = 24), out) == XDP_DROP, "action");
+    CHECK(delta(NS_SCALE_MISMATCH) == 1, "scale_mismatch counted");
+    CHECK(slot_get(901, 0, 0, &s) && s.contributors == 1, "not summed");
+    begin("a v2 contribution (e=16) cannot join a v3 slot at another exponent");
+    CHECK(send_frame(F(.job = 901, .wid = 1, .nw = 2, .chunk_len = 1, .val = 1), out) == XDP_DROP, "action");
+    CHECK(delta(NS_SCALE_MISMATCH) == 1, "scale_mismatch counted");
+
+    begin("a v3 worker's saturation marks the aggregate OVERFLOW");
+    send_frame(F(.job = 902, .wid = 0, .nw = 2, .chunk_len = 1, .val = 2147483647, .v3 = 1, .e = 30, .flags = NETSUM_F_OVERFLOW), out);
+    CHECK(send_frame(F(.job = 902, .wid = 1, .nw = 2, .chunk_len = 1, .val = -5, .v3 = 1, .e = 30), out) == XDP_TX, "action");
+    CHECK(get16(pl + 18) == netsum_wire_flags(NETSUM_VERSION_V3, 30, NETSUM_F_OVERFLOW), "flags 0x%04x", get16(pl + 18));
+    CHECK(delta(NS_OVERFLOW) == 1, "overflow counted");
+
+    begin("sweep flushes a v3 slot as a v3 PARTIAL at its exponent");
+    send_frame(F(.job = 903, .wid = 1, .nw = 3, .chunk_len = 2, .val = 7, .v3 = 1, .e = 45), out);
+    CHECK(sweep(903, 0, out) == XDP_TX, "action");
+    const uint8_t *sp = out + NETSUM_SWEEP_PAYLOAD_OFFSET;
+    CHECK(get16(sp + 18) == netsum_wire_flags(NETSUM_VERSION_V3, 45, NETSUM_F_PARTIAL), "flags 0x%04x", get16(sp + 18));
+    CHECK((int32_t)get32(sp + 20) == 7, "partial sum");
+
+    begin("RESEND flush of a v3 slot keeps the exponent");
+    send_frame(F(.job = 904, .wid = 0, .nw = 2, .chunk_len = 1, .val = 9, .v3 = 1, .e = 50), out);
+    CHECK(send_frame(F(.job = 904, .wid = 0, .nw = 2, .chunk_len = 1, .val = 9, .v3 = 1, .e = 50, .flags = NETSUM_F_RESEND), out) == XDP_TX, "action");
+    CHECK(get16(pl + 18) == netsum_wire_flags(NETSUM_VERSION_V3, 50, NETSUM_F_PARTIAL), "flags 0x%04x", get16(pl + 18));
+}
 
 static int array_get(uint32_t job, struct grad_slot *s)
 {
