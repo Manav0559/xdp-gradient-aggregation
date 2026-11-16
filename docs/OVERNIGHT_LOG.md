@@ -474,3 +474,90 @@ report in the PR body and here, then the verdict page.
   `94155a8` and `d6af32b`. The local YAML parse accepted it (a file without
   `on:` is valid YAML). Fixed by restoring the triggers; the fuzz run on the
   fix is recorded below.
+
+## 2026-11-16 07:17 IST — Final self-check and morning report
+
+```
+$ git status --porcelain
+ M docs/OVERNIGHT_LOG.md
+(empty before this log entry)
+$ git diff origin/polish/honest-results...HEAD | grep -inE "claude|anthropic|co-authored|generated with"
+attribution: clean
+$ grep -rn "struct netsum_config {" --include=*.c --include=*.h . | wc -l
+1
+$ make clean && make && make unit && make test && make bpf
+build warnings: 0; unit: 1 pass; bpf warnings: 0
+test_slot_table: all checks passed
+10/10 passed
+13 tests, 0 unexpected
+7 tests, 0 unexpected
+7 tests, 0 failed
+python client packer vs C header: 3/3 identical
+$ gh pr view 5 --json isDraft,baseRefName,headRefName
+isDraft=true base=polish/honest-results head=overnight/netsum-v2
+checks on deb3d6b: all success (see PR body for run IDs)
+```
+
+### Overnight summary
+
+**State:** Phases 0-9 complete, CI green on every workflow. Two items are scoped down: chunk size stays at 64 values, and the userspace aggregator has no array mode. Both are listed below.
+
+**Merge order for the owner:** merge #3 → merge #4 → retarget this PR to `main` → review → merge. The Pages dashboard keeps showing v1 until then (Pages deploys `main`).
+
+### What changed
+- **Phase 0-1:** work log, design notes, then red tests for every confirmed bug (13 userspace tests and kernel Scenarios K-O, each asserting the bug's symptom). `3d4c1d0`
+- **Phase 2:** protocol v2 with a contributor-bitmap trailer on every packet, one shared parser, a shared slot table with backward-shift deletion, and the userspace fixes for C1-C7. `201491e`, `c6a42bf`
+- **Phase 3:** the XDP program reaches parity (tombstones, admission, overflow, atomic quota, source rewrite, per-CPU stats). Added a `BPF_PROG_TEST_RUN` harness, now 69 cases on two builds with identical disassembly. `96548ae`
+- **Phase 3.5:** benchmark-lite, the first XDP numbers. `3d8311b`
+- **Phase 4:** ACK/result path, reliable windowed worker, RESEND flush, FLUSHED→FALLBACK, a TTL sweeper run in-kernel through test-run, array-mode aggregators with collision fallback, and PS merge-by-set (C13, C14 found and fixed). `67c6411`, `72770cb`, `9b86b9c`, `62db400`
+- **Phase 5:** `netsum-ctl` (attach with the actual mode read back, config, stats, slots, jobs, sweep, verify). CI moved to it; `netsum_cfg_loader.c` and `bpftool` are no longer used.
+- **Phase 6:** closed-loop benchmark on three namespaces with a fairness sweep. `7471b21`, `5031160`, `d6af32b`
+- **Phase 7-8:** training demo through every path, quantization study, exact Q16.16 rounding. `b6c88a5`, `38ec27d`
+- **Phase 9:** README, dashboard, design notes and history rewritten; spec corrected; comments migrated. `507ebcc`, `94155a8`
+
+### Bugs fixed (red → green)
+| ID | What it was | Evidence it's fixed |
+|----|-------------|---------------------|
+| C1 | a late duplicate re-created a slot that never completes | test_c1_* pass; Scenarios M and O leave `slot_map` empty |
+| C2 | worker_id was not checked against the fan-in | test_c2_*; Scenario K `rej_worker_id=3` |
+| C3 | the fan-in was never cross-checked | test_c3_*; Scenario L `num_workers_mismatch` |
+| C4 | silent int32 wrap of the sum | test_c4_*; Scenario N `[overflow]`, `overflow=1` |
+| C5 | the PS lacked the length and fan-in checks | test_c5_* |
+| C6 | a slot free broke probe chains | test_c6; randomized slot-table unit test |
+| C7 | the quota failed open after 256 jobs | test_c7; bpf-unit "full job table fails closed" |
+| C8 | kernel quota race and underflow | reserve-before-create plus saturating CAS (by design; single-CPU CI can't race it) |
+| C9 | the aggregate kept the worker's source MAC/IP | bpf-unit frame checks; three-namespace redirect works |
+| C10 | the benchmark measured process start-up | replaced by the v2 closed-loop benchmark |
+| C11 | the fuzzer tested copies of the checks | fuzzes `grad_parse.h`; corpus replayed through the loaded program |
+| C12 | `or True` test; ">0" checks | exact assertions throughout |
+| C13 | a lost result could never be recovered | test_c13; the PS re-sends results |
+| C14 | partial plus retransmitted aggregate livelocked | found by J2 on the CI kernel; test_fallback.py |
+
+### Measured results (CI runs 43765091283 / 43785552861 / 43784240541; Linux 7.0; 4 vCPU; XDP generic and native)
+- XDP generic vs userspace aggregator, throughput at 2/4/8 workers: **1.020 / 1.081 / 1.109** on a Xeon 6975P-C runner (reproduced at 1.020 / 1.078 / 1.102), and **1.685 / 1.420 / 1.369** on a Xeon Platinum 8573C runner. Median round time 5-8% lower (21-34% on the second CPU). All Holm-corrected, p_Holm ≤ 0.033.
+- **Negative result:** native XDP on veth is slower than generic in every run; veth's native path adds a ring + NAPI hop.
+- The XDP program costs 191-316 ns per packet; the userspace aggregator spends 2.0-2.3 µs of CPU per packet. XDP accounting balanced in 351/351 trials.
+- Fairness: a drop quota starves greedy jobs (Jain 0.34); fallback to the PS stays demand-proportional (1.000).
+- Training through noagg, userspace and XDP (also with 5% loss) is bit-identical to the local quantized all-reduce.
+
+### Not done / open
+- Userspace aggregator has hash mode only (no array mode).
+- Max chunk stays 64 values. 128 verifies (664k insns); 256 exceeds the verifier limit. `bpf_loop` or sub-blocks are untried.
+- No `BPF_PROG_TEST_RUN` micro-benchmark of individual paths; cost comes from `bpf_stats` only.
+- The benchmark reports accounting but does not fail the run on an imbalance (none occurred).
+- Correctness scenarios still run on the two-namespace topology; only the benchmark uses three.
+- Lost results are injected only in userspace tests, not on the kernel path (netem loses gradients and ACKs there).
+- The 2024 ToN paper is cited without the system name "GOAT", which I could not re-verify.
+- Not built: ECN congestion control, rack hierarchy, float re-request on overflow, shared-exponent wire format.
+
+### Things the owner should know
+- Default behaviour changes: workers send v2 packets, and the PS sends results/ACKs (`--ack-to`). Quota policy defaults to none; `fallback` and `drop` are opt-in through `netsum-ctl config`. ACKs go to port 9876 with the ACK flag.
+- The README now says plainly that the XDP advantage is 2-11% on one runner type and 37-69% on another.
+- The spec PDF was regenerated (headless Chrome) after fixing the ATP author list and the fairness attribution.
+- `docs/OVERNIGHT_LOG.md` has every step, including the mistakes and their fixes.
+
+### How to reproduce
+- macOS: `make && make test && scripts/demo_local.sh`
+- Linux: `sudo scripts/topo.sh up && make bpf all ctl && sudo ./bin/netsum-ctl attach --ifname veth_w0 --ifname veth_p0 --mode auto && …` (README Quick start)
+- CI: workflows on this PR. Artifacts: `xdp-loadtest-evidence`, `netsum-bench-<id>`, `train-demo-<id>`.
+
