@@ -160,7 +160,7 @@ in this order and the first failure is the verdict:
 7. `chunk_len <= 64` (`REJ_CHUNK_LEN_MAX`) and `> 0` except REGISTER (`REJ_CHUNK_LEN_ZERO`);
 8. the datagram holds `chunk_len` values plus, on v2, the 32-byte bitmap (`REJ_TRUNCATED`).
 
-Stateful rules, identical in agg, paramserver and (from Phase 3) the kernel:
+Stateful rules, identical in agg, paramserver and the kernel:
 
 * **The first accepted contribution fixes the round's fan-in and chunk
   length.** Later contributions that disagree are rejected and counted
@@ -217,7 +217,7 @@ Measured with `bpftool prog load` in the XDP load-test workflow (`-mcpu=v3`):
 | Version | Kernel | Stack depth | Instructions processed | Run |
 |---|---|---|---|---|
 | v1 (base `f7ea415`) | 6.17 x86_64 | 352 bytes | 110,791 | 38114728912 |
-| v2 Phase 3 (`96548ae`) | 7.0.0-1017-azure x86_64 | 200 bytes | 158,454 | 43758934811 |
+| v2 before array mode (`96548ae`) | 7.0.0-1017-azure x86_64 | 200 bytes | 158,454 | 43758934811 |
 | v2 with array mode (`38ec27d`) | CI runner x86_64 | 208 bytes | 335,067 | 43784550947 |
 
 Adding array mode roughly doubled the instructions the verifier processes:
@@ -278,12 +278,12 @@ rotating job ids can no longer escape the quota (bug C7).
 ## 8. Reclamation
 
 Slot life cycle: `EMPTY -> ACCUMULATING -> COMPLETED -> EMPTY`, plus
-`ACCUMULATING -> FLUSHED -> EMPTY` for partial flushes (Phase 4).
+`ACCUMULATING -> FLUSHED -> EMPTY` for partial flushes.
 
 * On completion a slot becomes a **tombstone** (`COMPLETED`) that keeps its
   sum, so late duplicates are recognised instead of opening a slot that can
-  never complete, and so a resend after completion can re-emit the result
-  (Phase 4). Tombstones are not charged to the job quota.
+  never complete, and so a resend after completion can re-emit the result.
+  Tombstones are not charged to the job quota.
 * Userspace retires tombstones after `--tombstone-ttl-ms` (agg default 2 s,
   paramserver 10 s) through a FIFO of `(key, completed_us)` entries; an entry
   only deletes the slot if it is still that same completion. If the FIFO is
@@ -291,11 +291,15 @@ Slot life cycle: `EMPTY -> ACCUMULATING -> COMPLETED -> EMPTY`, plus
 * ACCUMULATING slots idle longer than `slot_ttl_ms` (agg, optional) are
   dropped with a `[reaped]` line.
 
-| State \ event | raw contribution | duplicate worker | fan-in / chunk_len mismatch | late contribution | TTL |
-|---|---|---|---|---|---|
-| EMPTY | create ACCUMULATING (quota, job table, capacity checked) | - | - | - | - |
-| ACCUMULATING | add; complete if all workers present | count `duplicate`, drop | count, drop | - | reap (agg `slot_ttl_ms`) |
-| COMPLETED | count `late_duplicate`, drop | count `late_duplicate`, drop | count mismatch, drop | count `late_duplicate`, drop | delete |
+Full state x event table (kernel; userspace agg is identical except where
+noted). Every cell is covered by a `bpf-unit` case or a userspace test.
+
+| State \ event | new raw contribution | same worker again | same worker, RESEND | fan-in or chunk_len disagrees | ACK from PS | TTL expired (sweeper) | array: key differs from the slot's tag |
+|---|---|---|---|---|---|---|---|
+| EMPTY (no slot) | create ACCUMULATING (quota, job table, capacity checked; over quota: drop, or FALLBACK under the fallback policy) | - | treated as new (the original never arrived) | - | count `ack_unexpected`, drop | - | claim the aggregator |
+| ACCUMULATING | add; on the last worker forward the aggregate, -> COMPLETED | count `duplicate`, drop | flush the partial to the PS, -> FLUSHED, release quota | count mismatch, drop | discard (PS finished the key), release quota, count `ack_unexpected` | flush as PARTIAL, -> FLUSHED (agg: `slot_ttl_ms` reaps instead) | FALLBACK to the PS, remember the key |
+| COMPLETED | count `late_duplicate`, drop | count `late_duplicate`, drop | re-send the stored aggregate | count mismatch, drop | retire (delete / EMPTY) | retire | FALLBACK |
+| FLUSHED | forward as FALLBACK | count `duplicate`, drop | forward as FALLBACK | count mismatch, drop | retire | retire | FALLBACK |
 
 In the kernel, tombstones are retired by the PS's ACK (deleted in hash mode,
 reset to EMPTY in array mode) or by the TTL sweeper (§12): an ACCUMULATING
@@ -330,7 +334,7 @@ per path:
   worker checks every result lane against `workers x value`.
   `--drop-every K` and `--drop-result-every K` simulate the loss of every K-th
   first transmission and every K-th result.
-* **Aggregator on RESEND** (agg now; XDP in the next step):
+* **Aggregator on RESEND** (agg and XDP):
 
 | Slot state | RESEND contribution | Action |
 |---|---|---|
@@ -519,7 +523,7 @@ correctness topology:
   no result path yet.
 * **Per trial:** 25,000 rounds; the PS and agg are restarted and the XDP
   program reloaded, so every trial starts from empty maps (kernel tombstones
-  are not retired until Phase 4, and 25,000 stays below the 65,536-slot map).
+  were not yet retired when it ran, and 25,000 stays below the 65,536-slot map).
 * **Metrics:** completion ratio (rounds completed at the PS / rounds offered);
   goodput (completed rounds / time between first and last completion);
   sender rate achieved; XDP program cost `run_time_ns / run_cnt` from

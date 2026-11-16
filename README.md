@@ -45,7 +45,7 @@ Details: [`docs/DESIGN_NOTES.md`](docs/DESIGN_NOTES.md) §1-§13.
 **macOS or Linux, userspace only** (no kernel features needed):
 
 ```sh
-make && make test            # unit tests + 4 Python suites, ~1 minute
+make && make test            # unit tests + 5 Python suites, about 30 s
 scripts/demo_local.sh        # PS + userspace aggregator + 3 reliable workers, with simulated loss
 ```
 
@@ -94,7 +94,13 @@ trial. Full tables, method and threats to validity:
 Ratios of medians with bootstrap 95% CIs; permutation tests, Holm-corrected
 (p_Holm <= 0.033 for every bold entry).
 
-* **In-kernel aggregation helps here, by 2-11%, not by multiples.** The XDP
+* **Replicated:** a second run on the same runner type reproduced these
+  ratios to about one percentage point; a run on a different runner CPU
+  (Xeon Platinum 8573C) showed a much larger gap, 1.37-1.69x throughput and
+  21-34% lower round time, because the userspace aggregator was far slower
+  there. The direction held in all three runs; the size depends on the machine.
+* **In-kernel aggregation helps: by 2-11% on one runner type, by 37-69% on
+  another, never by multiples of the work it removes.** The XDP
   program costs 191-316 ns per packet; the userspace aggregator spends
   2.0-2.3 us of CPU per packet. On veth the XDP work runs on the sending CPU.
 * **Native XDP on veth is slower than generic** (veth's native path adds a

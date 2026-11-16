@@ -145,7 +145,9 @@
     <p class="eyebrow">// 01 · throughput</p>
     <h2>Aggregated gradient values delivered per second, by worker count</h2>
     <p class="desc">Closed loop, window of 64 chunks, 1,024 values per round, 8 trials per cell. Bars are medians;
-      whiskers are bootstrap 95% confidence intervals over trials.</p>
+      whiskers are bootstrap 95% confidence intervals over trials. Replicated: run 43785552861 on the same runner type
+      matched within about one percentage point; run 43784240541 on a different CPU (Xeon Platinum 8573C) showed XDP
+      generic 1.37-1.69x the userspace aggregator. The direction holds; the size depends on the machine.</p>
     <div class="chart-card"><div id="tpChart"><div class="loading-state">Loading…</div></div><div class="legend" id="tpLegend"></div></div>
     <div class="table-wrap" id="cmpTable"></div>
   </section>

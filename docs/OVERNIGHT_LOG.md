@@ -78,7 +78,7 @@ the reason for each are recorded here at the time they happen.
 - Decision: every v2 packet carries the 32-byte contributor bitmap (raw
   contributions set their own bit). Chosen up front instead of trying
   `bpf_xdp_adjust_tail` first: no tailroom dependency in `xdpgeneric`, one
-  packet shape for every kind. Deviation from the brief's order, recorded in
+  packet shape for every kind. Deviation from the plan's order, recorded in
   DESIGN_NOTES §Wire format.
 - Decision (C7): a job entry lives only while the job has ACCUMULATING slots
   (tombstones are not charged to the quota, so they do not pin it); full job
@@ -151,7 +151,7 @@ the CI verifier numbers (x86, 6.17); then Phase 3.5 (benchmark-lite).
   `scripts/bench_lite.sh` (topology, trials, counters), `scripts/netsum_stats.py`
   (stats moved out of the v1 benchmark; adds Holm and ratio-of-medians CIs),
   `scripts/bench_lite_analyze.py`, workflow `bench-lite.yml` (path-filtered).
-- Per the advisor: kernel tombstones are not retired until Phase 4, so each
+- Kernel tombstones are not retired until Phase 4, so each
   trial uses 25,000 rounds (< 65,536 slots) and a freshly loaded program;
   agg and paramserver are restarted per trial.
 - Paths: noagg = sender in root ns -> veth -> PS in ns1 (one crossing);
@@ -169,7 +169,7 @@ the CI verifier numbers (x86, 6.17); then Phase 3.5 (benchmark-lite).
   seed 1234), ratio of medians with bootstrap 95% CI, Holm within each family.
   Paced cells (100k/200k/400k pps) and per-packet costs are descriptive only;
   open-loop goodput at a paced rate equals the offered rate. 8 trials per cell.
-- Phase 4 plan reviewed before coding. Adopted: (a) close 3.5 first (commit
+- Phase 4 design decisions, made before coding: (a) close 3.5 first (commit
   the artifact + write-up); (b) FLUSHED is set in the kernel by a second
   program run through BPF_PROG_TEST_RUN by the sweeper (no userspace
   whole-value rewrite), 45-min cap, fallback = guarded BPF_F_LOCK update with
@@ -232,7 +232,7 @@ program run via BPF_PROG_TEST_RUN); then 4c.
   ACCUMULATING and release its quota), RESEND table (re-send stored
   aggregate / flush PARTIAL -> FLUSHED / FALLBACK after a flush), one shared
   rewrite-and-forward tail. `ack_port` and NETSUM_ACK_PORT removed.
-- 4b Design A, refined per review: the sweeper does not write slots from
+- 4b Design A, with one change: the sweeper does not write slots from
   userspace. A second program in the object, `netsum_sweep`, is run by
   `netsum-ctl sweep` through BPF_PROG_TEST_RUN once per key: under the slot
   lock it flushes an expired ACCUMULATING slot into a PARTIAL (the frame comes
@@ -358,7 +358,7 @@ record J2 timeline and H2 resend counts; then 4c (array mode + fallback).
   turned the array-claim zeroing loop into memset(), which BPF cannot call;
   an empty asm barrier in the loop prevents it.
 
-## 2026-11-16 06:35 IST — Phase 6 results (session resumed after a pause)
+## 2026-11-16 06:35 IST — Phase 6 results (work resumed after a pause)
 
 - CI on `dc85e1a`: all workflows green, including bench v2 run 43765091283
   (Linux 7.0.0-1016-aws, 4 vCPU Xeon 6975P-C, native attach accepted on veth,
@@ -449,3 +449,21 @@ rewrite, spec D3/D4/D5, dashboard v2, consistency greps), then final checks.
 
 Next step: push, confirm every workflow green, final self-check, morning
 report in the PR body and here, then the verdict page.
+
+## 2026-11-16 07:45 IST — replication and final fixes
+
+- Bench v2 re-ran on `b6c88a5` (run 43784240541, Xeon Platinum 8573C,
+  7.0.0-1019-azure) and `94155a8` (run 43785552861, Xeon 6975P-C,
+  7.0.0-1016-aws); measured code identical. Same runner type: generic/userspace
+  1.020 / 1.078 / 1.102 (primary 1.020 / 1.081 / 1.109). Different CPU:
+  1.685 / 1.420 / 1.369 throughput, 0.705 / 0.663 / 0.787 round time; native
+  faster than userspace there but still behind generic. All comparisons of
+  generic vs userspace significant in all runs; fairness identical. README,
+  RESULTS and dashboard now say the direction is stable and the size depends
+  on the machine. Data committed under bench/v2/replication-*/.
+- DESIGN_NOTES §8 now has the full state x event table (all four states incl.
+  FLUSHED; raw, same worker, RESEND, mismatch, ACK, TTL, array collision);
+  leftover "Phase N" notes removed. README test time measured (30 s, 5 Python
+  suites). Pages deploys the whole repo (`path: .`), so the dashboard's
+  training panel works on the live site. No stray helper scripts tracked; the
+  regenerated PDF holds no local path.

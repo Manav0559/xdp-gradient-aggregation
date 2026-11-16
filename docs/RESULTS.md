@@ -155,9 +155,35 @@ XDP packet accounting balanced in 117/117 trials.
   64 aggregators aggregates only 49% of contributions in-network but loses no
   goodput: collisions degrade to the PS, which is ATP's multi-tenancy design.
 
+### Replication across runs and runner hardware
+
+The same benchmark ran twice more on later commits whose measured code is
+unchanged (`b6c88a5`, `94155a8`); every run had 117 trials, exact results and
+balanced XDP accounting. Data: `bench/v2/replication-43784240541/` and
+`bench/v2/replication-43785552861/` (each with raw CSVs, environment and the
+analyzer's tables).
+
+| run | runner CPU (kernel) | throughput, XDP generic / userspace at 2 / 4 / 8 workers | median round time, XDP generic / userspace | XDP native vs generic |
+|---|---|---|---|---|
+| 43765091283 (primary) | Xeon 6975P-C (7.0.0-1016-aws) | 1.020 / 1.081 / 1.109 | 0.919 / 0.950 / 0.929 | slower |
+| 43785552861 | Xeon 6975P-C (7.0.0-1016-aws) | 1.020 / 1.078 / 1.102 | 0.923 / 0.938 / 0.927 | slower |
+| 43784240541 | Xeon Platinum 8573C (7.0.0-1019-azure) | 1.685 / 1.420 / 1.369 | 0.705 / 0.663 / 0.787 | slower |
+
+Every generic-vs-userspace comparison is significant after Holm correction in
+all three runs (p_Holm <= 0.033). On the same runner type the effect
+reproduces to within about one percentage point. On a different runner type
+the userspace aggregator was much slower (2.8M vs 6.0M values/s at 2 workers)
+while the XDP path lost less, so XDP's advantage grew to 37-69% throughput and
+21-34% round time; native XDP was also faster than userspace there. The
+direction (generic XDP ahead of the userspace aggregator; native XDP on veth
+behind generic XDP) held everywhere; the size depends on the machine, which is
+why no single speed-up figure is quoted without its environment. Fairness
+results were the same in all three runs (quota-drop Jain 0.34; fallback
+1.000).
+
 ### Threats to validity
 
-* Shared 4-vCPU cloud VM; one run. Trials of different configurations are
+* Shared 4-vCPU cloud VM; three runs on two CPU types (above). Trials of different configurations are
   interleaved (trial-major loop) so drift spreads across cells.
 * veth is a software device; there is no NIC, DMA or real interrupt
   coalescing. Generic XDP still allocates an skb.
@@ -357,7 +383,7 @@ allocation, softirq), and that work is charged elsewhere.
   is pinned, so the paths do not get the same number of cores (`agg` is a
   separate process; XDP runs in softirq context).
 * Open loop with no result path: this measures how much offered load each
-  path absorbs, not training round time. Phase 6 adds a closed-loop,
+  path absorbs, not training round time. The v2 benchmark above is the closed-loop,
   three-namespace benchmark with results returned to workers.
 * One chunk size (16 values) and single-chunk rounds.
 
