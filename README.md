@@ -185,6 +185,22 @@ read-through. The one deliberately out-of-scope nuance (a stateful
 `slot->chunk_len` consistency check neither extracted function can model
 without a live slot table) is documented in `fuzz/README.md`, not hidden.
 
+### Measured results v2 (closed loop, three namespaces)
+
+Run 43765091283 on a 4-vCPU GitHub runner (Linux 7.0), 117 trials, XDP
+accounting balanced in all of them; every result checked exact. Details and
+caveats: [`docs/RESULTS.md`](docs/RESULTS.md).
+
+* **Generic XDP aggregation beat the userspace aggregator** by +2.0% / +8.1% /
+  +10.9% throughput at 2 / 4 / 8 workers and cut median round time by 5-8%
+  (Holm-corrected permutation tests, p_Holm <= 0.033).
+* **Native XDP on veth was slower than generic** (up to -5% throughput, +13%
+  round time): veth's native path adds a ring + NAPI hop.
+* The XDP program costs 191-316 ns per packet; the userspace aggregator
+  2.0-2.3 us of CPU per packet. On veth the XDP work runs on the sender's CPU.
+* Fairness: a drop-based per-job quota starves greedy jobs (Jain 0.34);
+  ATP-style fallback to the PS keeps demand-proportional fairness (1.000).
+
 ### Measured results: benchmark-lite (first XDP numbers)
 
 Open loop, one host, two network namespaces over veth, generic XDP, GitHub

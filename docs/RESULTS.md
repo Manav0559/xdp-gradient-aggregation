@@ -4,6 +4,172 @@ Every number here comes from a committed script run in CI; the run ID,
 commit and environment are given with each table. Later sections supersede
 earlier ones only where they say so.
 
+## v2: closed-loop benchmark on three namespaces (primary result)
+
+**Source:** workflow `bench.yml`, run 43765091283, PR head `dc85e1a` (GitHub
+merge ref `f52225e`). Per-trial data: `bench/v2/throughput.csv`,
+`bench/v2/latency.csv`, `bench/v2/fairness.csv`; environment:
+`bench/v2/environment.json`; every table below is
+`python3 scripts/bench_analyze.py <artifact dir> bench/v2`. The 16 MB of
+per-round latency samples (`latency_rounds.csv`) stay in the run's artifact
+`netsum-bench-43765091283`; `bench/v2/summary_latency.csv` holds the pooled
+percentiles computed from them.
+
+**Environment:** GitHub-hosted runner, Linux `7.0.0-1016-aws` x86_64,
+4 vCPU Intel Xeon 6975P-C, clang 21.1.8, libbpf 1.6.3. XDP attach modes read
+back from the kernel: generic, and native (veth accepted native attach; the
+PS-side veth has GRO enabled so redirected frames are delivered). Workers
+pinned to CPUs 0-1, `agg` to CPU 2, the PS to CPU 3.
+
+**What was measured** (method: `docs/DESIGN_NOTES.md` §15 and §13). Workers
+in one namespace, the aggregator in the root namespace, the parameter server
+in a third, routed with no rp_filter/accept_local relaxation; XDP is attached
+to both aggregator interfaces and redirects aggregates out the PS-facing one.
+The load generator is the reliable worker: each of N workers (2, 4, 8) sends
+gradients of 1,024 values (16 chunks of 64) per round and waits for the PS's
+results, so every configuration returns results to the workers and round
+time is measured end to end at the worker. Throughput: 4,000 rounds with a
+window of 64 chunks, 8 trials per cell. Latency: 2,000 synchronous rounds
+(round r+1 starts after every result of round r), 5 trials per cell. Every
+result in every trial was checked to be the exact expected sum; the run would
+have failed otherwise.
+
+**XDP packet accounting balanced in 117/117 trials** (every packet the
+program saw ended in exactly one outcome counter).
+
+### Throughput (window 64, closed loop)
+
+| config | workers | attach | values/s median [95% CI] | rounds/s | XDP ns/run | agg CPU ns/pkt | PS CPU ns/chunk | in-network | retransmissions |
+|---|---:|---|---|---:|---:|---:|---:|---:|---:|
+| noagg | 2 | - | 5,565,225 [5,513,803, 5,579,910] | 5,435 | - | - | 11,496 | - | 0 |
+| useragg | 2 | - | 5,986,412 [5,962,797, 6,017,874] | 5,846 | - | 2,316 | 10,681 | - | 0 |
+| xdp-generic | 2 | generic | 6,103,577 [6,101,021, 6,133,270] | 5,961 | 302.8 | - | 10,479 | 1.000 | 0 |
+| xdp-native | 2 | native | 5,682,268 [5,674,230, 5,723,092] | 5,549 | 316.2 | - | 11,257 | 1.000 | 0 |
+| xdp-array | 2 | native | 5,779,568 [5,737,080, 5,803,097] | 5,644 | 267.4 | - | 11,060 | 0.999 | 0 |
+| noagg | 4 | - | 3,068,423 [3,053,212, 3,073,310] | 2,997 | - | - | 20,839 | - | 0 |
+| useragg | 4 | - | 3,284,859 [3,266,989, 3,295,177] | 3,208 | - | 2,334 | 19,412 | - | 0 |
+| xdp-generic | 4 | generic | 3,549,666 [3,541,001, 3,555,735] | 3,466 | 282.1 | - | 18,006 | 1.000 | 0 |
+| xdp-native | 4 | native | 3,305,485 [3,287,921, 3,317,534] | 3,228 | 279.6 | - | 19,342 | 1.000 | 0 |
+| xdp-array | 4 | native | 3,334,149 [3,309,233, 3,344,249] | 3,256 | 241.5 | - | 19,175 | 0.999 | 0 |
+| noagg | 8 | - | 1,601,003 [1,595,033, 1,610,535] | 1,563 | - | - | 39,924 | - | 0 |
+| useragg | 8 | - | 1,777,301 [1,751,106, 1,781,802] | 1,736 | - | 2,039 | 35,940 | - | 0 |
+| xdp-generic | 8 | generic | 1,971,498 [1,965,531, 1,982,698] | 1,925 | 255.8 | - | 32,398 | 1.000 | 0 |
+| xdp-native | 8 | native | 1,819,670 [1,814,310, 1,834,863] | 1,777 | 252.8 | - | 35,111 | 1.000 | 0 |
+| xdp-array | 8 | native | 1,833,739 [1,825,026, 1,837,451] | 1,791 | 228.6 | - | 34,833 | 0.999 | 0 |
+
+### Round completion time (synchronous rounds, measured at the worker)
+
+| config | workers | samples | p50 us [95% CI] | p95 us | p99 us [95% CI] | p99.9 us | agg algorithm ns/pkt | XDP ns/run |
+|---|---:|---:|---|---:|---|---:|---:|---:|
+| noagg | 2 | 20000 | 187 [185, 188] | 212 | 225 [223, 226] | 285 | - | - |
+| useragg | 2 | 20000 | 186 [184, 188] | 233 | 276 [266, 282] | 347 | 1,669 | - |
+| xdp-generic | 2 | 20000 | 171 [168, 174] | 207 | 223 [219, 226] | 254 | - | 275.2 |
+| xdp-native | 2 | 20000 | 189 [186, 192] | 227 | 248 [245, 251] | 286 | - | 263.1 |
+| xdp-array | 2 | 20000 | 187 [186, 189] | 225 | 247 [245, 253] | 274 | - | 239.6 |
+| noagg | 4 | 40000 | 327 [326, 329] | 360 | 402 [397, 405] | 486 | - | - |
+| useragg | 4 | 40000 | 322 [320, 323] | 398 | 425 [423, 428] | 816 | 908 | - |
+| xdp-generic | 4 | 40000 | 306 [304, 307] | 377 | 394 [392, 397] | 703 | - | 251.6 |
+| xdp-native | 4 | 40000 | 365 [363, 367] | 403 | 422 [420, 425] | 489 | - | 247.7 |
+| xdp-array | 4 | 40000 | 361 [359, 362] | 399 | 420 [418, 421] | 548 | - | 219.2 |
+| noagg | 8 | 80000 | 626 [624, 629] | 647 | 673 [666, 678] | 1,142 | - | - |
+| useragg | 8 | 80000 | 615 [613, 618] | 648 | 681 [673, 689] | 1,762 | 540 | - |
+| xdp-generic | 8 | 80000 | 572 [569, 575] | 604 | 625 [618, 628] | 913 | - | 218.1 |
+| xdp-native | 8 | 80000 | 653 [650, 656] | 703 | 736 [732, 740] | 1,168 | - | 217.9 |
+| xdp-array | 8 | 80000 | 645 [642, 648] | 693 | 727 [723, 731] | 1,295 | - | 191.4 |
+
+### Pre-registered comparisons against userspace aggregation
+
+| family | workers | config | config median | useragg median | ratio [95% CI] | Cliff's delta | p | p (Holm) | n |
+|---|---:|---|---:|---:|---|---:|---:|---:|---|
+| T_throughput | 2 | xdp-generic | 6,103,577 | 5,986,412 | 1.020 [1.014, 1.025] | 1.000 | 0.0005 | 0.0030 | 8 vs 8 |
+| T_throughput | 2 | xdp-native | 5,682,268 | 5,986,412 | 0.949 [0.944, 0.958] | -1.000 | 0.0005 | 0.0030 | 8 vs 8 |
+| T_throughput | 4 | xdp-generic | 3,549,666 | 3,284,859 | 1.081 [1.076, 1.087] | 1.000 | 0.0005 | 0.0030 | 8 vs 8 |
+| T_throughput | 4 | xdp-native | 3,305,485 | 3,284,859 | 1.006 [0.999, 1.012] | 0.531 | 0.0895 | 0.0895 | 8 vs 8 |
+| T_throughput | 8 | xdp-generic | 1,971,498 | 1,777,301 | 1.109 [1.105, 1.127] | 1.000 | 0.0005 | 0.0030 | 8 vs 8 |
+| T_throughput | 8 | xdp-native | 1,819,670 | 1,777,301 | 1.024 [1.020, 1.042] | 1.000 | 0.0005 | 0.0030 | 8 vs 8 |
+| L_round_p50 | 2 | xdp-generic | 170 | 185 | 0.919 [0.897, 0.951] | -1.000 | 0.0085 | 0.0325 | 5 vs 5 |
+| L_round_p50 | 2 | xdp-native | 191 | 185 | 1.032 [0.989, 1.043] | 0.520 | 0.1984 | 0.1984 | 5 vs 5 |
+| L_round_p50 | 4 | xdp-generic | 306 | 322 | 0.950 [0.938, 0.962] | -1.000 | 0.0070 | 0.0325 | 5 vs 5 |
+| L_round_p50 | 4 | xdp-native | 365 | 322 | 1.134 [1.121, 1.144] | 1.000 | 0.0085 | 0.0325 | 5 vs 5 |
+| L_round_p50 | 8 | xdp-generic | 574 | 618 | 0.929 [0.917, 0.940] | -1.000 | 0.0050 | 0.0300 | 5 vs 5 |
+| L_round_p50 | 8 | xdp-native | 652 | 618 | 1.055 [1.050, 1.069] | 1.000 | 0.0065 | 0.0325 | 5 vs 5 |
+
+### Fairness: three jobs with demand 4:2:1 sharing one XDP aggregator
+
+| policy | goodput job1 (demand 64) | job2 (32) | job3 (16) | Jain raw | Jain / demand | retransmissions | in-network fraction |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| none | 2,945 | 1,458 | 736 | 0.776 | 1.000 | 0 | 1.000 |
+| quota-drop | 13 | 13 | 5,039 | 0.337 | 0.335 | 679 | 0.999 |
+| quota-fallback | 2,896 | 1,448 | 731 | 0.779 | 1.000 | 0 | 0.995 |
+| array-small | 2,794 | 1,419 | 696 | 0.779 | 1.000 | 0 | 0.494 |
+
+XDP packet accounting balanced in 117/117 trials.
+
+### Interpretation
+
+* **Generic-mode XDP aggregation is faster than userspace aggregation on this
+  machine, and the gap grows with the number of workers:** +2.0%, +8.1% and
+  +10.9% aggregated values per second at 2, 4 and 8 workers, and a 5-8% lower
+  median round time, all significant after Holm correction (throughput
+  p_Holm = 0.003 each, Cliff's delta 1.0; latency p_Holm 0.030-0.033 with 5 vs
+  5 trials). This is the first closed-loop answer to the project's question:
+  yes, in-kernel aggregation helps here, by about 2-11%, not by multiples.
+* **Native-mode XDP on veth is slower than generic mode** (-5.1% throughput at
+  2 workers, no significant difference at 4, +2.4% at 8; median round time
+  5-13% higher than userspace at 4 and 8 workers, no significant difference
+  at 2). Native XDP on a veth pair does not skip skb
+  allocation the way it does on a physical NIC: frames are handed to the
+  peer through a ring and a NAPI poll, an extra queueing hop that generic mode,
+  which runs inline in the sender's receive path, does not have. This is the
+  likely cause and is not verified with kernel tracing here. Native-mode
+  numbers on veth say nothing about native XDP on hardware.
+* **Where the aggregation work runs.** NET_RX softirq counts per CPU are the
+  same for noagg, generic and native XDP: ~40-47% on the worker CPUs (0-1) and
+  the rest on the PS's CPU (3); the `agg` CPU (2) only sees softirqs in the
+  userspace configuration. On veth the receive path, and therefore the XDP
+  program, runs on the sending CPU, so XDP aggregation adds no context switch
+  or extra core, while `bin/agg` costs a separate process and a full UDP
+  receive and send per packet. This also confirms the hypothesis left open in
+  benchmark-lite. (Softirq counts are invocations, not time.)
+* **Per-packet cost:** the XDP program spends 191-316 ns per invocation
+  (`run_time_ns / run_cnt`; lower with more workers because more packets are
+  partial contributions); the userspace aggregator's algorithm alone takes
+  0.5-1.7 us per packet and the whole process 2.0-2.3 us of CPU per packet
+  received, including its system calls.
+* **Versus no aggregation:** with N workers the PS receives N times fewer
+  packets per chunk, yet the PS spends only 9-19% less CPU per chunk with XDP
+  aggregation than with noagg, because it still sends one result to each of
+  the N workers per chunk. Userspace aggregation is also faster than noagg
+  (the PS is the bottleneck when it receives every contribution).
+* **Array mode** (the ATP aggregator-pool design, 65,536 aggregators) runs
+  0.8-1.7% faster than hash mode in native mode and aggregates 99.9% of
+  contributions in-network at this load; its program cost is the lowest
+  (191-267 ns per run).
+* **Fairness.** With no policy, three jobs with demand 4:2:1 get goodput in
+  exactly that ratio (Jain's index over goodput/demand 1.000). A per-job quota
+  that **drops** over-quota contributions starves the two jobs whose window
+  exceeds the quota: 13 rounds/s against 5,039 for the small job, 679
+  retransmissions, Jain 0.34. The same quota with **fallback to the PS**
+  keeps every job at its demand-proportional share (Jain/demand 1.000,
+  0.5% of contributions aggregated at the PS). A deliberately small array of
+  64 aggregators aggregates only 49% of contributions in-network but loses no
+  goodput: collisions degrade to the PS, which is ATP's multi-tenancy design.
+
+### Threats to validity
+
+* Shared 4-vCPU cloud VM; one run. Trials of different configurations are
+  interleaved (trial-major loop) so drift spreads across cells.
+* veth is a software device; there is no NIC, DMA or real interrupt
+  coalescing. Generic XDP still allocates an skb.
+* Workers, aggregator and PS share one host. The workers' CPUs also run the
+  aggregator's receive path (see above), so the XDP configurations get no
+  extra core while `agg` has its own; that is a property of the topology.
+* The load generator is closed loop with a 64-chunk window; at 8 workers the
+  PS's CPU is the bottleneck in every configuration, which limits how large a
+  difference the aggregator can make.
+* Latency comparisons have 5 trials per cell, so the smallest attainable
+  p-value is 0.004 before correction.
+
 ## Benchmark-lite: first XDP measurements (open loop, two namespaces, `xdpgeneric`)
 
 **Source:** workflow `bench-lite.yml`, run 43759600920, on PR head `29acb78`
@@ -116,7 +282,7 @@ allocation, softirq), and that work is charged elsewhere.
   three-namespace benchmark with results returned to workers.
 * One chunk size (16 values) and single-chunk rounds.
 
-### What would be needed for line-rate claims
+### What would be needed for line-rate claims (applies to both benchmarks)
 
 Two or three physical hosts with XDP-capable NICs (mlx5, i40e, ice), native
 driver-mode XDP, RSS steering and pinned cores. Out of scope here.

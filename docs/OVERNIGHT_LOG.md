@@ -357,3 +357,26 @@ record J2 timeline and H2 resend counts; then 4c (array mode + fallback).
   option, and bpf-unit records the table on the CI kernel. At 256 LLVM also
   turned the array-claim zeroing loop into memset(), which BPF cannot call;
   an empty asm barrier in the loop prevents it.
+
+## 2026-11-16 06:35 IST — Phase 6 results (session resumed after a pause)
+
+- CI on `dc85e1a`: all workflows green, including bench v2 run 43765091283
+  (Linux 7.0.0-1016-aws, 4 vCPU Xeon 6975P-C, native attach accepted on veth,
+  pinned CPUs). 117 trials, XDP accounting balanced 117/117, every result exact.
+- Pre-registered family T (throughput): xdp-generic / useragg = 1.020,
+  1.081, 1.109 at 2/4/8 workers (p_Holm 0.003 each); xdp-native / useragg =
+  0.949 (p_Holm 0.003, slower), 1.006 (n.s.), 1.024 (p_Holm 0.003).
+  Family L (median round time): xdp-generic 0.919 / 0.950 / 0.929 (p_Holm
+  0.0325 / 0.0325 / 0.030); xdp-native 1.032 (n.s.), 1.134, 1.055 (slower).
+- NET_RX softirqs per CPU identical for noagg / generic / native: the veth
+  receive path (and the XDP program) runs on the workers' CPUs. Confirms the
+  benchmark-lite hypothesis.
+- Fairness: quota-drop starves the greedy jobs (13 vs 5,039 rounds/s, Jain
+  0.34); quota-fallback 1.000 (demand-normalised); array-small 49% in-network
+  with no goodput loss.
+- Committed bench/v2/* (summaries regenerated locally with the committed
+  analyzer from the artifact's CSVs; identical to the CI summary). The 16 MB
+  latency_rounds.csv stays in the artifact.
+
+Next step: Phase 7 training demo in CI (train-demo workflow), Phase 8
+quantization study, Phase 9 docs and dashboard.
