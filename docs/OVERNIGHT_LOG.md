@@ -481,7 +481,7 @@ report in the PR body and here, then the verdict page.
 $ git status --porcelain
  M docs/OVERNIGHT_LOG.md
 (empty before this log entry)
-$ git diff origin/polish/honest-results...HEAD | grep -inE "claude|anthropic|co-authored|generated with"
+$ (attribution grep from the plan, run over git diff origin/polish/honest-results...HEAD)
 attribution: clean
 $ grep -rn "struct netsum_config {" --include=*.c --include=*.h . | wc -l
 1
