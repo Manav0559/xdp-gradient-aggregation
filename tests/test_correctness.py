@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
-"""NetSum correctness tests: launches the real compiled binaries as
-subprocesses and asserts on their actual stderr output -- this test suite
-does not re-implement any protocol/aggregation logic in Python to compare
-against; it drives the real C programs and checks their real behavior,
-the same discipline as reproducing a bug with the actual binary rather than
-a model of it.
-
-Run: python3 tests/test_correctness.py   (after `make` in the repo root)
-"""
+"""NetSum correctness tests: drive the real binaries over UDP and assert on
+their stderr. Run: python3 tests/test_correctness.py (after `make`)."""
 import os
 import re
 import socket
@@ -29,15 +22,8 @@ Q16_16_ULP = 1.0 / 65536.0
 
 
 def sum_tolerance(num_workers):
-    """Worst-case accumulated Q16.16 truncation error when summing
-    `num_workers` independently-quantized contributions is num_workers
-    ULPs, not a fixed epsilon -- 0.1, for instance, truncates to
-    6553/65536 = 0.09999847..., and 5 workers' truncation errors can all
-    point the same direction. A fixed tolerance that happens to work for
-    one num_workers value will spuriously fail for another; this is the
-    honestly-reported "quantization error" cost the project spec names as
-    a real, measured quantity, not something to paper over with a looser
-    fixed constant."""
+    """Each contribution is quantized independently, so a sum of n values can
+    be off by up to n ULPs."""
     return num_workers * Q16_16_ULP + 1e-9
 
 
@@ -50,25 +36,9 @@ def free_port():
 
 
 class Server:
-    """Launches a server binary, blocks until its "listening" readiness
-    line appears on stderr (not a sleep-and-hope), and captures every
-    subsequent stderr line for the test to assert against.
-
-    Reads via raw, non-blocking os.read() on the pipe's file descriptor,
-    NOT via the stderr TextIOWrapper's own readline() -- an earlier version
-    of this harness mixed `selectors.select()` (which watches the raw OS
-    pipe) with buffered readline() calls, and lost lines: a single
-    readline() call can pull an entire multi-line chunk out of the OS pipe
-    into Python's internal text-buffer in one underlying read() syscall,
-    return just the first line, and leave the rest sitting in that
-    userspace buffer -- invisible to select(), which only sees the
-    (now-truly-empty) OS-level pipe and correctly reports nothing new,
-    while a real second line silently waits unread until the test's
-    deadline expires. Reading raw bytes ourselves and splitting on
-    newlines avoids the mismatch entirely -- a small, real lesson about
-    not layering two different buffering models on top of each other over
-    the same fd, worth keeping as a comment for exactly that reason.
-    """
+    """Starts a server binary, waits for its "listening" line, and collects its
+    stderr. Reads raw bytes with os.read (see docs/HISTORY.md, "Two buffering
+    models on one pipe")."""
 
     def __init__(self, argv):
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -379,13 +349,8 @@ def test_chunk_len_mismatch_rejected_not_silently_summed():
 
 
 def test_fairness_quota_isolates_greedy_job():
-    # Reproduces ATP's actual headline contribution -- its full paper
-    # title is "In-network Aggregation for MULTI-TENANT Learning," not
-    # just streaming aggregation (which SwitchML, ATP's own predecessor,
-    # already had). A per-job admission quota on concurrently-incomplete
-    # slots must isolate one greedy job's excess demand from a second,
-    # well-behaved job sharing the same aggregator -- proving real
-    # starvation-isolation, not just that the quota mechanism compiles.
+    # An optional per-job admission quota (NetSum's policy, not ATP's mechanism,
+    # which is fallback to the PS) must isolate a greedy job from a second job.
     ps_port = free_port()
     agg_port = free_port()
     quota = 2

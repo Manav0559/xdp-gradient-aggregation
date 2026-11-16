@@ -1,12 +1,10 @@
-/* NetSum worker: generates synthetic gradient chunks, quantizes them to
- * Q16.16 fixed-point, and sends them over UDP following grad_proto.h -- the
- * same sender binary feeds all three benchmark configurations (no-agg,
- * userspace-agg, XDP-agg); only the destination address changes.
- *
- * Deliberately synthetic gradients, not a real training loop -- named
- * honestly in the project docs as such. Values are drawn from a fixed seed
- * so every worker/run combination is reproducible.
- */
+/* NetSum worker. Two modes:
+ *  - one-shot (positional CLI, the default): sends R rounds of one chunk and
+ *    exits; used by the correctness tests and kernel scenarios;
+ *  - reliable (--mode reliable): registers with the PS, sends chunked
+ *    gradient vectors with a window, waits for results and retransmits with
+ *    RESEND on timeout; the benchmark's closed-loop load generator.
+ * Values are deterministic (fixed or seeded). docs/DESIGN_NOTES.md §Reliability. */
 #define _POSIX_C_SOURCE 200809L
 
 #include <arpa/inet.h>

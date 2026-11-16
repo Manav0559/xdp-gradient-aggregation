@@ -1,21 +1,9 @@
 name: Differential fuzz -- grad_hdr admission checks
 
-# Builds fuzz/fuzz_grad_parse.cpp (userspace_agg/agg.c's vs.
-# xdp_agg/xdp_agg.c's stateless grad_hdr admission-check logic,
-# differentially fuzzed against each other under libFuzzer + AddressSanitizer
-# -- see fuzz/README.md) and runs it for a bounded time against
-# fuzz/corpus/, failing the job on any crash or verdict divergence.
-#
-# This needs no Linux kernel feature at all: it fuzzes the extracted
-# userspace-only logic in fuzz/parse_shared.h, never the live XDP program
-# itself (the loaded program is exercised separately, through the real
-# in-kernel verifier on a veth pair, by xdp-loadtest.yml) -- so
-# ubuntu-latest's stock clang is enough, no BPF toolchain, no libbpf, no
-# root.
-on:
-  push:
-  pull_request:
-  workflow_dispatch:
+# Fuzzes protocol/grad_parse.h (the parser every component ships) against a
+# reference parser under libFuzzer + ASan for a bounded time; fails on any
+# crash or verdict divergence. The loaded XDP program gets the same corpus in
+# bpf-unit.yml. See fuzz/README.md.
 
 jobs:
   fuzz:

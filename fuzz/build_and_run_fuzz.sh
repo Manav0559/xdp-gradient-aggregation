@@ -1,29 +1,16 @@
 #!/usr/bin/env bash
-# Compiles fuzz_grad_parse.cpp with clang's libFuzzer + ASan and smoke-runs
-# it against fuzz/corpus/ for a bounded time, failing (non-zero exit) on
-# any crash or verdict divergence. Mirrors the sibling itch-lob-engine
-# project's fuzz/build_and_run*.sh scripts in structure and reasoning (same
-# "standalone script, not wired into the Makefile" call, same macOS
-# Homebrew-LLVM-clang fallback).
-#
-# This fuzzes only the extracted admission-check logic in
-# fuzz/parse_shared.h -- never the live XDP program itself -- so it needs
-# no Linux kernel, no BPF verifier, no libbpf, nothing beyond a real clang
-# with the libFuzzer runtime. Works identically on macOS and Linux CI.
-#
-# Usage:
-#   fuzz/build_and_run_fuzz.sh [seconds]
-#   FUZZ_SECONDS=300 fuzz/build_and_run_fuzz.sh
+# Builds fuzz_grad_parse.cpp with clang's libFuzzer + ASan and runs it on
+# fuzz/corpus/ for a bounded time; non-zero exit on a crash or a verdict
+# divergence between netsum_parse() and the reference parser. Needs only
+# clang with the libFuzzer runtime (on macOS: Homebrew LLVM).
+# Usage: fuzz/build_and_run_fuzz.sh [seconds]   (or FUZZ_SECONDS=300)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 HOMEBREW_LLVM_CLANGXX="/opt/homebrew/opt/llvm/bin/clang++"
 
-# On macOS, the Xcode Command Line Tools' clang++ ships ASan but not
-# libclang_rt.fuzzer_osx.a, so -fsanitize=fuzzer fails at link time. Prefer
-# a Homebrew LLVM clang++ when present; fall back to whatever's on PATH
-# otherwise (e.g. Linux CI, where the system clang++ already bundles it).
+# Apple's clang++ has ASan but no libFuzzer runtime: prefer Homebrew LLVM.
 if [ -x "${HOMEBREW_LLVM_CLANGXX}" ]; then
     CLANGXX="${HOMEBREW_LLVM_CLANGXX}"
 elif command -v clang++ >/dev/null 2>&1; then

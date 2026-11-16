@@ -1,21 +1,10 @@
 #!/usr/bin/env python3
-"""CI-only assertion helper for the xdp-loadtest workflow: greps a captured
-paramserver stderr log for a `[complete] job=... sum[0]=...` line (the same
-regex tests/test_correctness.py uses) for one specific job_id, and either
-requires it to be present with a sum within tolerance of an expected value,
-or requires it to be absent entirely -- the latter is how every adversarial
-case in this workflow proves the real, kernel-verifier-approved xdp_agg.o
-actually dropped a malformed/adversarial contribution instead of silently
-summing it, exactly mirroring the assertions tests/test_correctness.py
-already makes against the userspace agg.c binary.
+"""Asserts that a captured paramserver log has (require) or lacks (forbid) a
+[complete] line for a job, with the sum within the Q16.16 tolerance.
 
 Usage:
   assert_paramserver.py <logfile> <job_id> require <num_workers> <expected_sum>
   assert_paramserver.py <logfile> <job_id> forbid
-
-Tolerance matches tests/test_correctness.py's sum_tolerance(): num_workers
-Q16.16 ULPs (1/65536 each) plus a tiny epsilon, since each contribution's
-value was independently quantized before summing.
 """
 import re
 import sys

@@ -1,25 +1,10 @@
 #!/usr/bin/env python3
-"""CI-only helper: sends one hand-crafted raw grad_hdr(+payload) UDP packet,
-using the exact same struct.pack pattern as tests/test_correctness.py's
-_raw_grad_packet() helper, so the xdp-loadtest CI workflow can replay the
-same adversarial byte-level scenarios against the REAL kernel-loaded
-xdp_agg.o that tests/test_correctness.py already replays against the
-userspace agg.c binary.
-
-This intentionally does not import tests/test_correctness.py (that module
-launches subprocesses and isn't meant to run inside a network namespace as
-a one-shot sender) -- it just re-implements the same small, well-understood
-packing logic standalone.
+"""Sends one hand-built grad_hdr packet (v1, flags 0) whose declared chunk_len
+may disagree with the values supplied, for adversarial kernel scenarios.
 
 Usage:
   send_raw_packet.py <dest_ip> <dest_port> <job_id> <round> <chunk_id> \
       <worker_id> <num_workers> <declared_chunk_len> [value ...]
-
-Each trailing `value` is a real int32 fixed-point value to append to the
-payload -- the count of values given is independent of
-<declared_chunk_len>, which is exactly the mismatch adversarial tests need
-(e.g. declare chunk_len=4 but supply zero values, to build a genuinely
-truncated packet).
 """
 import socket
 import struct

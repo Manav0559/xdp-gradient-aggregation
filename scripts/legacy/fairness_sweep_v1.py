@@ -2,9 +2,8 @@
 # HISTORY (v1): measured the quota clipping identity min(demand, quota) with
 # jobs that never complete; superseded by the fairness sweep in
 # scripts/bench_v2.sh. Output: bench/v1-macos-loopback/fairness_results.csv.
-"""NetSum formal Jain's-fairness-index sweep: quantifies ATP's actual
-headline contribution (its paper's own title is literally "...for
-Multi-tenant Learning") with a real, measured curve instead of the existing
+"""NetSum v1 Jain's-fairness-index sweep over the per-job admission quota
+(a NetSum policy; ATP's multi-tenancy mechanism is fallback to the PS), with a real, measured curve instead of the existing
 qualitative-only proof (tests/test_correctness.py's
 test_fairness_quota_isolates_greedy_job: one greedy job's excess request
 gets rejected once). That test proves the mechanism *fires*; this script
