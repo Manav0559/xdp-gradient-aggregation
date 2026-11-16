@@ -621,3 +621,20 @@ bpf-unit cases), worker --frac-bits.
 Next step: commit docs, wait for bench/bench-lite on the PR (they run the
 new program with v2 traffic), then stage 3 (retry under a new key after
 OVERFLOW) only if time allows; otherwise record it as open.
+
+## 2026-11-16 12:18 IST — Regression found in review: v1-opened slots
+
+Review of the branch found that the XDP forward tail emitted at the slot's
+stored version without clamping it, so a slot opened by a legacy v1 packet
+(version 0) and completed or flushed by a v2 packet produced a 0xFFFF
+aggregate with flags 0, which the PS rejects. main hard-coded v2 there; the
+sweeper, agg and PS on this branch already clamped. No case covered mixed
+v1/v2 slots. Red first: `9b4d5e8` added two BPF cases; bpf-unit run
+43819068199 failed them on the kernel (flags 0x0000, 3 failures of 79).
+Fix: clamp in the forward tail as everywhere else. Also reworded the
+exponent-rule remark in DESIGN_NOTES (the rule exists only in Python),
+corrected the quant study's runtime, and stated that the C worker's v3
+mode is not exercised on the kernel.
+
+Next step: CI green on the fix; then stop. Stage 3 (retry after OVERFLOW)
+stays open.

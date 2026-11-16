@@ -226,7 +226,7 @@ result re-sends + 1,240 ACKs.)
 ## Quantization formats
 
 **Source:** `python3 scripts/quant_study.py --out bench/v2` (deterministic,
-seed 1234; plain Python, runs in ~15 s anywhere). Data:
+seed 1234; plain Python, runs in under a minute anywhere). Data:
 `bench/v2/quant_formats.csv`, `bench/v2/quant_training.csv`.
 
 Relative L2 error of the summed vector against the exact float64 sum, with
@@ -333,7 +333,8 @@ throughput tables above come from the v2 program; this change's effect on
 throughput is not analysed here.
 
 **Scope.** One small model, synchronous rounds, one exponent per 64-value
-chunk. Not shown: models whose gradients change scale faster than 16x per
+chunk. On the kernel, v3 was exercised by the Python client; the C worker's
+`--frac-bits` mode is tested only through the userspace aggregator and PS. Not shown: models whose gradients change scale faster than 16x per
 step, recovery after an `OVERFLOW` result (not implemented; the demo stops),
 and any effect on throughput.
 

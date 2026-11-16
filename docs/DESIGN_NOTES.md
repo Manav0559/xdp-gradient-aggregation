@@ -159,7 +159,8 @@ changes except bookkeeping:
   (`scale_mismatch`), like a fan-in or length disagreement (§3);
 * aggregates, PARTIAL flushes (forward tail and the TTL sweeper), results
   and ACKs are emitted at the slot's version and exponent, so the sweeper,
-  which has no incoming packet, still produces the right header;
+  which has no incoming packet, still produces the right header (a slot a
+  legacy v1 packet opened emits v2, never flags 0);
 * a worker whose own value saturates at *e* sets `OVERFLOW` on its raw
   contribution instead of sending a clipped value; the slot's sticky flag
   picks it up, so the result is flagged rather than wrong. (A v2 raw
@@ -168,7 +169,8 @@ changes except bookkeeping:
 *Agreement without a message.* All workers must use the same *e* for a
 chunk. Every worker receives the identical summed result each round, so the
 next exponent is a function of that result: `examples/train_mlp/scale_rule.py`
-computes, in integers only so C and Python cannot disagree at a boundary,
+computes, in integers only so that any reimplementation (another language,
+another float library) gives the same answer at a boundary,
 `e' = e + (30 - 4 - bitlen(max |sum|))`, clamped to 0-63: the previous sum
 lands near 2^26, leaving 4 bits (16x) of growth before overflow. An all-zero
 sum raises *e* by 8 (otherwise underflow would be permanent); an `OVERFLOW`

@@ -499,7 +499,7 @@ locked:
         copy_slot_out(slot, values, chunk_len, v2, data_end);
     overflowed = slot->overflowed;
     fanin = slot->fanin;
-    out_version = slot->version;
+    out_version = slot->version == NETSUM_VERSION_V3 ? NETSUM_VERSION_V3 : NETSUM_VERSION_V2;
     out_frac = slot->frac_bits;
     bpf_spin_unlock(&slot->lock);
 
