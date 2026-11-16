@@ -159,6 +159,7 @@ struct rel {
     int emit_rounds;
     int64_t rto_us;
     int sync, has_fixed;
+    int frac_bits; /* -1: v2 at Q16.16; 0..63: wire v3 at this exponent */
     double fixed;
     uint64_t seed;
     struct rel_chunk *c;
@@ -194,16 +195,22 @@ static uint16_t rel_len(const struct rel *r, uint32_t chunk)
     return chunk + 1 == r->chunks_per_round ? r->last_len : r->chunk_len;
 }
 
-/* Deterministic value for (seed, worker, round, chunk, lane). */
-static int32_t rel_value(const struct rel *r, uint32_t round, uint32_t chunk, unsigned lane)
+static int rel_e(const struct rel *r)
+{
+    return r->frac_bits < 0 ? NETSUM_Q_FRAC_BITS : r->frac_bits;
+}
+
+/* Deterministic value for (seed, worker, round, chunk, lane), quantized at
+ * the worker's exponent; *sat is set if it saturated. */
+static int32_t rel_value(const struct rel *r, uint32_t round, uint32_t chunk, unsigned lane, int *sat)
 {
     if (r->has_fixed)
-        return netsum_to_fixed(r->fixed);
+        return netsum_to_scaled(r->fixed, rel_e(r), sat);
     uint64_t x = r->seed ^ ((uint64_t)r->worker << 48) ^ ((uint64_t)round << 24) ^ ((uint64_t)chunk << 8) ^ lane;
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33;
-    return netsum_to_fixed(((double)(x % 2000001) / 1000000.0) - 1.0);
+    return netsum_to_scaled(((double)(x % 2000001) / 1000000.0) - 1.0, rel_e(r), sat);
 }
 
 static void rel_send(struct rel *r, uint32_t idx, int resend)
@@ -218,11 +225,18 @@ static void rel_send(struct rel *r, uint32_t idx, int resend)
     h->worker_id = htons(r->worker);
     h->num_workers = htons(r->workers);
     h->chunk_len = htons(len);
-    h->flags = htons((uint16_t)(NETSUM_FLAGS_V2 | (resend ? NETSUM_F_RESEND : 0)));
+    int saturated = 0;
     for (unsigned i = 0; i < len; i++) {
-        uint32_t be = htonl((uint32_t)rel_value(r, round, chunk, i));
+        int sat;
+        uint32_t be = htonl((uint32_t)rel_value(r, round, chunk, i, &sat));
+        saturated |= sat;
         memcpy(pkt + NETSUM_HDR_SIZE + 4 * i, &be, 4);
     }
+    uint16_t bits = (uint16_t)(resend ? NETSUM_F_RESEND : 0);
+    if (r->frac_bits >= 0 && saturated)
+        bits |= NETSUM_F_OVERFLOW; /* v3: report it rather than send a clipped value */
+    h->flags = htons(r->frac_bits >= 0 ? netsum_wire_flags(NETSUM_VERSION_V3, (uint8_t)r->frac_bits, bits)
+                                       : (uint16_t)(NETSUM_FLAGS_V2 | bits));
     uint8_t *bm = pkt + NETSUM_HDR_SIZE + 4 * (size_t)len;
     memset(bm, 0, NETSUM_BITMAP_BYTES);
     bm[r->worker / 8] = (uint8_t)(1u << (r->worker % 8));
@@ -276,10 +290,14 @@ static void rel_on_result(struct rel *r, const uint8_t *pkt, ssize_t n, int64_t 
     }
     c->state = 2;
     r->results++;
-    if (flags & NETSUM_F_OVERFLOW) {
+    unsigned version = flags >> NETSUM_VERSION_SHIFT;
+    unsigned e = version == NETSUM_VERSION_V3 ? (flags & NETSUM_FRAC_MASK) >> NETSUM_FRAC_SHIFT : NETSUM_Q_FRAC_BITS;
+    if ((r->frac_bits >= 0) != (version == NETSUM_VERSION_V3) || e != (unsigned)rel_e(r)) {
+        r->mismatches++; /* a result at another scale cannot be decoded */
+    } else if (flags & NETSUM_F_OVERFLOW) {
         r->overflow_results++;
     } else if (r->has_fixed) {
-        int32_t want = (int32_t)((int64_t)netsum_to_fixed(r->fixed) * r->workers);
+        int32_t want = (int32_t)((int64_t)netsum_to_scaled(r->fixed, rel_e(r), 0) * r->workers);
         for (unsigned i = 0; i < len; i++) {
             uint32_t be;
             memcpy(&be, pkt + NETSUM_HDR_SIZE + 4 * i, 4);
@@ -310,6 +328,7 @@ static int reliable_main(int argc, char **argv)
     r.rto_us = 50000;
     r.max_retries = 10;
     r.seed = 0x9E3779B97F4A7C15ULL;
+    r.frac_bits = -1;
     uint32_t vector_len = 0;
     int have_to = 0, have_ps = 0;
     for (int a = 1; a < argc; a++) {
@@ -331,17 +350,19 @@ static int reliable_main(int argc, char **argv)
         else if (!strcmp(k, "--max-retries")) r.max_retries = (unsigned)atoi(v);
         else if (!strcmp(k, "--fixed")) { r.has_fixed = 1; r.fixed = atof(v); }
         else if (!strcmp(k, "--seed")) r.seed = strtoull(v, NULL, 10);
+        else if (!strcmp(k, "--frac-bits")) r.frac_bits = atoi(v);
         else if (!strcmp(k, "--drop-every")) r.drop_every = (unsigned)atoi(v);
         else if (!strcmp(k, "--drop-result-every")) r.drop_result_every = (unsigned)atoi(v);
         else { fprintf(stderr, "unknown option %s\n", k); return 1; }
     }
     if (!have_to || !have_ps || r.workers < 1 || r.workers > NETSUM_MAX_FANIN || r.worker >= r.workers ||
-        r.chunk_len < 1 || r.chunk_len > NETSUM_MAX_CHUNK_LEN || r.window < 1 || r.rounds < 1) {
+        r.chunk_len < 1 || r.chunk_len > NETSUM_MAX_CHUNK_LEN || r.window < 1 || r.rounds < 1 || r.frac_bits < -1 || r.frac_bits > 63) {
         fprintf(stderr,
                 "usage: worker --mode reliable --to IP:PORT --ps IP:PORT --job J --worker W --workers N\n"
                 "         [--rounds R] [--vector-len V] [--chunk-len C<=64] [--window W] [--rto-ms MS]\n"
                 "         [--max-retries K] [--fixed X | --seed S] [--sync] [--drop-every K] [--drop-result-every K]\n"
-                "         [--emit-rounds]\n"
+                "         [--emit-rounds] [--frac-bits E]\n"
+                "  --frac-bits: send wire v3 with values round(x * 2^E), 0 <= E <= 63\n"
                 "  --emit-rounds: also print each round's duration and CLOCK_MONOTONIC end time (us)\n");
         return 1;
     }

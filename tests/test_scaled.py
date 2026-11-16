@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from netsum_packets import grad_packet, send  # noqa: E402
 from test_correctness import AGG, PARAMSERVER, Server, free_port  # noqa: E402
 from test_protocol_v2 import EXPECTED_FAIL  # noqa: E402
-from test_reliability import ACK, OVERFLOW, Endpoint, bitmap, stats_all  # noqa: E402
+from test_reliability import ACK, OVERFLOW, Endpoint, bitmap, run_reliable, start_agg, stats_all  # noqa: E402
 
 V3 = 3 << 12
 
@@ -101,6 +101,37 @@ def test_s1_aggregator_rejects_scale_disagreement():
     finally:
         agg.stop()
     assert st.get("scale_mismatch") == 1 and st.get("tx_aggregate") == 0, st
+
+
+def test_reliable_v3_workers_through_useragg_with_loss():
+    # 3e-6 is 0 in Q16.16; at e=40 it is 3298535 per worker, summed exactly
+    ps_port = free_port()
+    agg, agg_port = start_agg(ps_port, "--quiet")
+    ps = Server([PARAMSERVER, "--quiet", "--ack-to", f"127.0.0.1:{agg_port}", str(ps_port), "agg"])
+    try:
+        res = run_reliable(agg_port, ps_port, 910, 3, 6, 256,
+                           ("--fixed", "3e-6", "--frac-bits", "40", "--drop-every", "5", "--drop-result-every", "7"))
+        ast, pst = stats_all(agg), stats_all(ps)
+    finally:
+        agg.stop()
+        ps.stop()
+    for r in res:
+        assert r["results"] == 6 * 4 and r["result_mismatches"] == 0 and r["overflow_results"] == 0, r
+    assert sum(r["resent"] for r in res) > 0, res
+    assert ast.get("scale_mismatch") == 0 and pst.get("scale_mismatch") == 0, (ast, pst)
+    assert ast.get("slots_accumulating") == 0, ast
+
+
+def test_reliable_v3_saturation_is_flagged_not_summed():
+    # 1.0 at e=31 does not fit in int32: every result must carry OVERFLOW
+    ps_port = free_port()
+    ps = Server([PARAMSERVER, "--quiet", str(ps_port), "noagg"])
+    try:
+        res = run_reliable(ps_port, ps_port, 911, 2, 2, 128, ("--fixed", "1.0", "--frac-bits", "31"))
+    finally:
+        ps.stop()
+    for r in res:
+        assert r["results"] == 2 * 2 and r["overflow_results"] == r["results"], r
 
 
 def main():
