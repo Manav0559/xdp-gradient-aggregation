@@ -7,6 +7,7 @@ on a raw contribution) instead of reporting a wrong sum.
 Run: python3 tests/test_scaled.py (after `make`)."""
 import os
 import re
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -16,6 +17,7 @@ from test_protocol_v2 import EXPECTED_FAIL  # noqa: E402
 from test_reliability import ACK, OVERFLOW, Endpoint, bitmap, run_reliable, start_agg, stats_all  # noqa: E402
 
 V3 = 3 << 12
+TRAIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples", "train_mlp")
 
 
 def v3flags(e, bits=0):
@@ -132,6 +134,36 @@ def test_reliable_v3_saturation_is_flagged_not_summed():
         ps.stop()
     for r in res:
         assert r["results"] == 2 * 2 and r["overflow_results"] == r["results"], r
+
+
+def run_train_spike(train_dir):
+    """Trains with a x1000 gradient spike at step 20 through the userspace
+    aggregator: every chunk overflows once and must be retried in-step."""
+    ps_port, agg_port = free_port(), free_port()
+    agg = Server([AGG, "--quiet", str(agg_port), "127.0.0.1", str(ps_port)])
+    ps = Server([PARAMSERVER, "--quiet", "--ack-to", f"127.0.0.1:{agg_port}", str(ps_port), "agg"])
+    out = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"netsum_spike_{os.getpid()}.csv")
+    try:
+        p = subprocess.run([sys.executable, os.path.join(train_dir, "train.py"), "--steps", "40",
+                            "--paths", "adapt,net", "--net-format", "v3", "--grad-scale", "1e-4",
+                            "--spike-step", "20", "--spike-factor", "1000", "--log-every", "40",
+                            "--to", f"127.0.0.1:{agg_port}", "--ps", f"127.0.0.1:{ps_port}",
+                            "--label", "useragg-v3", "--job", "920", "--out", out],
+                           capture_output=True, text=True, timeout=120)
+    finally:
+        agg.stop()
+        ps.stop()
+        if os.path.exists(out):
+            os.remove(out)
+    return p
+
+
+def test_overflowed_chunks_are_retried_in_step_at_a_lower_exponent():
+    p = run_train_spike(TRAIN_DIR)
+    assert p.returncode == 0, p.stdout[-800:] + p.stderr[-800:]
+    assert "useragg-v3: chunks retried after OVERFLOW: 3" in p.stdout, p.stdout
+    assert "adapt: chunks retried after OVERFLOW: 3" in p.stdout, p.stdout
+    assert "differed from the local quantized sum: 0" in p.stdout, p.stdout
 
 
 def main():

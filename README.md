@@ -118,6 +118,7 @@ Ratios of medians with bootstrap 95% CIs; permutation tests, Holm-corrected
   on from the previous step's result: with every gradient scaled by 1e-4,
   Q16.16 training ends at 0.436 accuracy and v3 at 0.989 (float: 0.989),
   bit-identical across noagg, userspace and XDP, with and without 5% loss.
+  A chunk that overflows is retried in the same step at a lower exponent.
 
 Not shown: physical NICs, native XDP on hardware, multi-host topologies,
 line rate. The environment is a shared VM and veth is a software device.

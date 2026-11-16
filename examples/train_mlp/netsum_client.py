@@ -4,9 +4,8 @@ contributions with a contributor-bitmap trailer, results (ACK) back from the
 parameter server, retransmission with RESEND on timeout.
 
 All logical workers of one process are driven together by allreduce(), so a
-synchronous training step needs no threads. With per-chunk exponents
-allreduce() speaks wire v3 (values are round(x * 2^e), e in flags bits 6-11;
-scale_rule.py chooses e)."""
+synchronous training step needs no threads. exchange() also speaks wire v3
+(values are round(x * 2^e), e in flags bits 6-11; scale_rule.py chooses e)."""
 import select
 import socket
 import struct
@@ -19,6 +18,13 @@ FRAC_SHIFT, FRAC_MASK = 6, 0x0FC0
 RESEND, ACK, OVERFLOW, FALLBACK, PARTIAL, REGISTER = 1, 2, 4, 8, 16, 32
 MAX_CHUNK = 64
 AGGREGATE_ID = 0xFFFF
+RETRY_SHIFT = 24
+
+
+def retry_chunk_id(chunk, attempt):
+    """Wire chunk id of a retry: a fresh key, so no slot, tombstone or stored
+    result of an earlier attempt can match it."""
+    return chunk | (attempt << RETRY_SHIFT)
 
 
 def wire_flags(e, bits):
@@ -67,30 +73,24 @@ class Worker:
         self.sock.close()
 
 
-def allreduce(workers, rnd, vectors, exps=None, saturated=None, rto=0.05, max_retries=30):
-    """Sends every worker's int32 vector for round `rnd` and returns the summed
-    vector each worker received (they must all be identical).
-
-    v2 (Q16.16) when `exps` is None: raises OverflowError on an OVERFLOW
-    result. v3 when `exps` gives each chunk's exponent: saturated[w][c] marks
-    worker w's chunk c OVERFLOW; returns (sum, overflowed chunk ids) and
-    rejects a result at any other version or exponent. Raises TimeoutError
-    if a chunk never completes."""
-    length = len(vectors[0])
-    chunks = [(c, min(MAX_CHUNK, length - c * MAX_CHUNK)) for c in range((length + MAX_CHUNK - 1) // MAX_CHUNK)]
-    e_of = (lambda c: None) if exps is None else (lambda c: exps[c])
-    sat_of = (lambda w, c: False) if saturated is None else (lambda w, c: saturated[w][c])
+def exchange(workers, rnd, items, rto=0.05, max_retries=30):
+    """One all-reduce of round `rnd`. items: [(chunk_id, per-worker int32
+    lists, e or None for v2, per-worker saturated flags or None)]. Returns
+    {chunk_id: (summed values, OVERFLOW set)}; every worker must receive the
+    same. Rejects a result at another version or exponent; raises
+    TimeoutError if a chunk never completes."""
+    spec = {cid: (vals, e, sat) for cid, vals, e, sat in items}
     results = [dict() for _ in workers]
-    overflowed = set()
 
-    def send(i, w, c, n, resend=False):
-        w.send_chunk(rnd, c, vectors[i][c * MAX_CHUNK:c * MAX_CHUNK + n], resend, e_of(c), sat_of(i, c))
+    def send(i, w, cid, resend=False):
+        vals, e, sat = spec[cid]
+        w.send_chunk(rnd, cid, vals[i], resend, e, bool(sat and sat[i]))
 
     for i, w in enumerate(workers):
-        for c, n in chunks:
-            send(i, w, c, n)
+        for cid in spec:
+            send(i, w, cid)
     deadline, retries = time.monotonic() + rto, 0
-    while any(len(r) < len(chunks) for r in results):
+    while any(len(r) < len(spec) for r in results):
         timeout = max(0.0, deadline - time.monotonic())
         ready, _, _ = select.select([w.sock for w in workers], [], [], timeout)
         for s in ready:
@@ -100,29 +100,37 @@ def allreduce(workers, rnd, vectors, exps=None, saturated=None, rto=0.05, max_re
                     data = s.recv(4096)
                 except BlockingIOError:
                     break
-                job, r, chunk, _, _, flags, values = unpack(data)
-                if not flags & ACK or job != workers[i].job or r != rnd or values is None or chunk >= len(chunks):
+                job, r, cid, _, _, flags, values = unpack(data)
+                if not flags & ACK or job != workers[i].job or r != rnd or values is None or cid not in spec:
                     continue
-                if flags & 0xFFC0 != wire_flags(e_of(chunk), 0):  # version and exponent
-                    raise AssertionError(f"round {rnd} chunk {chunk}: result flags {flags:#06x} at another scale")
-                if flags & OVERFLOW:
-                    if exps is None:
-                        raise OverflowError(f"round {rnd} chunk {chunk} overflowed Q16.16")
-                    overflowed.add(chunk)
-                results[i][chunk] = values
-        if time.monotonic() >= deadline and any(len(r) < len(chunks) for r in results):
+                if flags & 0xFFC0 != wire_flags(spec[cid][1], 0):  # version and exponent
+                    raise AssertionError(f"round {rnd} chunk {cid}: result flags {flags:#06x} at another scale")
+                results[i][cid] = (values, bool(flags & OVERFLOW))
+        if time.monotonic() >= deadline and any(len(r) < len(spec) for r in results):
             retries += 1
             if retries > max_retries:
                 raise TimeoutError(f"round {rnd}: no result after {max_retries} retransmissions")
             for i, w in enumerate(workers):
-                missing = [(c, n) for c, n in chunks if c not in results[i]]
+                missing = [cid for cid in spec if cid not in results[i]]
                 if missing:
                     w.register()
-                for c, n in missing:
-                    send(i, w, c, n, resend=True)
+                for cid in missing:
+                    send(i, w, cid, resend=True)
                     w.resent += 1
             deadline = time.monotonic() + min(rto * (2 ** retries), 1.0)
-    out = [sum((r[c] for c, _ in chunks), []) for r in results]
-    if any(o != out[0] for o in out):
+    if any(r != results[0] for r in results):
         raise AssertionError(f"round {rnd}: workers received different sums")
-    return out[0] if exps is None else (out[0], sorted(overflowed))
+    return results[0]
+
+
+def allreduce(workers, rnd, vectors, rto=0.05, max_retries=30):
+    """v2 (Q16.16) all-reduce of one int32 vector per worker, in 64-value
+    chunks; returns the summed vector. Raises OverflowError on OVERFLOW."""
+    length = len(vectors[0])
+    ids = list(range((length + MAX_CHUNK - 1) // MAX_CHUNK))
+    items = [(c, [v[c * MAX_CHUNK:(c + 1) * MAX_CHUNK] for v in vectors], None, None) for c in ids]
+    res = exchange(workers, rnd, items, rto, max_retries)
+    over = [c for c in ids if res[c][1]]
+    if over:
+        raise OverflowError(f"round {rnd} chunks {over} overflowed Q16.16")
+    return sum((res[c][0] for c in ids), [])

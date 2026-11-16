@@ -180,12 +180,22 @@ C worker therefore takes a fixed exponent (`--frac-bits`). The rule is
 offline-checked against an oracle that sees the current step's data
 (`scripts/quant_study.py`, table in `docs/RESULTS.md`).
 
-*Failure modes.* A sum that grows more than 16x in one step, or a single
-worker's value that is large while the sum is small (+1 and -0.9999), can
-overflow; both are reported (`OVERFLOW`), never summed silently. Recovering
-by re-sending the round under a new key at a lower exponent is not
-implemented: the demo stops loudly instead. It did not trigger in any run
-recorded in `docs/RESULTS.md`.
+*Overflow is decided by the workers, and retried in the same step.* With N
+workers each v3 value is bounded by `INT32_MAX / N` (`scale_rule.worker_limit`),
+so no order of adding N values can overflow an int32 accumulator, and the
+aggregators' own overflow check cannot fire on such traffic. A chunk
+overflows exactly when some worker saturates (a sum that grew more than 16x,
+or one worker's value large while the sum is small, +1 and -0.9999); that
+worker marks its contribution `OVERFLOW`, the result comes back flagged, and
+every worker, having computed the same thing, retries the chunk in the same
+step at `e - 8` under the key `chunk_id | attempt << 24`. A fresh key means no
+slot, tombstone, fallback entry or stored result of the failed attempt can
+match the retry; the failed attempt's slots retire by ACK like any other. Up
+to 9 attempts reach exponent 0; overflow there stops the job. Because the
+decision depends only on each worker's own values, the local reference
+(`adapt`) makes exactly the same retries, and the network path must match it
+bit for bit at every attempt. The C worker uses a fixed exponent and does not
+retry.
 
 ## 3. Admission and validation
 
@@ -624,5 +634,6 @@ are unicast, not multicast; the userspace aggregator has no array mode; the
 parameter server cannot separate partially overlapping aggregates (it waits
 for the remaining workers' fallbacks instead of subtracting per-worker values);
 Q16.16 loses gradients below ~1e-5 (see `docs/RESULTS.md` §Quantization);
-wire v3's per-chunk exponent addresses that for synchronous training, but
-after an `OVERFLOW` result the round is not retried under a new key (§2).
+wire v3's per-chunk exponent addresses that for synchronous training (the
+Python client retries an overflowed chunk in the same step, §2; the
+pipelined C worker uses a fixed exponent and does not).

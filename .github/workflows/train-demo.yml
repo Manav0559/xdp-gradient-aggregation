@@ -86,6 +86,31 @@ jobs:
           print(f"PASS: gradients x1e-4: float {fl}, Q16.16 {q}, per-chunk exponent {ad}; every v3 network path bit-identical to it")
           PY
 
+      - name: Retry after OVERFLOW (gradients x1000 at step 50, wire v3)
+        run: |
+          set -euo pipefail
+          OUT=examples/train_mlp/results/curves_spike.csv
+          rm -f "$OUT"
+          . scripts/train_paths.sh
+          SPIKE="--grad-scale 1e-4 --spike-step 50 --spike-factor 1000"
+          python3 examples/train_mlp/train.py --steps 200 --paths float,adapt $SPIKE --out "$OUT" | tee /tmp/train-local-spike.txt
+          all_paths -spike $SPIKE --net-format v3
+          python3 -c "import json; d=json.load(open('/tmp/xdp-stats.json')); assert d.get('scale_mismatch') == 0 and d.get('overflow', 0) >= 3, d"
+          grep -h "chunks retried after OVERFLOW" /tmp/train-*spike.txt
+          for f in /tmp/train-*spike.txt; do grep -q "chunks retried after OVERFLOW: 3" "$f" || { echo "no in-step retry in $f"; exit 1; }; done
+          python3 - "$OUT" <<'PY'
+          import csv, sys
+          rows = list(csv.DictReader(open(sys.argv[1])))
+          final = {r["config"]: r for r in rows if r["step"] == "200"}
+          print({k: (v["loss"], v["accuracy"], v["retransmissions"]) for k, v in final.items()})
+          net = [r for r in rows if r["bit_identical_to_quant"] != ""]
+          assert net and all(r["bit_identical_to_quant"] == "1" for r in net), "a network path diverged from the local adaptive sum"
+          for cfg in ("noagg-spike", "useragg-spike", "xdp-spike", "xdp-loss5-spike"):
+              assert final[cfg]["loss"] == final["adapt"]["loss"], (cfg, final[cfg], final["adapt"])
+          assert float(final["adapt"]["accuracy"]) >= float(final["float"]["accuracy"]) - 0.01
+          print("PASS: every chunk that overflowed at the spike was retried in-step; every path bit-identical to local adapt")
+          PY
+
       - name: Upload curves
         if: always()
         uses: actions/upload-artifact@v4

@@ -332,11 +332,24 @@ instructions at 64 values per packet (stack 208 to 224 bytes) and from
 throughput tables above come from the v2 program; this change's effect on
 throughput is not analysed here.
 
+**Recovery after OVERFLOW.** `train.py --spike-step 50 --spike-factor 1000`
+multiplies the gradients sent at step 50 by 1,000 and divides the summed
+result by 1,000, so training is unchanged while every chunk saturates at its
+exponent. Each chunk comes back `OVERFLOW` and is retried in the same step at
+`e - 8` under a new key (`docs/DESIGN_NOTES.md` §2). Locally through the
+userspace aggregator and PS (200 steps): 3 chunks retried, final 0.3560 /
+0.989, bit-identical to local `adapt`; both servers counted 3 overflows and
+no `scale_mismatch`. `tests/test_scaled.py` runs a 40-step version. The
+training workflow runs it on the kernel ("Retry after OVERFLOW"; run ID in
+`docs/OVERNIGHT_LOG.md`). Each worker's v3 values are now bounded by
+`INT32_MAX / N`; re-running the local S = 1e-4 paths after that change gives
+the same final loss to six digits, so the table above stands.
+
 **Scope.** One small model, synchronous rounds, one exponent per 64-value
 chunk. On the kernel, v3 was exercised by the Python client; the C worker's
-`--frac-bits` mode is tested only through the userspace aggregator and PS. Not shown: models whose gradients change scale faster than 16x per
-step, recovery after an `OVERFLOW` result (not implemented; the demo stops),
-and any effect on throughput.
+`--frac-bits` mode is tested only through the userspace aggregator and PS,
+and it does not retry. Not shown: gradients that change scale by more than
+16x per step other than the forced spike, and any effect on throughput.
 
 ## Benchmark-lite: first XDP measurements (open loop, two namespaces, `xdpgeneric`)
 

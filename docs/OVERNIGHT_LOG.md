@@ -638,3 +638,38 @@ mode is not exercised on the kernel.
 
 Next step: CI green on the fix; then stop. Stage 3 (retry after OVERFLOW)
 stays open.
+
+CI on `b35240e`: all eight workflows green; bpf-unit 79 cases, 0 failures;
+verifier at 64 values 425,243 insns (stack 224) with the fix, up from
+422,645 at `8212e91`.
+
+## 2026-11-16 (afternoon; time per commit) — Stage 3: in-step retry after OVERFLOW
+
+On the user's "continue on xdp project".
+
+- Order-independence first: with N workers each v3 value is now bounded by
+  INT32_MAX // N (`scale_rule.worker_limit`), so no order of adding N
+  values overflows an int32 accumulator. Overflow is therefore decided only
+  by each worker's own saturation, which the local `adapt` reference
+  computes identically; without the bound, an aggregator could flag an
+  intermediate overflow whose final sum fits, depending on arrival order.
+- Retry: an overflowed chunk is re-sent in the same step at e - 8 under the
+  key `chunk_id | attempt << 24` (`netsum_client.retry_chunk_id`), so no
+  slot, tombstone or stored result of the failed attempt can match. The
+  client's loop moved into `exchange()` (explicit chunk ids);
+  `allreduce()` is the v2 wrapper over it.
+- `train.py --spike-step K --spike-factor F` forces it. Locally, 200 steps
+  at S = 1e-4 with a x1000 spike at step 50 through agg + PS: 3 chunks
+  retried in both `adapt` and the network path, bit-identical, final
+  0.3560 / 0.989; agg and PS each counted 3 overflows, 0 scale_mismatch.
+  Without a spike the S = 1e-4 local result is unchanged (0.3560 / 0.989,
+  0 retries).
+- Red check: the new test run against the previous commit's train.py fails,
+  but only on the unknown `--spike-step` option, so it is not a meaningful
+  red; the previous code's behaviour is in its source (it raised
+  OverflowError, "retrying under a new key is not implemented").
+- New CI step "Retry after OVERFLOW" in train-demo.yml: noagg, userspace,
+  XDP and XDP + 5% loss with the spike; asserts 3 retried chunks per run,
+  every step bit-identical to local adapt, kernel overflow >= 3.
+
+Next step: push, read the new step's numbers into RESULTS, then stop.

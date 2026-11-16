@@ -13,7 +13,13 @@ so C and Python can never disagree:
   after an OVERFLOW result -> prev_e - OVERFLOW_STEP
 
 So the previous sum lands near 2^(30 - HEADROOM_BITS): a sum may grow
-2^HEADROOM_BITS times between rounds before it overflows."""
+2^HEADROOM_BITS times between rounds before it overflows.
+
+With N workers each value is bounded by worker_limit(N) = INT32_MAX // N, so
+no order of adding N values can overflow an int32 accumulator: overflow is
+decided by each worker's own saturation, identically everywhere. A chunk
+that overflows is retried in the same round at e - OVERFLOW_STEP under the
+key chunk_id | attempt << RETRY_SHIFT (netsum_client.retry_chunk_id)."""
 import math
 
 INT32_MAX = 2**31 - 1
@@ -22,6 +28,7 @@ E_MIN, E_MAX = 0, 63
 HEADROOM_BITS = 4
 EMPTY_STEP = 8
 OVERFLOW_STEP = 8
+MAX_ATTEMPTS = (E_MAX - E_MIN) // OVERFLOW_STEP + 2
 Q16 = 16
 
 
@@ -38,16 +45,25 @@ def next_exponent(prev_sum_ints, prev_e, overflowed=False):
     return clamp_e(prev_e + (30 - HEADROOM_BITS - m.bit_length()))
 
 
-def quantize(x, e):
-    """round(x * 2^e) half away from zero; returns (int32, saturated?)."""
+def worker_limit(n_workers):
+    return INT32_MAX // n_workers
+
+
+def quantize(x, e, limit=None):
+    """round(x * 2^e) half away from zero; returns (int32, saturated?).
+    With `limit`, |value| is bounded by it instead of the int32 range."""
     if x != x:
         return 0, False
     s = math.ldexp(x, e)
-    if s >= INT32_MAX:
-        return INT32_MAX, True
-    if s <= INT32_MIN:
-        return INT32_MIN, True
-    return (int(s + 0.5) if s >= 0 else -int(-s + 0.5)), False
+    hi, lo = (INT32_MAX, INT32_MIN) if limit is None else (limit, -limit)
+    if s >= hi:
+        return hi, True
+    if s <= lo:
+        return lo, True
+    q = int(s + 0.5) if s >= 0 else -int(-s + 0.5)
+    if q > hi or q < lo:
+        return (hi if q > 0 else lo), True
+    return q, False
 
 
 def dequantize(v, e):
