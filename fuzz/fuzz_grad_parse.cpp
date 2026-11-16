@@ -16,7 +16,7 @@ std::uint64_t g_inputs, g_accepted;
 
 struct ref_result {
     int verdict;
-    unsigned worker_id, num_workers, chunk_len, kind;
+    unsigned worker_id, num_workers, chunk_len, kind, frac;
 };
 
 unsigned be16(const std::uint8_t *p) { return (unsigned)p[0] << 8 | p[1]; }
@@ -31,9 +31,10 @@ ref_result ref_parse(const std::uint8_t *d, std::size_t n)
     r.chunk_len = be16(d + 16);
     unsigned flags = be16(d + 18);
     unsigned version = flags >> 12, bits = flags & 0x3F;
-    bool v2 = version == 2;
-    if (version != 0 && version != 2) { r.verdict = NETSUM_REJ_VERSION; return r; }
-    if ((version == 0 && flags != 0) || (flags & 0x0FC0)) { r.verdict = NETSUM_REJ_RESERVED_FLAGS; return r; }
+    bool v3 = version == 3, v2 = version == 2 || v3;
+    if (version != 0 && !v2) { r.verdict = NETSUM_REJ_VERSION; return r; }
+    if ((version == 0 && flags != 0) || (version == 2 && (flags & 0x0FC0))) { r.verdict = NETSUM_REJ_RESERVED_FLAGS; return r; }
+    r.frac = v3 ? (flags >> 6) & 63 : 16;
     if (r.num_workers < 1 || r.num_workers > 256) { r.verdict = NETSUM_REJ_NUM_WORKERS; return r; }
     bool aggregate_id = r.worker_id == 0xFFFF;
     if (aggregate_id && !v2) { r.verdict = NETSUM_REJ_WORKER_ID; return r; }
@@ -48,7 +49,7 @@ ref_result ref_parse(const std::uint8_t *d, std::size_t n)
         if (bits & (RESEND | FALLBACK)) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }
         r.kind = (bits & PARTIAL) ? NETSUM_KIND_PARTIAL : NETSUM_KIND_AGGREGATE;
     } else {
-        if (bits & (PARTIAL | OVERFLOW)) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }
+        if ((bits & PARTIAL) || ((bits & OVERFLOW) && !v3)) { r.verdict = NETSUM_REJ_FLAG_COMBO; return r; }
         if (r.worker_id >= r.num_workers) { r.verdict = NETSUM_REJ_WORKER_ID; return r; }
         r.kind = NETSUM_KIND_RAW;
     }
@@ -82,7 +83,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data, std::size_t size
     ref_result want = ref_parse(buf, size);
     bool fields_differ = got == NETSUM_OK &&
         (p.worker_id != want.worker_id || p.num_workers != want.num_workers ||
-         p.chunk_len != want.chunk_len || p.kind != want.kind);
+         p.chunk_len != want.chunk_len || p.kind != want.kind || p.frac_bits != want.frac);
     if (got != want.verdict || fields_differ) {
         std::fprintf(stderr, "DIVERGENCE on %zu-byte input: netsum_parse=%d reference=%d\n",
                      size, got, want.verdict);

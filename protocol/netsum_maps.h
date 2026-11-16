@@ -44,11 +44,12 @@ struct grad_slot {
     uint8_t state;            /* enum netsum_slot_state */
     uint8_t overflowed;       /* sticky: some lane overflowed */
     uint8_t charged;          /* holds one unit of its job's quota */
-    uint8_t _pad0;
+    uint8_t frac_bits;        /* exponent every contribution must share (16 for v1/v2) */
     uint16_t fanin;
     uint16_t chunk_len;
     uint16_t contributors;
-    uint16_t _pad1;
+    uint8_t version;          /* wire version of the first contribution; outputs reuse it */
+    uint8_t _pad1;
     uint64_t last_touched_ns; /* bpf_ktime_get_ns() (CLOCK_MONOTONIC) */
     uint8_t bitmap[NETSUM_BITMAP_BYTES];
     int32_t sum[NETSUM_MAX_CHUNK_LEN];

@@ -164,7 +164,7 @@ row = {
     "xdp_tx_aggregate": xdp.get("tx_aggregate", 0), "xdp_tx_fallback": xdp.get("tx_fallback", 0),
     "xdp_ack_seen": xdp.get("ack_seen", 0),
     "xdp_terminal": sum(xdp.get(k, 0) for k in xdp if k.startswith("rej_") and k != "rej_ttl") + sum(xdp.get(k, 0) for k in (
-        "accepted", "duplicate", "resend_duplicate", "late_duplicate", "num_workers_mismatch", "chunk_len_mismatch",
+        "accepted", "duplicate", "resend_duplicate", "late_duplicate", "num_workers_mismatch", "chunk_len_mismatch", "scale_mismatch",
         "tx_fallback", "tx_result_resend", "drop_quota", "drop_map_full", "drop_job_table_full", "pass_control", "ack_seen")),
     "net_rx_softirqs_by_cpu": "|".join(str(x) for x in softirq),
 }

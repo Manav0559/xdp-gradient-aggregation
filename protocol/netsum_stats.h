@@ -27,6 +27,7 @@ enum netsum_stat {
     NS_LATE_DUPLICATE,
     NS_NUM_WORKERS_MISMATCH,
     NS_CHUNK_LEN_MISMATCH,
+    NS_SCALE_MISMATCH,        /* v3 exponent differs from the slot's */
     NS_OVERLAP_REJECTED,      /* aggregate/partial partially overlapping contributors held */
     NS_OVERLAP_SUBSET,        /* aggregate/partial whose contributors are all held: dropped */
     NS_OVERLAP_SUPERSET,      /* aggregate/partial covering everything held: replaces it */
@@ -59,7 +60,7 @@ static const char *const netsum_stat_names[NS_STAT__COUNT] = {
     "rej_short_hdr", "rej_chunk_len_max", "rej_chunk_len_zero", "rej_truncated",
     "rej_num_workers", "rej_worker_id", "rej_version", "rej_reserved_flags",
     "rej_flag_combo", "rej_udp_len", "rej_ttl", "rej_kind", "accepted", "duplicate",
-    "resend_duplicate", "late_duplicate", "num_workers_mismatch", "chunk_len_mismatch",
+    "resend_duplicate", "late_duplicate", "num_workers_mismatch", "chunk_len_mismatch", "scale_mismatch",
     "overlap_rejected", "overlap_subset", "overlap_superset", "aggregate_conflict", "slot_created", "slot_completed",
     "slot_retired_ack", "slot_retired_ttl", "slot_reaped", "slot_flushed_partial",
     "fallback_collision", "fallback_quota", "drop_quota", "drop_map_full",

@@ -7,13 +7,12 @@ on a raw contribution) instead of reporting a wrong sum.
 Run: python3 tests/test_scaled.py (after `make`)."""
 import os
 import re
-import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from netsum_packets import grad_packet, send  # noqa: E402
 from test_correctness import AGG, PARAMSERVER, Server, free_port  # noqa: E402
-from test_protocol_v2 import EXPECTED_FAIL, expect_fail  # noqa: E402
+from test_protocol_v2 import EXPECTED_FAIL  # noqa: E402
 from test_reliability import ACK, OVERFLOW, Endpoint, bitmap, stats_all  # noqa: E402
 
 V3 = 3 << 12
@@ -44,16 +43,14 @@ def run_ps(steps):
     return ps.text(), st
 
 
-@expect_fail("S1")
 def test_s1_paramserver_sums_v3_at_a_fine_scale():
     # 3 x 1e-6 at e = 40 is exactly 1099512 each (round(1e-6 * 2^40))
     q = 1099512
-    text, st = run_ps([lambda p: raw(p, 900, w, 3, [q, -q], 40) for w in range(3)])
+    text, st = run_ps([lambda p, w=w: raw(p, 900, w, 3, [q, -q], 40) for w in range(3)])
     sums = complete_lines(text, 900)
     assert len(sums) == 1 and abs(float(sums[0]) - 3 * q / 2**40) < 1e-12, text
 
 
-@expect_fail("S1")
 def test_s1_scale_disagreement_is_rejected():
     text, st = run_ps([lambda p: raw(p, 901, 0, 2, [1 << 20], 20),
                        lambda p: raw(p, 901, 1, 2, [1 << 24], 24),
@@ -63,14 +60,12 @@ def test_s1_scale_disagreement_is_rejected():
     assert len(sums) == 1 and float(sums[0]) == 2.0, text
 
 
-@expect_fail("S1")
 def test_s1_worker_saturation_is_reported_not_summed():
     text, st = run_ps([lambda p: raw(p, 902, 0, 2, [2**31 - 1], 30, OVERFLOW),
                        lambda p: raw(p, 902, 1, 2, [5], 30)])
     assert complete_lines(text, 902) == [] and "[overflow] job=902" in text, text
 
 
-@expect_fail("S1")
 def test_s1_aggregator_and_results_keep_the_exponent():
     ps_port, agg_port = free_port(), free_port()
     agg = Server([AGG, str(agg_port), "127.0.0.1", str(ps_port)])
@@ -95,7 +90,6 @@ def test_s1_aggregator_and_results_keep_the_exponent():
     assert ast.get("slot_retired_ack") == 1, ast
 
 
-@expect_fail("S1")
 def test_s1_aggregator_rejects_scale_disagreement():
     ps_port, agg_port = free_port(), free_port()
     agg = Server([AGG, str(agg_port), "127.0.0.1", str(ps_port)])

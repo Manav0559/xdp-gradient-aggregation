@@ -83,8 +83,9 @@ struct {
 struct grad_slot_init {
     uint32_t lock_placeholder;
     struct grad_slot_key tag;
-    uint8_t state, overflowed, charged, _pad0;
-    uint16_t fanin, chunk_len, contributors, _pad1;
+    uint8_t state, overflowed, charged, frac_bits;
+    uint16_t fanin, chunk_len, contributors;
+    uint8_t version, _pad1;
     uint64_t last_touched_ns;
     uint8_t bitmap[NETSUM_BITMAP_BYTES];
     int32_t sum[NETSUM_MAX_CHUNK_LEN];
@@ -190,6 +191,7 @@ enum outcome {
     OUT_LATE,
     OUT_FANIN_MISMATCH,
     OUT_CHUNK_LEN_MISMATCH,
+    OUT_SCALE_MISMATCH,
 };
 
 /* Copies a slot's sum (and, for v2, its contributor bitmap) into the packet.
@@ -321,7 +323,7 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
     uint16_t chunk_len = p.chunk_len;
     if (chunk_len > NETSUM_MAX_CHUNK_LEN)
         return XDP_DROP; /* already guaranteed by the parser; bounds it for the verifier */
-    int v2 = p.version == NETSUM_VERSION_V2;
+    int v2 = p.has_trailer; /* v2 and v3 share the trailer, RESEND and FALLBACK */
     int resend = (p.flags & NETSUM_F_RESEND) != 0;
 
     struct grad_slot_key key = {p.job_id, p.round, p.chunk_id};
@@ -336,6 +338,7 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
     int32_t *values = (int32_t *)((uint8_t *)payload + NETSUM_HDR_SIZE);
     int release_quota = 0, overflowed = 0, copy_out = 0;
     uint16_t fanin = 0, agg_flags = 0;
+    uint8_t out_version = p.version, out_frac = p.frac_bits;
 
     if ((array || fallback_policy) && bpf_map_lookup_elem(&fallback_keys, &key)) {
         outcome = OUT_FALLBACK; /* this key already lives at the PS */
@@ -381,6 +384,8 @@ int netsum_xdp_aggregate(struct xdp_md *ctx)
         tmpl->state = NETSUM_SLOT_ACCUMULATING;
         tmpl->fanin = p.num_workers;
         tmpl->chunk_len = chunk_len;
+        tmpl->frac_bits = p.frac_bits;
+        tmpl->version = p.version;
         tmpl->charged = (uint8_t)charged;
         tmpl->last_touched_ns = now;
         long rc = bpf_map_update_elem(&slot_map, &key, tmpl, BPF_NOEXIST);
@@ -411,6 +416,8 @@ locked:
         slot->state = NETSUM_SLOT_ACCUMULATING;
         slot->fanin = p.num_workers;
         slot->chunk_len = chunk_len;
+        slot->frac_bits = p.frac_bits;
+        slot->version = p.version;
         slot->contributors = 0;
         slot->overflowed = 0;
         slot->charged = 0;
@@ -431,6 +438,8 @@ locked:
         outcome = OUT_FANIN_MISMATCH;
     } else if (chunk_len != slot->chunk_len) {
         outcome = OUT_CHUNK_LEN_MISMATCH;
+    } else if (p.frac_bits != slot->frac_bits) {
+        outcome = OUT_SCALE_MISMATCH;
     } else if (slot->state == NETSUM_SLOT_COMPLETED) {
         if (resend) { /* the aggregate or the PS's result was lost */
             outcome = OUT_RESEND_RESULT;
@@ -466,6 +475,8 @@ locked:
             if (completing)
                 values[i] = (int32_t)netsum_htonl((uint32_t)acc);
         }
+        if (p.flags & NETSUM_F_OVERFLOW) /* a v3 worker's own value saturated */
+            slot->overflowed = 1;
         slot->bitmap[(p.worker_id >> 3) & 31] |= (uint8_t)(1u << (p.worker_id & 7));
         slot->contributors++;
         slot->last_touched_ns = now;
@@ -488,6 +499,8 @@ locked:
         copy_slot_out(slot, values, chunk_len, v2, data_end);
     overflowed = slot->overflowed;
     fanin = slot->fanin;
+    out_version = slot->version;
+    out_frac = slot->frac_bits;
     bpf_spin_unlock(&slot->lock);
 
     if (release_quota)
@@ -511,6 +524,9 @@ locked:
         return XDP_DROP;
     case OUT_CHUNK_LEN_MISMATCH:
         stat_inc(NS_CHUNK_LEN_MISMATCH);
+        return XDP_DROP;
+    case OUT_SCALE_MISMATCH:
+        stat_inc(NS_SCALE_MISMATCH);
         return XDP_DROP;
     case OUT_COMPLETED:
         stat_inc(NS_ACCEPTED);
@@ -560,7 +576,8 @@ forward:
     } else if (v2) {
         h->worker_id = netsum_htons(NETSUM_WORKER_AGGREGATE);
         h->num_workers = netsum_htons(fanin);
-        h->flags = netsum_htons((uint16_t)(NETSUM_FLAGS_V2 | agg_flags | (overflowed ? NETSUM_F_OVERFLOW : 0)));
+        h->flags = netsum_htons(netsum_wire_flags(out_version, out_frac,
+                                                  (uint16_t)(agg_flags | (overflowed ? NETSUM_F_OVERFLOW : 0))));
         stat_inc(agg_flags ? NS_TX_PARTIAL : NS_TX_AGGREGATE);
     } else {
         if (overflowed)
@@ -623,6 +640,7 @@ int netsum_sweep(struct xdp_md *ctx)
     uint64_t now = bpf_ktime_get_ns();
     int action = XDP_PASS, release_quota = 0, overflowed = 0;
     uint16_t fanin = 0, chunk_len = 0;
+    uint8_t version = NETSUM_VERSION_V2, frac_bits = NETSUM_Q_FRAC_BITS;
 
     bpf_spin_lock(&slot->lock);
     if (array)
@@ -637,6 +655,8 @@ int netsum_sweep(struct xdp_md *ctx)
             fanin = slot->fanin;
             chunk_len = slot->chunk_len;
             overflowed = slot->overflowed;
+            version = slot->version == NETSUM_VERSION_V3 ? NETSUM_VERSION_V3 : NETSUM_VERSION_V2;
+            frac_bits = slot->frac_bits;
             if (chunk_len > NETSUM_MAX_CHUNK_LEN)
                 chunk_len = NETSUM_MAX_CHUNK_LEN;
             copy_slot_out(slot, values, chunk_len, 1, data_end);
@@ -661,7 +681,8 @@ int netsum_sweep(struct xdp_md *ctx)
         h->worker_id = netsum_htons(NETSUM_WORKER_AGGREGATE);
         h->num_workers = netsum_htons(fanin);
         h->chunk_len = netsum_htons(chunk_len);
-        h->flags = netsum_htons((uint16_t)(NETSUM_FLAGS_V2 | NETSUM_F_PARTIAL | (overflowed ? NETSUM_F_OVERFLOW : 0)));
+        h->flags = netsum_htons(netsum_wire_flags(version, frac_bits,
+                                                  (uint16_t)(NETSUM_F_PARTIAL | (overflowed ? NETSUM_F_OVERFLOW : 0))));
         stat_inc(NS_SLOT_FLUSHED_PARTIAL);
         stat_inc(NS_TX_PARTIAL);
     }
