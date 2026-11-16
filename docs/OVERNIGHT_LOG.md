@@ -380,3 +380,32 @@ record J2 timeline and H2 resend counts; then 4c (array mode + fallback).
 
 Next step: Phase 7 training demo in CI (train-demo workflow), Phase 8
 quantization study, Phase 9 docs and dashboard.
+
+## 2026-11-16 06:55 IST — Phases 7 and 8
+
+- 7a: multi-chunk vectors are in the reliable worker (`--vector-len`, short
+  last chunk) and the Python client. Deviation: no `[round-complete]` line at
+  the PS, which does not know how many chunks a round has; round completion
+  is measured at the worker (`round_us_*`, `--emit-rounds`), which is the
+  end-to-end number anyway.
+- 7b: NETSUM_MAX_CHUNK_LEN stays 64 (verifier table above: 128 verifies at
+  ~672k insns, 256 exceeds the 1M limit). Neither bpf_loop nor sub-blocks
+  were tried; recorded as future work.
+- 7c: examples/train_mlp (plain Python; NumPy is not installed on the Mac
+  and not needed). train-demo run 43784240658: float / quant / noagg /
+  useragg / xdp / xdp with 5% loss all end at loss 0.355125 (float
+  0.355124), accuracy 0.9889; every network path bit-identical to the local
+  quantized sum at every step; the lossy XDP run needed 492 retransmissions,
+  90 partial flushes and 206 fallbacks and still matched exactly.
+  tests/test_python_client.py: Python packer == C header bytes (3/3).
+- 8: scripts/quant_study.py (15 s, deterministic). Q16.16 underflows 6% of
+  N(0, 1e-4) values (4.4% sum error); ATP x1e8 overflows at fan-in 256 for
+  unit-variance and early MLP gradients; per-chunk exponent best overall.
+  Recommendation (README/RESULTS): next wire-format step is a shared
+  per-chunk exponent agreed one iteration ahead.
+- netsum_to_fixed now rounds half away from zero, saturates, maps NaN to 0
+  (was truncation and UB out of range); unit tests for +-0.5 ULP, limits,
+  +-inf, NaN; the Python quantizer matches it exactly.
+
+Next step: Phase 9 (DESIGN_NOTES reorder and completion, HISTORY.md, README
+rewrite, spec D3/D4/D5, dashboard v2, consistency greps), then final checks.

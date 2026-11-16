@@ -163,6 +163,20 @@ static void test_add_overflow(void)
     CHECK(o == 1, "2 x 20000.0 overflows Q16.16");
 }
 
+static void test_to_fixed(void)
+{
+    const double ulp = 1.0 / 65536.0;
+    CHECK(netsum_to_fixed(0.5 * ulp) == 1, "+0.5 ULP rounds away from zero");
+    CHECK(netsum_to_fixed(-0.5 * ulp) == -1, "-0.5 ULP rounds away from zero");
+    CHECK(netsum_to_fixed(0.49 * ulp) == 0, "< 0.5 ULP rounds to 0");
+    CHECK(netsum_to_fixed(1.4 * ulp) == 1 && netsum_to_fixed(1.6 * ulp) == 2, "nearest");
+    CHECK(netsum_to_fixed(1e9) == 2147483647 && netsum_to_fixed(-1e9) == -2147483647 - 1, "saturates");
+    CHECK(netsum_to_fixed(32767.99999) == 2147483647, "just below the limit saturates after rounding");
+    CHECK(netsum_to_fixed(1.0 / 0.0) == 2147483647 && netsum_to_fixed(-1.0 / 0.0) == -2147483647 - 1, "inf");
+    CHECK(netsum_to_fixed(0.0 / 0.0) == 0, "NaN -> 0");
+    CHECK(netsum_to_fixed(-0.25) == -16384 && netsum_to_fixed(20000.0) == 1310720000, "exact values");
+}
+
 static void test_bitmap(void)
 {
     uint8_t a[NETSUM_BITMAP_BYTES] = {0}, b[NETSUM_BITMAP_BYTES] = {0};
@@ -226,6 +240,7 @@ int main(void)
     test_tombstones();
     test_add_overflow();
     test_bitmap();
+    test_to_fixed();
     test_parse();
     if (failures) {
         fprintf(stderr, "test_slot_table: %d failure(s)\n", failures);

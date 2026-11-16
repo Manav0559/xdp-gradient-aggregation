@@ -36,11 +36,16 @@ CLASSES = 3
 
 
 def quantize(x):
-    """Q16.16, round to nearest, saturate (the worker-side conversion)."""
+    """Q16.16 exactly as netsum_to_fixed(): round half away from zero,
+    saturate at the int32 limits, NaN -> 0."""
     if x != x:
         return 0
-    v = int(round(x * Q))
-    return max(-2**31, min(2**31 - 1, v))
+    s = x * Q
+    if s >= 2147483647.0:
+        return 2147483647
+    if s <= -2147483648.0:
+        return -2147483648
+    return int(s + 0.5) if s >= 0 else -int(-s + 0.5)
 
 
 def make_rings(n_per_class=120, seed=7):

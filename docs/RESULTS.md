@@ -170,6 +170,85 @@ XDP packet accounting balanced in 117/117 trials.
 * Latency comparisons have 5 trials per cell, so the smallest attainable
   p-value is 0.004 before correction.
 
+## Training through NetSum
+
+**Source:** workflow `train-demo.yml`, run 43784240658 (PR head `b6c88a5`),
+three-namespace topology, generic XDP; `examples/train_mlp/results/curves.csv`
+is that run's artifact. Method: `examples/train_mlp/README.md`.
+
+A 2-24-3 MLP (147 parameters, three chunks per gradient) trained for 200
+steps of synchronous data-parallel SGD over 4 workers:
+
+| path | final loss | final accuracy | retransmissions | summed gradient identical to local quantized sum |
+|---|---:|---:|---:|---|
+| float (local reference) | 0.355124 | 0.9889 | - | - |
+| quant (local Q16.16) | 0.355125 | 0.9889 | - | - |
+| noagg (through the PS) | 0.355125 | 0.9889 | 0 | every step |
+| useragg | 0.355125 | 0.9889 | 0 | every step |
+| xdp (generic) | 0.355125 | 0.9889 | 0 | every step |
+| xdp with 5% loss on the workers' link | 0.355125 | 0.9889 | 492 | every step |
+
+Integer sums are exact, so all four network paths produced **bit-identical
+weights** to the local quantized run, including the lossy one: the
+aggregator flushed 90 partials, forwarded 206 contributions to the PS as
+fallbacks and re-sent 17 results, and the PS merged everything without a
+single double-counted or missing worker. Q16.16 quantization moved the final
+loss by 1e-6 against float. (XDP counters for the whole job: 6,382 packets =
+4,828 accepted + 90 resend duplicates + 1 late duplicate + 206 fallbacks + 17
+result re-sends + 1,240 ACKs.)
+
+## Quantization formats
+
+**Source:** `python3 scripts/quant_study.py --out bench/v2` (deterministic,
+seed 1234; plain Python, runs in ~15 s anywhere). Data:
+`bench/v2/quant_formats.csv`, `bench/v2/quant_training.csv`.
+
+Relative L2 error of the summed vector against the exact float64 sum, with
+the fraction of 64-value chunks that overflowed int32 where non-zero, and the
+fraction of non-zero inputs Q16.16 rounds to 0:
+
+| data | fan-in | Q16.16 | ATP x1e8 | block exponent | float32 | Q16.16 underflow |
+|---|---:|---:|---:|---:|---:|---:|
+| gauss_1e-4 | 8 | 4.320e-02 | 2.682e-05 | 5.020e-09 | 5.722e-08 | 6.32% |
+| gauss_1e-4 | 256 | 4.406e-02 | 2.745e-05 | 1.647e-07 | 2.992e-07 | 6.05% |
+| gauss_1e-2 | 8 | 4.297e-04 | 2.699e-07 | 5.731e-09 | 5.942e-08 | 0.05% |
+| gauss_1e-2 | 256 | 4.412e-04 | 2.928e-07 | 2.074e-07 | 2.921e-07 | 0.07% |
+| gauss_1 | 8 | 4.663e-06 | 3.143e-09 | 4.734e-09 | 6.437e-08 | 0.00% |
+| gauss_1 | 256 | 4.489e-06 | 1.168e+00 (ovf 100%) | 2.218e-07 | 2.858e-07 | 0.00% |
+| student_t3 | 8 | 2.534e-04 | 1.659e-07 | 1.369e-08 | 5.886e-08 | 0.06% |
+| student_t3 | 256 | 2.665e-04 | 1.762e-07 | 1.652e-06 | 2.818e-07 | 0.05% |
+| mlp_step0 | 8 | 5.508e-05 | 3.406e-08 | 2.671e-09 | 4.271e-08 | 0.00% |
+| mlp_step0 | 256 | 5.508e-05 | 1.010e+00 (ovf 67%) | 8.425e-08 | 9.707e-07 | 0.00% |
+| mlp_step150 | 8 | 4.180e-04 | 2.364e-07 | 6.038e-09 | 4.636e-08 | 0.00% |
+| mlp_step150 | 256 | 4.180e-04 | 2.364e-07 | 2.079e-07 | 7.905e-07 | 0.00% |
+
+Training the demo MLP for 200 steps with each format gives the same final
+loss to within 1e-6 (0.355124-0.355125, accuracy 0.9889 for all).
+
+* **Q16.16** (NetSum's format) has a fixed resolution of 2^-16 = 1.5e-5. It
+  is accurate for gradients around 1e-2 or larger (error ~4e-4) and for this
+  small model, but for gradients of order 1e-4, common in deep networks, 6% of
+  values round to zero and the sum is 4.4% off. Its range (|sum| < 32,768) is
+  never the problem.
+* **ATP's scaled int32** (x1e8) is far more precise for small values but its
+  range is only |sum| < 21.5: it overflowed every chunk of unit-variance
+  gradients and two thirds of the chunks of the MLP's first-step gradients at
+  fan-in 256. ATP handles this with an overflow flag and a float fallback.
+* **A per-chunk shared exponent** (block floating point) had the smallest
+  error of the integer formats in almost every case (the exception is
+  heavy-tailed data at fan-in 256, where one outlier forces a coarse scale
+  for the whole chunk) and never overflowed,
+  because it picks the scale from the data and the fan-in. On the wire it
+  needs every worker to use the same exponent for a chunk, which takes an
+  agreement step (SwitchML derives it from the previous iteration).
+
+**Recommendation:** keep Q16.16 for now (it is what the kernel program and
+the tests implement, and it is adequate for this demo), but it is the
+weakest point for real models with small gradients. The next wire-format step
+should be a per-chunk shared exponent carried in the header, with the
+exponent agreed one iteration ahead. NetSum already flags overflow, so a
+mis-chosen exponent fails loudly rather than silently.
+
 ## Benchmark-lite: first XDP measurements (open loop, two namespaces, `xdpgeneric`)
 
 **Source:** workflow `bench-lite.yml`, run 43759600920, on PR head `29acb78`

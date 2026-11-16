@@ -103,7 +103,16 @@ NETSUM_INLINE int netsum_add_i32(int32_t *acc, int32_t v) {
  * integer arithmetic with no float instructions anywhere in the kernel
  * path. */
 static inline int32_t netsum_to_fixed(double v) {
-    return (int32_t)(v * (double)(1 << NETSUM_Q_FRAC_BITS));
+    /* Round half away from zero; saturate instead of overflowing (an
+     * out-of-range double -> int32 cast is undefined behaviour); NaN -> 0. */
+    if (v != v)
+        return 0;
+    double s = v * (double)(1 << NETSUM_Q_FRAC_BITS);
+    if (s >= 2147483647.0)
+        return 2147483647;
+    if (s <= -2147483648.0)
+        return -2147483647 - 1;
+    return (int32_t)(s >= 0 ? s + 0.5 : s - 0.5);
 }
 
 static inline double netsum_to_double(int32_t fixed) {
