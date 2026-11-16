@@ -42,12 +42,14 @@ $(BIN_DIR)/agg: userspace_agg/agg.c $(HDRS) | $(BIN_DIR)
 unit: tests/unit/test_slot_table.c $(HDRS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $(BIN_DIR)/test_slot_table tests/unit/test_slot_table.c
 	./$(BIN_DIR)/test_slot_table
+	$(CC) $(CFLAGS) -o $(BIN_DIR)/hdr_dump tests/unit/hdr_dump.c
 
 test: all unit
 	python3 tests/test_correctness.py
 	python3 tests/test_protocol_v2.py
 	python3 tests/test_reliability.py
 	python3 tests/test_fallback.py
+	python3 tests/test_python_client.py
 
 # On Linux with libbpf headers installed, build against the real UAPI and
 # libbpf headers; otherwise use the vendored subset in xdp_agg/bpf_compat.h.
