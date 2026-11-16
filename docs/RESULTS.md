@@ -265,15 +265,77 @@ loss to within 1e-6 (0.355124-0.355125, accuracy 0.9889 for all).
   heavy-tailed data at fan-in 256, where one outlier forces a coarse scale
   for the whole chunk) and never overflowed,
   because it picks the scale from the data and the fan-in. On the wire it
-  needs every worker to use the same exponent for a chunk, which takes an
-  agreement step (SwitchML derives it from the previous iteration).
+  needs every worker to use the same exponent for a chunk; this oracle uses
+  the current step's data from every worker, which no worker has.
 
-**Recommendation:** keep Q16.16 for now (it is what the kernel program and
+**Recommendation (made before wire v3):** keep Q16.16 for now (it is what the kernel program and
 the tests implement, and it is adequate for this demo), but it is the
 weakest point for real models with small gradients. The next wire-format step
 should be a per-chunk shared exponent carried in the header, with the
 exponent agreed one iteration ahead. NetSum already flags overflow, so a
-mis-chosen exponent fails loudly rather than silently.
+mis-chosen exponent fails loudly rather than silently. The next section
+measures that design.
+
+## Per-chunk exponent (wire v3)
+
+**Design:** `docs/DESIGN_NOTES.md` §2. A v3 chunk carries `round(x * 2^e)`;
+each chunk's *e* for step *t* is computed by every worker from step *t-1*'s
+summed int32 values (`examples/train_mlp/scale_rule.py`), so no extra message
+is needed.
+
+**Offline check of the rule** (`python3 scripts/quant_study.py`,
+`bench/v2/quant_scaled_training.csv`, deterministic). The demo MLP is trained
+for 200 steps with every gradient multiplied by S and the learning rate
+divided by S, so float training is unchanged while the values shrink.
+`blockexp` is the oracle that sees the current step's data; `v3lagged` is
+the rule NetSum ships:
+
+| S | float64 | Q16.16 | oracle (blockexp) | v3 rule (lagged) | Q16.16 underflow | v3 underflow |
+|---:|---|---|---|---|---:|---:|
+| 1 | 0.3551 / 0.989 | 0.3551 / 0.989 | 0.3551 / 0.989 | 0.3551 / 0.989 | 0.06% | 0.00% |
+| 1e-3 | 0.3551 / 0.989 | 0.3460 / 0.989 | 0.3551 / 0.989 | 0.3546 / 0.989 | 50.6% | 0.12% |
+| 1e-4 | 0.3551 / 0.989 | 1.0901 / 0.436 | 0.3551 / 0.989 | 0.3560 / 0.989 | 99.9% | 0.45% |
+| 1e-5 | 0.3551 / 0.989 | 1.1908 / 0.333 | 0.3551 / 0.989 | 0.3567 / 0.989 | 100% | 0.55% |
+
+(final loss / accuracy; underflow is the fraction of non-zero inputs that
+quantize to 0.) No chunk overflowed with either per-chunk format. The lagged
+rule keeps float accuracy at every scale; its loss is up to 0.0016 above
+float because it leaves 4 bits of headroom and follows the previous step, so
+about 0.5% of the smallest values in a chunk still round to 0. At S = 1e-3
+Q16.16 happens to end at a lower loss than float, after rounding half the
+values to 0; it is not a better format.
+
+**Through the network** (workflow `train-demo.yml`, run 43817130916, PR head
+`ec7eeaf`, step "Train with small gradients"; data
+`examples/train_mlp/results/curves_scale1e-4.csv`). S = 1e-4, four workers,
+200 synchronous steps:
+
+| path | final loss | accuracy | retransmissions | sum equal to the local v3 sum |
+|---|---:|---:|---:|---|
+| float (local) | 0.355124 | 0.9889 | - | - |
+| Q16.16 (local) | 1.090061 | 0.4361 | - | - |
+| v3 (local) | 0.356032 | 0.9889 | - | - |
+| v3, noagg | 0.356032 | 0.9889 | 0 | every step |
+| v3, userspace aggregation | 0.356032 | 0.9889 | 0 | every step |
+| v3, XDP (generic) | 0.356032 | 0.9889 | 0 | every step |
+| v3, XDP with 5% loss on one worker link | 0.356032 | 0.9889 | 428 | every step |
+
+The kernel counted no `scale_mismatch` and no overflow. In the lossy run it
+flushed 75 partials, forwarded 188 contributions as fallbacks and re-sent 30
+results, all at the chunk's exponent. The same run's v2 step at S = 1
+reproduced the earlier bit-identical result (`curves.csv` is unchanged).
+
+**Cost.** The XDP program's verifier work rose from 335,067 to 422,645
+instructions at 64 values per packet (stack 208 to 224 bytes) and from
+663,811 to 840,360 at 128 (`bpf-unit.yml` run 43816639927,
+`docs/DESIGN_NOTES.md` §6). The benchmarks still send v2 traffic, and the
+throughput tables above come from the v2 program; this change's effect on
+throughput is not analysed here.
+
+**Scope.** One small model, synchronous rounds, one exponent per 64-value
+chunk. Not shown: models whose gradients change scale faster than 16x per
+step, recovery after an `OVERFLOW` result (not implemented; the demo stops),
+and any effect on throughput.
 
 ## Benchmark-lite: first XDP measurements (open loop, two namespaces, `xdpgeneric`)
 

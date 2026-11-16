@@ -590,3 +590,34 @@ step: Q16.16 rounds gradients below ~1e-5 to zero.
 
 Next step: stage 1 in protocol/grad_parse.h, agg, paramserver, xdp_agg (with
 bpf-unit cases), worker --frac-bits.
+
+## 2026-11-16 12:03 IST — Wire v3 implemented (stages 1 and 2)
+
+- `f48b926` v3 on every path (parser, PS, userspace aggregator, XDP state
+  machine, forward tail, sweeper); slot records version and exponent in the
+  former padding; `scale_mismatch` counter; v3 raw OVERFLOW. Version 3 is
+  no longer the unknown-version example (now 4) in the unit test, bpf-unit,
+  `bad_version.bin` and the fuzz reference; corpus regenerated (36 seeds).
+  Mistake: I put the new BPF cases above the `sweep()` they call; CI
+  failed to compile the harness; fixed in `6612ef9`. Also a test of mine
+  captured a loop variable late (all packets from worker 2); fixed before
+  commit.
+- `8212e91` reliable C worker `--frac-bits`. bpf-unit run 43816639927:
+  77 cases pass on both builds. Verifier at 64 values 422,645 insns / stack
+  224 (was 335,067 / 208); 128 values 840,360 (was 663,811); 256 rejected.
+- `ec7eeaf` Python client v3 + train.py `adapt` path, `--net-format v3`,
+  `--grad-scale`. train-demo run 43817130916: at S = 1e-4 every v3 path
+  (noagg, useragg, XDP, XDP + 5% loss with 428 retransmissions) is
+  bit-identical to local adapt (0.356032 / 0.9889); Q16.16 1.090061 /
+  0.4361; float 0.355124 / 0.9889. The v2 step at S = 1 is unchanged.
+- `scripts/quant_study.py` now has the shipping lagged rule next to the
+  oracle (`bench/v2/quant_scaled_training.csv`); it reproduces the earlier
+  scratch simulation digit for digit, so every number quoted at 08:xx now
+  has a committed source. Existing quant CSVs byte-identical.
+- Docs: DESIGN_NOTES §1-§3, §6, §16; RESULTS new section; README. Removed
+  the RESULTS parenthetical describing how SwitchML picks its exponent: I
+  could not verify it, so the text now describes only NetSum's own rule.
+
+Next step: commit docs, wait for bench/bench-lite on the PR (they run the
+new program with v2 traffic), then stage 3 (retry under a new key after
+OVERFLOW) only if time allows; otherwise record it as open.

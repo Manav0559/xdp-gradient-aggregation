@@ -33,8 +33,9 @@ runners over veth. **It is not a line-rate system;** see
                                   netsum-ctl: attach, config, stats, slots, sweep (TTL)
 ```
 
-Every packet is a 20-byte header, up to 64 Q16.16 values, and (in v2) a
-32-byte contributor bitmap. Packet kinds: raw contribution, RESEND, FALLBACK
+Every packet is a 20-byte header, up to 64 int32 values (Q16.16, or on v3
+`round(x * 2^e)` with a per-chunk exponent *e* in the header), and (in v2
+and v3) a 32-byte contributor bitmap. Packet kinds: raw contribution, RESEND, FALLBACK
 (a contribution the aggregator passed through), PARTIAL (a flushed incomplete
 sum), aggregate, ACK (the result) and REGISTER. A slot moves
 `EMPTY -> ACCUMULATING -> COMPLETED -> EMPTY` (or `-> FLUSHED -> EMPTY`).
@@ -113,8 +114,10 @@ Ratios of medians with bootstrap 95% CIs; permutation tests, Holm-corrected
   and through XDP with 5% packet loss, ends with weights bit-identical to the
   local quantized all-reduce and within 1e-6 loss of float training.
 * **Quantization:** Q16.16 loses gradients below ~1e-5 (6% of N(0, 1e-4)
-  values round to zero); a per-chunk shared exponent is the recommended next
-  wire format.
+  values round to zero). Wire v3 adds a per-chunk exponent that workers agree
+  on from the previous step's result: with every gradient scaled by 1e-4,
+  Q16.16 training ends at 0.436 accuracy and v3 at 0.989 (float: 0.989),
+  bit-identical across noagg, userspace and XDP, with and without 5% loss.
 
 Not shown: physical NICs, native XDP on hardware, multi-host topologies,
 line rate. The environment is a shared VM and veth is a software device.

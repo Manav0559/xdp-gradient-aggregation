@@ -7,9 +7,11 @@ Formats
   atp1e8   ATP's scaled int32 (NSDI'21 §3.8): round(x * 1e8), int32
   blockexp per-chunk shared exponent (block floating point, as in SwitchML):
            scale = 2^e with e chosen from the chunk's max |x| and the fan-in so
-           the int32 sum cannot overflow. Offline only: on the wire every
-           worker must use the same e for a chunk, which needs an agreement
-           step NetSum does not have.
+           the int32 sum cannot overflow. An oracle: it needs this step's
+           data from every worker before anyone quantizes.
+  v3lagged wire v3's rule (examples/train_mlp/scale_rule.py): e for a chunk
+           follows the previous step's summed int32 values, which every worker
+           already has, so no agreement step is needed (training table only).
   float32  IEEE single precision summed in float32 (the usual all-reduce)
 
 Data: synthetic N(0, sigma^2) for sigma in {1e-4, 1e-2, 1}, Student-t (nu=3)
@@ -20,7 +22,9 @@ Metrics per (format, data, fan-in N in {2, 8, 32, 256}): relative L2 error of
 the summed vector against the exact float64 sum; the fraction of non-zero
 inputs that quantize to 0 (underflow); the fraction of 64-value chunks with
 an int32 overflow in the sum. Then the training demo is rerun with each
-format and its final loss and accuracy compared.
+format and its final loss and accuracy compared, and again with every
+gradient multiplied by S in {1, 1e-3, 1e-4, 1e-5} (learning rate / S, so the
+float curve is unchanged) to compare Q16.16, the oracle and v3lagged.
 
 Usage: quant_study.py [--out bench/v2] [--quick]"""
 import argparse
@@ -33,6 +37,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "examples", "train_mlp"))
+import scale_rule  # noqa: E402
 import train as mlp  # noqa: E402
 
 I32_MIN, I32_MAX = -2**31, 2**31 - 1
@@ -135,6 +140,44 @@ def train_with(fmt, steps):
     return mlp.loss_acc(p, data)
 
 
+def train_scaled(fmt, gscale, steps):
+    """Final (loss, accuracy, overflowed chunks, underflow fraction) of the
+    demo MLP with gradients x gscale and learning rate / gscale."""
+    data = mlp.make_rings()
+    shards = [data[i::mlp.WORKERS] for i in range(mlp.WORKERS)]
+    p = mlp.init_params()
+    n_chunks = (len(p) + CHUNK - 1) // CHUNK
+    e = [scale_rule.Q16] * n_chunks
+    ovf = under = nonzero = 0
+    for _ in range(steps):
+        grads = [[g * gscale for g in mlp.gradient(p, shards[i])] for i in range(mlp.WORKERS)]
+        if fmt == "float64":
+            agg = [sum(c) for c in zip(*grads)]
+        elif fmt != "v3lagged":
+            agg, u, nz, o, _ = aggregate(fmt, grads)
+            under, nonzero, ovf = under + u, nonzero + nz, ovf + o
+        else:
+            agg = [0.0] * len(p)
+            for c in range(n_chunks):
+                lanes = range(c * CHUNK, min(len(p), (c + 1) * CHUNK))
+                ints, saturated = [0] * len(lanes), False
+                for g in grads:
+                    for k, i in enumerate(lanes):
+                        q, st = scale_rule.quantize(g[i], e[c])
+                        saturated |= st
+                        nonzero += g[i] != 0
+                        under += g[i] != 0 and q == 0
+                        ints[k] += q
+                over = saturated or any(v > I32_MAX or v < I32_MIN for v in ints)
+                ovf += over
+                for k, i in enumerate(lanes):
+                    agg[i] = scale_rule.dequantize(ints[k], e[c])
+                e[c] = scale_rule.next_exponent(ints, e[c], overflowed=over)
+        p = [w - (0.5 / gscale) * a / mlp.WORKERS for w, a in zip(p, agg)]
+    loss, acc = mlp.loss_acc(p, data)
+    return loss, acc, ovf, (under / nonzero if nonzero else 0.0)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=os.path.join(ROOT, "bench", "v2"))
@@ -171,10 +214,21 @@ def main():
         w = csv.DictWriter(fh, fieldnames=list(train_rows[0].keys()))
         w.writeheader()
         w.writerows(train_rows)
+    scaled_rows = []
+    for gscale in (1.0, 1e-3, 1e-4, 1e-5):
+        for fmt in ("float64", "q16", "blockexp", "v3lagged"):
+            loss, acc, ovf, uf = train_scaled(fmt, gscale, steps)
+            scaled_rows.append({"grad_scale": f"{gscale:g}", "format": fmt, "steps": steps,
+                                "final_loss": f"{loss:.6f}", "final_accuracy": f"{acc:.4f}",
+                                "overflowed_chunks": ovf, "underflow_fraction": f"{uf:.4f}"})
+    with open(os.path.join(args.out, "quant_scaled_training.csv"), "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(scaled_rows[0].keys()))
+        w.writeheader()
+        w.writerows(scaled_rows)
     print("data,fanin,format,rel_l2_error,underflow_fraction,overflow_chunk_fraction")
     for r in rows:
         print(",".join(str(v) for v in r.values()))
-    for r in train_rows:
+    for r in train_rows + scaled_rows:
         print(r)
     return 0
 
