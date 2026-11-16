@@ -362,6 +362,16 @@ static void test_state_machine(void)
     const uint8_t *pl = out + 14 + 20 + 8;
     CHECK(get16(pl + 12) == 0 && get16(pl + 14) == 1 && get16(pl + 18) == 0, "v1 aggregate header");
     CHECK((int32_t)get32(pl + 20) == 11, "v1 sum");
+
+    begin("a v2 contribution completing a slot a v1 contribution opened emits a v2 aggregate");
+    send_frame(F(.job = 106, .wid = 0, .nw = 2, .chunk_len = 1, .val = 5, .v1 = 1), out);
+    CHECK(send_frame(F(.job = 106, .wid = 1, .nw = 2, .chunk_len = 1, .val = 6), out) == XDP_TX, "action");
+    check_aggregate_frame(out, 2, 1, 11, 0);
+    CHECK(get16(pl + 18) == NETSUM_FLAGS_V2, "flags 0x%04x", get16(pl + 18));
+    begin("a v2 RESEND flushing a slot a v1 contribution opened emits a v2 PARTIAL");
+    send_frame(F(.job = 107, .wid = 0, .nw = 2, .chunk_len = 1, .val = 5, .v1 = 1), out);
+    CHECK(send_frame(F(.job = 107, .wid = 0, .nw = 2, .chunk_len = 1, .val = 5, .flags = NETSUM_F_RESEND), out) == XDP_TX, "action");
+    CHECK(get16(pl + 18) == (NETSUM_FLAGS_V2 | NETSUM_F_PARTIAL), "flags 0x%04x", get16(pl + 18));
 }
 
 static void test_overflow(void)
