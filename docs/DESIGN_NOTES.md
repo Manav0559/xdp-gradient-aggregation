@@ -130,10 +130,10 @@ worker registration, no values (REGISTER) (52 bytes):
 0030  00 00 00 00
 ```
 
-
 ## 2. Fixed point
 
-Values are Q16.16 in an `int32_t`: the BPF verifier forbids floating point,
+Values are Q16.16 in an `int32_t`. Workers convert with `netsum_to_fixed()`:
+round half away from zero, saturate at the int32 limits, NaN to 0. The BPF verifier forbids floating point,
 and integer addition is exact and order-independent, so every path (noagg,
 userspace aggregation, XDP) produces bit-identical sums for the same inputs.
 Accumulation uses `netsum_add_i32()`, an unsigned add that reports signed
@@ -218,6 +218,28 @@ Measured with `bpftool prog load` in the XDP load-test workflow (`-mcpu=v3`):
 |---|---|---|---|---|
 | v1 (base `f7ea415`) | 6.17 x86_64 | 352 bytes | 110,791 | 38114728912 |
 | v2 Phase 3 (`96548ae`) | 7.0.0-1017-azure x86_64 | 200 bytes | 158,454 | 43758934811 |
+| v2 with array mode (`38ec27d`) | CI runner x86_64 | 208 bytes | 335,067 | 43784550947 |
+
+Adding array mode roughly doubled the instructions the verifier processes:
+the hash-map and array paths reach the shared slot-update code with pointers
+to different maps, so the verifier explores them separately. The sweep
+program processes about 5,000-6,700 instructions (stack 40 bytes).
+
+Packet size (`-DNETSUM_MAX_CHUNK_LEN=N`, `netsum-ctl verify` in `bpf-unit.yml`,
+CI run 43784550947, x86_64; the local 7.0.11 aarch64 kernel gives 332,972 /
+671,690 / rejected):
+
+| values per packet | aggregator insns processed | sweep program | result |
+|---|---|---|---|
+| 64 (default) | 335,067 | 5,132 | accepted |
+| 128 | 663,811 | 7,713 | accepted |
+| 256 | > 1,000,000 | - | rejected: verifier complexity limit |
+
+The default stays 64: 128 fits but leaves little room for future features,
+and larger packets would need `bpf_loop()` or splitting the lane loops into
+fixed sub-blocks. At 256, LLVM also rewrote the array-claim zeroing loop into
+a `memset()` call, which BPF cannot make; an empty `asm volatile` barrier in
+the loop body prevents it.
 
 * The 300-byte `struct grad_slot fresh = {0}` stack local is gone: new slots
   are initialised from a zeroed per-CPU template map (`slot_template`). A
@@ -232,42 +254,6 @@ Measured with `bpftool prog load` in the XDP load-test workflow (`-mcpu=v3`):
   pointer arithmetic.
 * `netsum_parse()` and `netsum_add_i32()` are forced inline: BPF does not
   allow a call while a spin lock is held.
-
-## 10. Fallback
-
-Contributions for one key can reach the parameter server by several paths:
-raw (no aggregator), FALLBACK (an aggregator forwarded a contribution it did
-not aggregate), PARTIAL (an aggregator flushed an incomplete slot) and a
-complete aggregate. Every one of them carries a contributor bitmap, so the PS
-merges by sets and never counts a worker twice:
-
-| Incoming set I vs held set H | Action |
-|---|---|
-| disjoint | add the sum, `H = H u I` |
-| I is a subset of H | drop (`overlap_subset`): nothing new |
-| H is a subset of I | replace H's sum with I's (`overlap_superset`) |
-| any other overlap | reject (`overlap_rejected`); the remaining workers' resends finish the key |
-| key already completed | count `aggregate_conflict` / `late_duplicate` and re-send the stored result |
-
-The superset rule is what keeps loss recovery live. In Scenario J2 the
-sweeper flushes `{0,1}` as a PARTIAL and later retires the FLUSHED slot;
-when the workers retransmit, the aggregator re-creates the slot and completes
-it with `{0,1,2}`. Without the rule the PS rejected that aggregate because it
-overlapped the partial it held, the aggregator re-sent it on every RESEND,
-and the round never completed (bug C14, found by J2 on the CI kernel).
-Integer sums are exact, so replacing is always correct when the incoming
-aggregate covers everything held. A partial overlap could be resolved by
-subtracting per-worker values the PS kept; NetSum does not keep them, and the
-remaining workers' resends, forwarded as fallbacks, complete the key anyway.
-
-## 11. Observability
-
-`protocol/netsum_stats.h` defines one counter enum used by every path. In the
-kernel it indexes a `BPF_MAP_TYPE_PERCPU_ARRAY` incremented with a plain
-`(*v)++` (no atomics, no cross-CPU cache traffic); readers sum across CPUs.
-agg and paramserver keep the same counters in a plain array and print them as
-one `[stats-all]` JSON line on SIGUSR1 and at exit. CI checks exact counter
-deltas per scenario (`ci/check_stat.py`), not "greater than zero".
 
 ## 7. Slot storage
 
@@ -310,6 +296,14 @@ Slot life cycle: `EMPTY -> ACCUMULATING -> COMPLETED -> EMPTY`, plus
 | EMPTY | create ACCUMULATING (quota, job table, capacity checked) | - | - | - | - |
 | ACCUMULATING | add; complete if all workers present | count `duplicate`, drop | count, drop | - | reap (agg `slot_ttl_ms`) |
 | COMPLETED | count `late_duplicate`, drop | count `late_duplicate`, drop | count mismatch, drop | count `late_duplicate`, drop | delete |
+
+In the kernel, tombstones are retired by the PS's ACK (deleted in hash mode,
+reset to EMPTY in array mode) or by the TTL sweeper (§12): an ACCUMULATING
+slot idle past the TTL is flushed to the PS as a PARTIAL and becomes FLUSHED;
+an expired COMPLETED or FLUSHED slot is retired. Retiring on ACK means a
+plain duplicate arriving after the ACK opens a fresh slot, which the sweeper
+reclaims; ATP's switch behaves the same way (it frees aggregators on the
+parameter packet and reclaims stale ones by timestamp).
 
 ## 9. Reliability
 
@@ -367,6 +361,42 @@ aggregator created 149 slots (21 re-opened by resends after a lost result),
 flushed 16 partials, forwarded 42 fallbacks, and every slot was retired by an
 ACK; the PS re-sent 21 results.
 
+## 10. Fallback
+
+Contributions for one key can reach the parameter server by several paths:
+raw (no aggregator), FALLBACK (an aggregator forwarded a contribution it did
+not aggregate), PARTIAL (an aggregator flushed an incomplete slot) and a
+complete aggregate. Every one of them carries a contributor bitmap, so the PS
+merges by sets and never counts a worker twice:
+
+| Incoming set I vs held set H | Action |
+|---|---|
+| disjoint | add the sum, `H = H u I` |
+| I is a subset of H | drop (`overlap_subset`): nothing new |
+| H is a subset of I | replace H's sum with I's (`overlap_superset`) |
+| any other overlap | reject (`overlap_rejected`); the remaining workers' resends finish the key |
+| key already completed | count `aggregate_conflict` / `late_duplicate` and re-send the stored result |
+
+The superset rule is what keeps loss recovery live. In Scenario J2 the
+sweeper flushes `{0,1}` as a PARTIAL and later retires the FLUSHED slot;
+when the workers retransmit, the aggregator re-creates the slot and completes
+it with `{0,1,2}`. Without the rule the PS rejected that aggregate because it
+overlapped the partial it held, the aggregator re-sent it on every RESEND,
+and the round never completed (bug C14, found by J2 on the CI kernel).
+Integer sums are exact, so replacing is always correct when the incoming
+aggregate covers everything held. A partial overlap could be resolved by
+subtracting per-worker values the PS kept; NetSum does not keep them, and the
+remaining workers' resends, forwarded as fallbacks, complete the key anyway.
+
+## 11. Observability
+
+`protocol/netsum_stats.h` defines one counter enum used by every path. In the
+kernel it indexes a `BPF_MAP_TYPE_PERCPU_ARRAY` incremented with a plain
+`(*v)++` (no atomics, no cross-CPU cache traffic); readers sum across CPUs.
+agg and paramserver keep the same counters in a plain array and print them as
+one `[stats-all]` JSON line on SIGUSR1 and at exit. CI checks exact counter
+deltas per scenario (`ci/check_stat.py`), not "greater than zero".
+
 ## 12. Control plane
 
 `ctl/netsum_ctl.c` (`make ctl`, Linux) is the only tool that loads, attaches
@@ -394,23 +424,84 @@ and inspects the program; CI and the benchmarks use nothing else.
   packet or timer, and this keeps the program free of `bpf_timer`.
 * Struct layouts come from `protocol/netsum_maps.h`; there is no second copy.
 
+## 13. Topology
+
+**Correctness scenarios** (`xdp-loadtest.yml`): one veth pair. `veth0`
+(10.200.1.1, root namespace) carries the XDP program; workers and the
+parameter server share namespace `ns1` behind `veth1` (10.200.1.2).
+Aggregates leave with `XDP_TX`, rewritten to the aggregator's own source
+MAC/IP, so no `accept_local` relaxation is needed.
+
+**Benchmark** (`scripts/topo.sh`): three namespaces.
+
+```
+ ns_w (workers)                root ns (aggregator)               ns_ps (parameter server)
+ 10.10.1.2  veth_w1 <------> veth_w0 10.10.1.1
+                             veth_p0 10.10.2.1 <------> veth_p1 10.10.2.2
+```
+
+* The same XDP program and maps are attached to `veth_w0` (gradients from
+  workers) and `veth_p0` (ACKs from the PS). Aggregates, partials and
+  fallbacks are redirected out of `veth_p0` with `bpf_redirect`, addressed
+  from `veth_p0` to `veth_p1`.
+* Results from the PS to the workers, and all noagg traffic, are routed by
+  the root namespace (`ip_forward=1`). Hosts running Docker (GitHub runners)
+  set the iptables FORWARD policy to DROP, so `topo.sh` accepts exactly these
+  two links.
+* Native-mode XDP on veth delivers redirected frames to the peer only if the
+  peer can receive them on its NAPI path; `topo.sh` enables GRO on
+  `veth_p1` (kernel >= 5.13). Verified on 7.0.11 (local) and on the CI
+  kernel 7.0.0-1016-aws, where `netsum-ctl attach --mode native` reported
+  native and the PS received every aggregate.
+* On veth, the receiver's processing (including XDP) runs on the sending
+  CPU: per-CPU NET_RX softirq counts in the v2 benchmark are the same with
+  and without XDP aggregation.
+
 ## 14. Testing strategy
 
-* `tests/test_correctness.py`: end-to-end behaviour of the real binaries.
-* `tests/test_protocol_v2.py`: one regression test per confirmed bug. While
-  a bug is open its test carries `@expect_fail("Cn")`; the runner reports
-  XFAIL, and fails the build on an unexpected pass so the marker is removed
-  in the fixing commit.
-* `tests/unit/test_slot_table.c` (`make unit`): slot table, overflow add,
-  bitmap helpers, parser verdicts.
-* `fuzz/`: libFuzzer + ASan differential test of `netsum_parse()` against a
-  reference parser.
-* `.github/workflows/xdp-loadtest.yml`: scenarios against the real kernel.
-  Scenarios for open bugs assert the bug's symptom while their
-  `NETSUM_EXPECT_RED_*` flag is set, so a script error or an unexpected fix
-  fails the run.
+| Layer | What | Where | Runs |
+|---|---|---|---|
+| Unit (C) | slot table vs a reference (200k random ops), overflow add, Q16.16 conversion edges, parser verdicts | `tests/unit/test_slot_table.c` | `make unit`, CI |
+| Wire format | Python packer == C header bytes | `tests/test_python_client.py` | `make test`, CI |
+| Userspace behaviour | the real binaries over UDP: sums, duplicates, truncation, quota, reaper | `tests/test_correctness.py` | `make test`, CI |
+| Confirmed bugs | one regression test per bug C1-C7 | `tests/test_protocol_v2.py` | `make test`, CI |
+| Reliability | results, ACK retirement, lost results (C13), RESEND table, reliable workers under loss | `tests/test_reliability.py` | `make test`, CI |
+| PS merge rules | partial/fallback/aggregate set rules (C14) | `tests/test_fallback.py` | `make test`, CI |
+| Parser fuzzing | `netsum_parse()` vs a reference parser, ASan | `fuzz/` | `fuzz.yml` |
+| Kernel unit | the loaded program via `BPF_PROG_TEST_RUN`: every verdict, the state x event table, ACK/RESEND/FLUSHED rows, the sweep program, array mode and fallback, quota, overflow edges, TTL, redirect, corpus replay + 5,000 mutations vs the userspace parser; on the system-libbpf and vendored-header builds, whose disassembly must match | `tests/bpf/run_xdp_tests.c` | `bpf-unit.yml` |
+| Kernel end to end | real UDP over veth: Scenarios A-G (sums, adversarial input, config, quota), Q (ACK retirement), J2 (sweeper flush + retransmission + fallback), K-N (bugs C1-C4), H2/I2 (reliable workers under loss and reordering), G2 (fallback policy), P (array mode), O (the sweeper leaves nothing behind); exact counter deltas via `netsum-ctl --json` | `xdp-loadtest.yml`, `ci/` | CI |
+| Control plane | attach, config, stats, sweep, detach on a veth | `ci/test_netsum_ctl.sh` | `xdp-loadtest.yml` |
+| Training | SGD through noagg / userspace / XDP / XDP with loss must be bit-identical to the local quantized all-reduce | `examples/train_mlp/` | `train-demo.yml` |
+
+Bugs are fixed red-first: the test (or the kernel scenario) is committed
+failing for the documented reason, and the fix flips it. Python tests mark
+open bugs with `@expect_fail("Cn")`; the runner fails on an unexpected pass.
 
 ## 15. Benchmark methodology
+
+**v2 (primary, `scripts/bench_v2.sh`, `bench.yml`).** Three-namespace
+topology (§13). Configurations: noagg, userspace aggregation, XDP generic,
+XDP native (only if the kernel reports native attach) and XDP array mode.
+The load generator is the reliable worker, so every configuration returns
+results to the workers and the measured time is end to end. Throughput:
+4,000 rounds of 1,024 values (16 chunks), window 64, 8 trials per cell;
+latency: 2,000 synchronous rounds, 5 trials per cell; 2, 4 and 8 workers.
+Workers are pinned to CPUs 0-1, `agg` to 2, the PS to 3. Each trial starts
+from freshly loaded maps and restarted processes. Recorded per trial: every
+worker's result summary (any wrong or missing result fails the run), XDP
+`run_time_ns / run_cnt`, `agg --profile` algorithm time per packet, on-CPU
+time of agg and PS (`/proc/<pid>/schedstat`), NET_RX softirqs per CPU and
+every counter. Accounting: every packet the XDP program saw must end in
+exactly one outcome counter. Pre-registered tests (written in the log before
+the run): per worker count, xdp-generic and xdp-native vs userspace on
+throughput (family T) and per-trial median round time (family L);
+permutation test on Cliff's delta, Holm within each family, ratio of medians
+with bootstrap CIs. Fairness: three jobs of fan-in 2 with windows 64/32/16
+run concurrently under no policy, a drop quota, a fallback quota and a
+64-slot array; goodput is measured over the window in which all three jobs
+are active; Jain's index over raw goodput and over goodput/demand.
+
+**Benchmark-lite (history).**
 
 **Benchmark-lite** (`scripts/bench_lite.sh`, workflow `bench-lite.yml`) is the
 first measurement of the XDP path. It is deliberately small and runs on the
@@ -464,8 +555,15 @@ correctness topology:
 | C7 | quota failed open after 256 job ids | fixed (free at zero, fail closed) in userspace and kernel |
 | C8 | kernel quota check-then-act race, decrement underflow | fixed (reserve-before-create, saturating CAS) |
 | C9 | forwarded aggregate keeps the worker's source MAC/IP | fixed (source rewritten from config); redirect to another interface supported |
-| C10 | v1 benchmark measured serial process launches | replaced in Phase 3.5 / 6 |
+| C10 | v1 benchmark measured serial process launches | replaced: benchmark-lite, then the closed-loop v2 benchmark |
 | C11 | fuzzer tested copies of the checks | fixed: fuzzes `grad_parse.h`; bpf-unit replays the corpus through the loaded program |
 | C12 | a test that could not fail; CI checks weaker than documented | fixed |
 | C13 | a lost result could never be recovered: the PS ignored late packets for keys it had completed | fixed: the PS re-sends the stored result |
 | C14 | the PS rejected a complete aggregate that covered a partial it held, so a flushed-then-retransmitted round never completed (found by Scenario J2) | fixed: superset replaces, subset is dropped |
+
+Open limitations (not bugs): no authentication of workers (§4); one level of
+aggregation (no ATP rack hierarchy); no ECN/AIMD congestion control; results
+are unicast, not multicast; the userspace aggregator has no array mode; the
+parameter server cannot separate partially overlapping aggregates (it waits
+for the remaining workers' fallbacks instead of subtracting per-worker values);
+Q16.16 loses gradients below ~1e-5 (see `docs/RESULTS.md` §Quantization).

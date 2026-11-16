@@ -409,3 +409,43 @@ quantization study, Phase 9 docs and dashboard.
 
 Next step: Phase 9 (DESIGN_NOTES reorder and completion, HISTORY.md, README
 rewrite, spec D3/D4/D5, dashboard v2, consistency greps), then final checks.
+
+## 2026-11-16 07:20 IST — Phase 9 (documentation)
+
+- Verified against primary sources before writing: ATP paper text (authors,
+  NSDI 2021, §3.5 switch logic incl. hash-indexed aggregators, collision ->
+  forward to PS, parameter packets deallocate; §3.6 end hosts; §3.7 resend
+  flush and timestamp reclamation; §3.8 x1e8 scaling); "Awarded Best Paper!"
+  on the USENIX presentation page; SwitchML authors from its PDF; the 2024 ToN
+  paper's authors, volume, issue, pages and date from Crossref (DOI
+  10.1109/TNET.2024.3387948). DBLP was behind a bot check. The GOAT PDF URL now
+  returns HTML, so the system name "GOAT" could not be re-verified and is not
+  used; the paper is cited by title, authors and venue.
+- README rewritten (pitch with scope, architecture, quick start incl.
+  scripts/demo_local.sh, component table, v2 results with CIs, correctness
+  evidence, ATP relation: reproduced / adapted / not reproduced, layout,
+  history, citations). docs/HISTORY.md with the four stories.
+- DESIGN_NOTES reordered 1-16 with Topology, full Testing strategy, v2
+  method, CI verifier tables (x86 run 43784550947: 335,067 / 663,811 /
+  rejected at 64/128/256 values), kernel reclamation, open limitations.
+- Spec: status box; D3 author list fixed; D4 mechanism rewritten in §1, §2.1,
+  §2.3, §5 table, §9; D5 full citation. Same corrections in
+  PROJECT_SPEC.html; NetSum_Project_Spec.pdf regenerated from it with headless
+  Chrome (the original was printed the same way: Producer Skia/PDF).
+- Comment migration: xdp_agg.c 344 -> 57 comment lines (601 -> 669 total; it
+  now holds two programs and array mode, so the 300-400 target was not met),
+  agg.c 237 -> 39, bpf_compat.h 61 -> 25, grad_proto.h header and helper
+  comments shortened, worker/fuzz/test/ci docstrings trimmed.
+- Dashboard: v2 panels (throughput with CI whiskers + comparison table, p50
+  and p99, ns per packet, fairness + Jain, training curves, environment and
+  caveats) from the committed CSVs; same hand-drawn SVG approach and theme;
+  checked by rendering with headless Chrome (6 charts, 4 stat tiles, no
+  error states). One fix found that way: the CSS uppercases chart titles, so
+  "p50 (µs)" read as "P50 (MS)".
+- Consistency greps: no stale "not benchmarked" text, no "headline
+  contribution" misattribution outside history, no Chiang/Vahdat (md, html,
+  pdf), attribution grep over the whole diff clean. pages.yml left untouched
+  (one stale path in a comment) per the rule on Pages.
+
+Next step: push, confirm every workflow green, final self-check, morning
+report in the PR body and here, then the verdict page.

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NetSum — results dashboard</title>
+<title>NetSum Results</title>
 <style>
   :root {
     color-scheme: light;
@@ -119,189 +119,114 @@
 
   <header class="page">
     <div>
-      <h1><span class="prompt">$</span> netsum — results dashboard <span class="live-dot" aria-hidden="true"></span><span class="live-label">live</span></h1>
+      <h1><span class="prompt">$</span> netsum — results <span class="live-dot" aria-hidden="true"></span><span class="live-label">v2</span></h1>
       <p class="tagline">
-        In-network gradient aggregation on commodity Linux via XDP/eBPF, reproducing
-        <a href="https://www.usenix.org/conference/nsdi21/presentation/lao">ATP</a> (NSDI 2021 Best Paper)
-        without a programmable switch. This page charts real measurements from the userspace
-        benchmark baselines, the real-kernel XDP verification/fuzzing CI results, and multi-tenant
-        fairness — all backed by a real, runnable command in this repo, nothing aspirational.
+        In-network gradient aggregation on commodity Linux with XDP/eBPF, adapting
+        <a href="https://www.usenix.org/conference/nsdi21/presentation/lao">ATP</a> (NSDI 2021).
+        Every chart below is read client-side from CSV files committed under <code>bench/v2/</code> and
+        <code>examples/train_mlp/results/</code>, each produced by a named CI run.
       </p>
       <p class="sub">
-        Renders <code>bench/results.csv</code> directly, client-side, no build step. Regenerate with
-        <code>python3 scripts/benchmark.py</code>, then reload this page. See
-        <a href="../docs/PROJECT_SPEC.md">the full project spec</a> for the research grounding and design.
+        Method, statistics and threats to validity: <a href="../docs/RESULTS.md">docs/RESULTS.md</a>.
+        Design: <a href="../docs/DESIGN_NOTES.md">docs/DESIGN_NOTES.md</a>.
+        The v1 macOS benchmark is kept as <a href="#history">history</a>.
       </p>
     </div>
     <div class="header-actions">
-      <span class="last-updated" id="lastUpdated"></span>
-      <button class="btn" id="refreshBtn" type="button">↻ Refresh</button>
       <button class="btn" id="themeToggle" type="button">Toggle theme</button>
     </div>
   </header>
 
   <div class="stat-row" id="statRow">
-    <div class="loading-state" style="grid-column:1/-1;">Loading summary stats…</div>
+    <div class="loading-state" style="grid-column:1/-1;">Loading summary…</div>
   </div>
 
   <section class="panel">
-    <p class="eyebrow">// 01 · packet reduction</p>
-    <h2>Aggregator-uplink traffic: no-aggregation vs. userspace aggregation</h2>
-    <p class="desc">
-      In <code>noagg</code>, every worker's contribution reaches the parameter server individually.
-      In <code>useragg</code>, the aggregator absorbs every partial contribution (never forwarded — the
-      same <code>XDP_DROP</code> behavior the real kernel program uses, verified on a live Linux kernel
-      in CI) and emits exactly one summed packet once the slot is complete. This is ATP's core
-      mechanism, measured here with the userspace baseline. The N→1 count is a message count by design
-      (N for noagg by construction, 1 for useragg as reported by the aggregator's log), not a timing
-      result; the XDP path has not been benchmarked.
-    </p>
+    <p class="eyebrow">// 01 · throughput</p>
+    <h2>Aggregated gradient values delivered per second, by worker count</h2>
+    <p class="desc">Closed loop, window of 64 chunks, 1,024 values per round, 8 trials per cell. Bars are medians;
+      whiskers are bootstrap 95% confidence intervals over trials.</p>
+    <div class="chart-card"><div id="tpChart"><div class="loading-state">Loading…</div></div><div class="legend" id="tpLegend"></div></div>
+    <div class="table-wrap" id="cmpTable"></div>
+  </section>
+
+  <section class="panel">
+    <p class="eyebrow">// 02 · round time</p>
+    <h2>Round completion time measured at the worker (synchronous rounds)</h2>
+    <p class="desc">2,000 rounds x 5 trials per cell, pooled over workers. p50 with its 95% confidence interval, and p99.</p>
     <div class="chart-grid">
-      <div class="chart-card">
-        <h3>Uplink packets reaching the receiver, by worker count</h3>
-        <div id="packetsChart"><div class="loading-state">Loading…</div></div>
-      </div>
-      <div class="chart-card">
-        <h3>Packet reduction ratio (useragg ÷ noagg)</h3>
-        <div id="reductionChart"><div class="loading-state">Loading…</div></div>
-      </div>
+      <div class="chart-card"><h3>median (p50) round time</h3><div id="p50Chart"><div class="loading-state">Loading…</div></div></div>
+      <div class="chart-card"><h3>p99 round time</h3><div id="p99Chart"><div class="loading-state">Loading…</div></div></div>
     </div>
-    <div class="legend" id="packetsLegend"></div>
+    <div class="legend" id="latLegend"></div>
   </section>
 
   <section class="panel">
-    <p class="eyebrow">// 02 · completion latency</p>
-    <h2>Aggregation-round completion latency</h2>
-    <p class="desc">
-      Median latency (first contribution seen → slot complete, at the node that sums: the parameter
-      server for noagg, the aggregator for useragg), with the observed min–max range as whiskers —
-      measured on this dev machine's loopback interface, not a controlled multi-host testbed.
-      <strong>This mostly measures the benchmark harness, not aggregation:</strong> workers are started
-      one after another as separate processes, so the gap grows by roughly 3 ms per extra worker in
-      both configs, and the aggregator → parameter server hop is not included. It cannot show a
-      speedup either way.
-      <strong>The XDP program is not in this chart.</strong> CI loads it on a real kernel (see §05)
-      to test correctness only, in <code>xdpgeneric</code> mode on a veth pair, and records no timing.
-      Whether XDP lowers latency at all has not been measured. Showing that would require native
-      driver-mode XDP on a real NIC across separate hosts.
-    </p>
-    <div id="latencyChart"><div class="loading-state">Loading…</div></div>
-    <div class="legend" id="latencyLegend"></div>
+    <p class="eyebrow">// 03 · cost per packet</p>
+    <h2>Where the time goes: ns per packet</h2>
+    <p class="desc">XDP: <code>run_time_ns / run_cnt</code> (time inside the BPF program). Userspace: the aggregator's
+      algorithm alone (<code>agg --profile</code>) and its whole on-CPU time per packet including system calls.
+      Not like-for-like: neither includes the receive path before the hook or socket.</p>
+    <div class="chart-card"><div id="costChart"><div class="loading-state">Loading…</div></div><div class="legend" id="costLegend"></div></div>
   </section>
 
   <section class="panel">
-    <p class="eyebrow">// 03 · latency distribution rigor</p>
-    <h2>Percentiles, bootstrap confidence, and significance — not just mean/min/max</h2>
-    <p class="desc">
-      Mean/min/max over a handful of trials is exactly the setup prone to tail-latency effects (the
-      userspace aggregator is explicitly single-threaded — one OS-scheduling gap shows up as a tail
-      outlier, not a shifted mean) and to noise at low trial counts. This panel reads
-      <code>bench/results_percentiles.csv</code> (written by <code>scripts/benchmark.py</code> from the
-      same real per-trial runs as the chart above, now at 30 trials per cell): p50/p95/p99 per config,
-      a bootstrap 95% confidence interval on the median (whiskers on the p50 bars below), and a
-      permutation test — using <a href="https://en.wikipedia.org/wiki/Effect_size#Effect_sizes_based_on_binary_data" target="_blank" rel="noopener">Cliff's delta</a>
-      as a distribution-free effect size, the same quantity a Mann-Whitney U test's statistic reduces to
-      (<code>delta = 2U/(n·m) − 1</code>) — comparing noagg vs. useragg latency at each worker count.
-      Plain Python throughout (resampling loops, no SciPy/NumPy dependency).
-      <strong>Result: no worker count shows a significant difference.</strong> With n = 30 per config,
-      p-values range from 0.38 to 0.85 and every |delta| is ≤ 0.134 (negligible). This run cannot tell
-      the two setups apart, and XDP is not part of the comparison.
-    </p>
+    <p class="eyebrow">// 04 · multi-tenancy</p>
+    <h2>Three jobs with demand 4:2:1 sharing one XDP aggregator</h2>
+    <p class="desc">Goodput (completed rounds/s) per job while all three run. A drop-based per-job quota starves
+      the greedy jobs; ATP-style fallback to the parameter server keeps demand-proportional shares.</p>
     <div class="chart-grid">
-      <div class="chart-card">
-        <h3>noagg — p50 (± 95% CI), p95, p99 by worker count</h3>
-        <div id="latencyPercentilesNoagg"><div class="loading-state">Loading…</div></div>
-      </div>
-      <div class="chart-card">
-        <h3>useragg — p50 (± 95% CI), p95, p99 by worker count</h3>
-        <div id="latencyPercentilesUseragg"><div class="loading-state">Loading…</div></div>
-      </div>
-    </div>
-    <div class="legend" id="latencyPercentilesLegend"></div>
-    <div class="table-wrap">
-      <table class="sig-table">
-        <thead><tr><th>Worker count</th><th>Cliff's delta (useragg vs. noagg)</th><th>Permutation-test p-value</th><th>Significant at α=0.05?</th></tr></thead>
-        <tbody id="sigTableBody"><tr><td colspan="4" style="text-align:center;color:var(--text-muted);">Loading…</td></tr></tbody>
-      </table>
+      <div class="chart-card"><h3>goodput per job (rounds/s)</h3><div id="fairChart"><div class="loading-state">Loading…</div></div><div class="legend" id="fairLegend"></div></div>
+      <div class="chart-card"><h3>fairness and in-network share</h3><div class="table-wrap" id="fairTable"></div></div>
     </div>
   </section>
 
   <section class="panel">
-    <p class="eyebrow">// 04 · multi-tenant fairness — Jain's index</p>
-    <h2>Formal fairness sweep: does the admission quota actually equalize access?</h2>
-    <p class="desc">
-      ATP's own paper title is literally <em>"...for Multi-tenant Learning"</em> — its headline
-      contribution, previously proven here only qualitatively (one test, one greedy job, one rejected
-      round). <code>scripts/fairness_sweep.py</code> drives 3 concurrent synthetic jobs with
-      deliberately uneven concurrent-slot demand (16 / 4 / 8, via the same "worker 1 never sends, so the
-      slot never frees" technique the correctness suite already uses) at a fresh <code>bin/agg</code> for
-      each <code>max_slots_per_job</code> quota value, snapshots each job's live slot-table occupancy via
-      a real SIGUSR1-triggered stats dump, and computes
-      <code>J = (Σxᵢ)² / (n·Σxᵢ²)</code> over each job's <code>concurrent_slots</code> — its actual share
-      of the shared resource at that moment, not its own admitted/attempted ratio (that ratio is
-      trivially 1.0 whenever quota=0, which would make "unlimited" look perfectly fair — the opposite of
-      the point). Every quota's outcome here reran identically across 3 repeats — real, deterministic
-      measurements, not simulated.
-    </p>
-    <div class="chart-grid">
-      <div class="chart-card">
-        <h3>Jain's fairness index vs. admission quota</h3>
-        <div id="fairnessChart"><div class="loading-state">Loading…</div></div>
-      </div>
-      <div class="chart-card">
-        <h3>Per-job concurrent slots held, by quota</h3>
-        <div id="fairnessSlotsChart"><div class="loading-state">Loading…</div></div>
-      </div>
-    </div>
-    <div class="legend" id="fairnessLegend"></div>
+    <p class="eyebrow">// 05 · training</p>
+    <h2>Training loss through every aggregation path</h2>
+    <p class="desc">A 2-24-3 MLP, 4 workers, synchronous SGD. Network paths are bit-identical to the local quantized
+      all-reduce at every step, so their curves coincide; float differs only by quantization error.</p>
+    <div class="chart-card"><div id="trainChart"><div class="loading-state">Loading…</div></div><div class="legend" id="trainLegend"></div></div>
   </section>
 
   <section class="panel">
-    <p class="eyebrow">// 05 · project status</p>
-    <h2>What's built, tested, and pending</h2>
-    <p class="desc">Every checked item below is backed by a real, runnable command in this repo — nothing here is aspirational.</p>
-    <ul class="checklist" id="statusList">
-      <li><span class="tick done">[x]</span><span>Wire protocol (<code>protocol/grad_proto.h</code>) — Q16.16 fixed-point, network byte order, shared by every component</span></li>
-      <li><span class="tick done">[x]</span><span>Worker + parameter server (baseline #1, no-aggregation) — <code>make &amp;&amp; python3 tests/test_correctness.py</code>, 10/10 passing</span></li>
-      <li><span class="tick done">[x]</span><span>Userspace aggregator (baseline #2) — same slot/accumulate/emit algorithm the XDP program will run, packet-reduction verified (N→1)</span></li>
-      <li><span class="tick done">[x]</span><span>Two real bugs found and fixed during testing: duplicate-worker double-counting, and a select()-vs-buffered-I/O race in the test harness itself</span></li>
-      <li><span class="tick done">[x]</span><span>XDP/eBPF kernel program (<code>xdp_agg/xdp_agg.c</code>) — compiles to valid eBPF bytecode (<code>make bpf</code>); a real BPF-stack-limit bug was caught and fixed at this stage</span></li>
-      <li><span class="tick done">[x]</span><span>Independent adversarial code review found 10 confirmed issues (2 critical: an out-of-bounds-write risk in the write-back path, and a missing packet-length check in the userspace baseline) — all fixed and regression-tested, see <a href="../xdp_agg/xdp_agg.c">xdp_agg.c</a>'s header comment for the full list</span></li>
-      <li><span class="tick done">[x]</span><span><strong>Real-kernel verification</strong> — <code>xdp_agg.o</code> loaded on a real Linux kernel in CI (<a href="../.github/workflows/xdp-loadtest.yml">xdp-loadtest.yml</a>), verifier-accepted, and driven with real UDP traffic across a veth pair including every adversarial input; the real verifier rejected the original object over a loop bounds-proof gap codegen alone could never catch — fixed and now green</span></li>
-      <li><span class="tick done">[x]</span><span>Multi-tenant fairness — ATP's actual headline contribution (<em>"...for Multi-tenant Learning"</em>): a per-job admission quota in <code>userspace_agg/agg.c</code> caps concurrently-incomplete slots per <code>job_id</code>, proven to isolate a greedy job from starving others via a dedicated regression test</span></li>
-      <li><span class="tick done">[x]</span><span>Slot-table TTL/reaper — closes the crashed-worker resource leak the fairness quota alone doesn't cover: an incomplete slot with a genuinely dead worker is now evicted after a configurable timeout instead of leaking forever, proven via a dedicated regression test</span></li>
-      <li><span class="tick done">[x]</span><span>Differential fuzz harness (<code>fuzz/</code>) — adversarially searches for divergence between the userspace and XDP admission-check logic instead of relying only on hand-written tests; 133M CI executions, zero crashes, zero divergences found</span></li>
-      <li><span class="tick done">[x]</span><span>Formal Jain's-fairness-index sweep (<code>scripts/fairness_sweep.py</code>) — quantifies the per-job admission quota's actual fairness across 3 concurrent jobs with uneven demand instead of just proving the mechanism fires once, via a real SIGUSR1-driven stats dump added to <code>userspace_agg/agg.c</code></span></li>
-      <li><span class="tick done">[x]</span><span>Latency-distribution rigor (<code>scripts/benchmark.py</code>) — p50/p95/p99, a bootstrap 95% CI on the median, and a permutation test (Cliff's delta effect size) comparing noagg vs. useragg at each worker count, over 30 trials per cell instead of mean/min/max over 10</span></li>
-      <li><span class="tick done">[x]</span><span>Fairness quota ported into the XDP kernel program itself (<code>job_quota_map</code>) — a real, loaded, verifier-accepted greedy job is rejected on its 3rd concurrent slot against a quota of 2 while a second job completes unaffected; a real netem sweep confirms the program still aggregates correctly under 20% packet loss and reordering, and empirically confirms the known no-TTL gap: a slot stuck by permanent packet loss leaks in <code>slot_map</code> rather than silently recovering</span></li>
-      <li><span class="tick pending">[ ]</span><span>A kernel-side TTL/reaper (needs <code>bpf_timer</code>, Linux 5.15+) to close the leak the netem sweep just confirmed, and real per-packet XDP latency numbers via <code>BPF_PROG_TEST_RUN</code></span></li>
-    </ul>
+    <p class="eyebrow">// 06 · environment and caveats</p>
+    <h2>What produced these numbers, and what they cannot show</h2>
+    <div class="table-wrap" id="envTable"><div class="loading-state">Loading…</div></div>
+    <p class="desc">GitHub-hosted runner: a shared 4-vCPU VM. veth is a software device (no NIC, no DMA); generic XDP
+      still allocates an skb; workers, aggregator and parameter server share one host. Relative comparisons within one
+      run are the meaningful output, not absolute packet rates. Nothing here is a line-rate claim.</p>
+  </section>
+
+  <section class="panel" id="history">
+    <p class="eyebrow">// history</p>
+    <h2>v1 (macOS loopback)</h2>
+    <p class="desc">The v1 benchmark launched workers one after another on macOS loopback, so its latency mostly measured
+      process start-up, and it did not include the XDP path. Its data is kept in
+      <code>bench/v1-macos-loopback/</code>; see <a href="../docs/HISTORY.md">docs/HISTORY.md</a>.</p>
   </section>
 
   <footer class="page">
-    Data sources: <code>bench/results.csv</code>, <code>bench/results_percentiles.csv</code>
-    (<code>scripts/benchmark.py</code>) and <code>bench/fairness_results.csv</code>
-    (<code>scripts/fairness_sweep.py</code>), all committed under <code>bench/</code> — this page performs
-    no computation the repo doesn't already do, it only parses and charts what's there.
+    Data: bench/v2/summary_throughput.csv, summary_latency.csv, comparisons.csv, fairness_summary.csv,
+    environment.json (CI run 43765091283) and examples/train_mlp/results/curves.csv (CI run 43784240658).
+    This page computes nothing; it parses and draws those files.
   </footer>
 </div>
-
 <div class="tooltip" id="tooltip"></div>
-
 <script>
 (function () {
   "use strict";
   var root = document.documentElement;
   var toggle = document.getElementById("themeToggle");
-  var saved = localStorage.getItem("netsum-theme");
+  var saved = null;
+  try { saved = localStorage.getItem("netsum-theme"); } catch (e) {}
   if (saved) root.setAttribute("data-theme", saved);
   toggle.addEventListener("click", function () {
     var current = root.getAttribute("data-theme");
     var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-    var effectiveDark = current ? current === "dark" : prefersDark;
-    var next = effectiveDark ? "light" : "dark";
+    var next = (current ? current === "dark" : prefersDark) ? "light" : "dark";
     root.setAttribute("data-theme", next);
-    localStorage.setItem("netsum-theme", next);
+    try { localStorage.setItem("netsum-theme", next); } catch (e) {}
   });
 
   function parseCSV(text) {
@@ -406,205 +331,125 @@
     });
   }
 
-  function loadBenchSection() {
-    fetchCSV("../bench/v1-macos-loopback/results.csv").then(function (data) {
-      var rows = data.rows;
-      if (rows.length === 0) {
-        ["packetsChart", "reductionChart", "latencyChart"].forEach(function (id) {
-          document.getElementById(id).innerHTML = emptyStateHTML("No benchmark data yet", "Run <code>python3 scripts/benchmark.py</code> from the repo root, then reload.");
-        });
-        return;
-      }
-      var workerCounts = Array.from(new Set(rows.map(function (r) { return num(r.num_workers); }))).sort(function(a,b){return a-b;});
-      var byConfig = {};
-      rows.forEach(function (r) {
-        byConfig[r.config] = byConfig[r.config] || {};
-        var nw = num(r.num_workers);
-        byConfig[r.config][nw] = byConfig[r.config][nw] || { latencies: [], uplink: null };
-        byConfig[r.config][nw].latencies.push(num(r.latency_us));
-        byConfig[r.config][nw].uplink = num(r.uplink_packets);
-      });
 
-      var catLabels = workerCounts.map(function (n) { return n + "w"; });
-      var colorFor = { noagg: "var(--series-1)", useragg: "var(--series-2)" };
-      var nameFor = { noagg: "No aggregation", useragg: "Userspace aggregation" };
-      var configs = Object.keys(byConfig).sort();
+  function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  var CONFIGS = ["noagg", "useragg", "xdp-generic", "xdp-native", "xdp-array"];
+  var COLORS = { "noagg": "var(--text-muted)", "useragg": "var(--series-2)", "xdp-generic": "var(--series-1)",
+                 "xdp-native": "var(--series-3)", "xdp-array": "var(--good)" };
+  function byKey(rows, cfg, n) { return rows.filter(function (r) { return r.config === cfg && r.workers === String(n); })[0]; }
+  function table(container, header, rows) {
+    var h = '<table class="sig-table"><thead><tr>' + header.map(function (x) { return "<th>" + x + "</th>"; }).join("") + "</tr></thead><tbody>";
+    rows.forEach(function (r) { h += "<tr>" + r.map(function (x) { return "<td>" + x + "</td>"; }).join("") + "</tr>"; });
+    container.innerHTML = h + "</tbody></table>";
+  }
 
-      var packetSeries = configs.map(function (c) {
-        return { name: nameFor[c] || c, color: colorFor[c] || "var(--series-3)",
-                 values: workerCounts.map(function (nw) { return byConfig[c][nw] ? byConfig[c][nw].uplink : 0; }) };
-      });
-      groupedBarChart(document.getElementById("packetsChart"), { categories: catLabels, series: packetSeries, unit: "packets", width: 520, height: 230 });
-      legendFor(document.getElementById("packetsLegend"), packetSeries);
-
-      if (byConfig.noagg && byConfig.useragg) {
-        var reduction = workerCounts.map(function (nw) {
-          var a = byConfig.noagg[nw], b = byConfig.useragg[nw];
-          return a && b && b.uplink ? a.uplink / b.uplink : 0;
-        });
-        groupedBarChart(document.getElementById("reductionChart"), {
-          categories: catLabels,
-          series: [{ name: "noagg / useragg packets", color: "var(--accent)", values: reduction }],
-          unit: "x fewer packets", width: 520, height: 230,
-        });
-      }
-
-      var latSeries = configs.map(function (c) {
-        return {
-          name: nameFor[c] || c, color: colorFor[c] || "var(--series-3)",
-          values: workerCounts.map(function (nw) { return byConfig[c][nw] ? median(byConfig[c][nw].latencies) : 0; }),
-          whiskers: workerCounts.map(function (nw) {
-            var d = byConfig[c][nw]; if (!d) return null;
-            return { min: Math.min.apply(null, d.latencies), max: Math.max.apply(null, d.latencies) };
-          }),
-        };
-      });
-      groupedBarChart(document.getElementById("latencyChart"), { categories: catLabels, series: latSeries, unit: "us (median, min-max whiskers)", width: 1080, height: 260 });
-      legendFor(document.getElementById("latencyLegend"), latSeries);
-
-      var maxNw = workerCounts[workerCounts.length - 1];
-      var stats = [];
-      if (byConfig.noagg && byConfig.noagg[maxNw] && byConfig.useragg && byConfig.useragg[maxNw]) {
-        var ratio = byConfig.noagg[maxNw].uplink / byConfig.useragg[maxNw].uplink;
-        stats.push({ label: "Packet reduction at " + maxNw + " workers", value: ratio.toFixed(1) + "×",
-                     note: byConfig.noagg[maxNw].uplink + " → " + byConfig.useragg[maxNw].uplink + " packets" });
-        stats.push({ label: "Median latency, " + maxNw + " workers (noagg)", value: fmtInt(median(byConfig.noagg[maxNw].latencies)) + " us" });
-        stats.push({ label: "Median latency, " + maxNw + " workers (useragg)", value: fmtInt(median(byConfig.useragg[maxNw].latencies)) + " us" });
-      }
-      stats.push({ label: "Worker counts benchmarked", value: workerCounts.join(", "), note: rows.length + " total runs recorded" });
-      addStatTiles(stats, "bench");
-    }).catch(function (err) {
-      ["packetsChart", "reductionChart", "latencyChart"].forEach(function (id) {
-        document.getElementById(id).innerHTML = emptyStateHTML("Couldn't load benchmark data", err.message);
-      });
-      console.error(err);
+  function lineChart(container, opts) {
+    var width = 1040, height = 260, m = { top: 20, right: 16, bottom: 28, left: 50 };
+    var pw = width - m.left - m.right, ph = height - m.top - m.bottom;
+    var xmax = 0, ymax = 0;
+    opts.series.forEach(function (s) { s.points.forEach(function (p) { if (p[0] > xmax) xmax = p[0]; if (p[1] > ymax) ymax = p[1]; }); });
+    var ticks = niceTicks(ymax, 4), axisMax = ticks[ticks.length - 1] || 1;
+    function X(v) { return m.left + (v / (xmax || 1)) * pw; }
+    function Y(v) { return m.top + ph - (v / axisMax) * ph; }
+    var svg = svgEl("svg", { viewBox: "0 0 " + width + " " + height, role: "img" });
+    var ul = svgEl("text", { class: "axis-label", x: m.left, y: m.top - 8 }); ul.textContent = opts.unit; svg.appendChild(ul);
+    ticks.forEach(function (t) {
+      svg.appendChild(svgEl("line", { class: "gridline", x1: m.left, x2: width - m.right, y1: Y(t), y2: Y(t) }));
+      var l = svgEl("text", { class: "axis-tick", x: m.left - 8, y: Y(t) + 3, "text-anchor": "end" }); l.textContent = t.toFixed(1); svg.appendChild(l);
     });
-  }
-
-  function loadPercentilesSection() {
-    fetchCSV("../bench/v1-macos-loopback/results_percentiles.csv").then(function (data) {
-      var rows = data.rows;
-      if (rows.length === 0) {
-        ["latencyPercentilesNoagg", "latencyPercentilesUseragg"].forEach(function (id) {
-          document.getElementById(id).innerHTML = emptyStateHTML("No percentile data yet", "Run <code>python3 scripts/benchmark.py</code> from the repo root, then reload.");
-        });
-        document.getElementById("sigTableBody").innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-muted);">No data yet</td></tr>';
-        return;
-      }
-      var workerCounts = Array.from(new Set(rows.map(function (r) { return num(r.num_workers); }))).sort(function (a, b) { return a - b; });
-      var catLabels = workerCounts.map(function (n) { return n + "w"; });
-
-      function buildForConfig(config, containerId) {
-        var byW = {};
-        rows.forEach(function (r) { if (r.config === config) byW[num(r.num_workers)] = r; });
-        var series = [
-          { name: "p50 (median)", color: "var(--series-1)",
-            values: workerCounts.map(function (w) { return byW[w] ? num(byW[w].p50) : 0; }),
-            whiskers: workerCounts.map(function (w) {
-              return byW[w] ? { min: num(byW[w].median_ci95_lo), max: num(byW[w].median_ci95_hi) } : null;
-            }) },
-          { name: "p95", color: "var(--series-2)", values: workerCounts.map(function (w) { return byW[w] ? num(byW[w].p95) : 0; }) },
-          { name: "p99", color: "var(--series-3)", values: workerCounts.map(function (w) { return byW[w] ? num(byW[w].p99) : 0; }) },
-        ];
-        groupedBarChart(document.getElementById(containerId), { categories: catLabels, series: series, unit: "us", width: 520, height: 230 });
-        return series;
-      }
-      var legendSeries = buildForConfig("noagg", "latencyPercentilesNoagg");
-      buildForConfig("useragg", "latencyPercentilesUseragg");
-      legendFor(document.getElementById("latencyPercentilesLegend"), legendSeries);
-
-      var tbody = document.getElementById("sigTableBody");
-      tbody.innerHTML = "";
-      workerCounts.forEach(function (w) {
-        var r = rows.find(function (rr) { return rr.config === "useragg" && num(rr.num_workers) === w; });
-        if (!r) return;
-        var sig = String(r["significant_at_0.05"]).toLowerCase() === "true";
-        var tr = document.createElement("tr");
-        tr.innerHTML = "<td>" + w + "</td><td>" + num(r.cliffs_delta_vs_other_config).toFixed(4) +
-          "</td><td>" + num(r.p_value_vs_other_config).toFixed(4) +
-          '</td><td class="' + (sig ? "yes" : "no") + '">' + (sig ? "yes" : "no") + "</td>";
-        tbody.appendChild(tr);
-      });
-    }).catch(function (err) {
-      ["latencyPercentilesNoagg", "latencyPercentilesUseragg"].forEach(function (id) {
-        document.getElementById(id).innerHTML = emptyStateHTML("Couldn't load percentile data", err.message);
-      });
-      document.getElementById("sigTableBody").innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--critical);">' + err.message + "</td></tr>";
-      console.error(err);
+    [0, xmax / 2, xmax].forEach(function (t) {
+      var l = svgEl("text", { class: "msg-tick", x: X(t), y: m.top + ph + 16, "text-anchor": "middle" }); l.textContent = "step " + Math.round(t); svg.appendChild(l);
     });
-  }
-
-  function loadFairnessSection() {
-    fetchCSV("../bench/v1-macos-loopback/fairness_results.csv").then(function (data) {
-      var rows = data.rows;
-      if (rows.length === 0) {
-        ["fairnessChart", "fairnessSlotsChart"].forEach(function (id) {
-          document.getElementById(id).innerHTML = emptyStateHTML("No fairness-sweep data yet", "Run <code>python3 scripts/fairness_sweep.py</code> from the repo root, then reload.");
-        });
-        return;
-      }
-      var quotas = Array.from(new Set(rows.map(function (r) { return num(r.quota); }))).sort(function (a, b) { return a - b; });
-      var quotaLabels = quotas.map(function (q) { return q === 0 ? "0 (∞)" : String(q); });
-
-      function avgFor(filterFn) {
-        var matched = rows.filter(filterFn);
-        if (matched.length === 0) return 0;
-        return matched.reduce(function (acc, r) { return acc + num(r.jains_index); }, 0) / matched.length;
-      }
-      var jainsByQuota = quotas.map(function (q) { return avgFor(function (r) { return num(r.quota) === q; }); });
-      groupedBarChart(document.getElementById("fairnessChart"), {
-        categories: quotaLabels,
-        series: [{ name: "Jain's fairness index", color: "var(--accent)", values: jainsByQuota }],
-        unit: "J (1/n .. 1.0)", width: 520, height: 230,
-      });
-
-      var jobNames = Array.from(new Set(rows.map(function (r) { return r.job_name; }))).sort();
-      var palette = ["var(--series-1)", "var(--series-2)", "var(--series-3)"];
-      var slotSeries = jobNames.map(function (name, i) {
-        return {
-          name: name, color: palette[i % palette.length],
-          values: quotas.map(function (q) {
-            var matched = rows.filter(function (r) { return num(r.quota) === q && r.job_name === name; });
-            if (matched.length === 0) return 0;
-            return matched.reduce(function (acc, r) { return acc + num(r.concurrent_slots); }, 0) / matched.length;
-          }),
-        };
-      });
-      groupedBarChart(document.getElementById("fairnessSlotsChart"), { categories: quotaLabels, series: slotSeries, unit: "slots held", width: 520, height: 230 });
-      legendFor(document.getElementById("fairnessLegend"), slotSeries);
-
-      var jAtUnlimited = avgFor(function (r) { return num(r.quota) === 0; });
-      var maxJ = Math.max.apply(null, jainsByQuota);
-      var stats = [
-        { label: "Jain's index, quota=0 (unlimited)", value: jAtUnlimited.toFixed(4), note: jobNames.length + " concurrent jobs, uneven demand" },
-        { label: "Jain's index, best quota observed", value: maxJ.toFixed(4) },
-      ];
-      addStatTiles(stats, "fairness");
-    }).catch(function (err) {
-      ["fairnessChart", "fairnessSlotsChart"].forEach(function (id) {
-        document.getElementById(id).innerHTML = emptyStateHTML("Couldn't load fairness-sweep data", err.message);
-      });
-      console.error(err);
+    opts.series.forEach(function (s) {
+      var d = s.points.map(function (p, i) { return (i ? "L" : "M") + X(p[0]).toFixed(1) + "," + Y(p[1]).toFixed(1); }).join(" ");
+      var path = svgEl("path", { d: d, fill: "none", stroke: s.color, "stroke-width": s.width || 2, "stroke-dasharray": s.dash || "" });
+      path.addEventListener("mousemove", function (evt) { var last = s.points[s.points.length - 1]; showTooltip(evt, "<b>" + s.name + "</b><br>final loss " + last[1].toFixed(6)); });
+      path.addEventListener("mouseleave", hideTooltip);
+      svg.appendChild(path);
     });
+    container.innerHTML = ""; container.appendChild(svg);
   }
 
-  addStatTiles([
-    { label: "Correctness tests", value: "10 / 10", note: "python3 tests/test_correctness.py" },
-    { label: "XDP program", value: "verified", note: "loaded + verifier-accepted on a real kernel in CI (xdp-loadtest.yml)" },
-  ], "static");
+  function fail(id, err) { document.getElementById(id).innerHTML = emptyStateHTML("Could not load data", String(err)); }
 
-  loadBenchSection();
-  loadPercentilesSection();
-  loadFairnessSection();
+  fetchCSV("../bench/v2/summary_throughput.csv").then(function (d) {
+    var cats = ["2 workers", "4 workers", "8 workers"], ns = [2, 4, 8];
+    var series = CONFIGS.map(function (cfg) {
+      return { name: cfg, color: COLORS[cfg],
+        values: ns.map(function (n) { var r = byKey(d.rows, cfg, n); return r ? num(r.values_per_s_median) : 0; }),
+        whiskers: ns.map(function (n) { var r = byKey(d.rows, cfg, n); return r ? { min: num(r.values_per_s_ci_lo), max: num(r.values_per_s_ci_hi) } : null; }) };
+    });
+    groupedBarChart(document.getElementById("tpChart"), { categories: cats, series: series, unit: "values/s", width: 1040, height: 260 });
+    legendFor(document.getElementById("tpLegend"), series);
+    var cost = [
+      { name: "XDP program (generic)", color: COLORS["xdp-generic"], values: ns.map(function (n) { return num(byKey(d.rows, "xdp-generic", n).xdp_ns_per_run_median); }) },
+      { name: "XDP program (array)", color: COLORS["xdp-array"], values: ns.map(function (n) { return num(byKey(d.rows, "xdp-array", n).xdp_ns_per_run_median); }) },
+      { name: "agg process, on-CPU per packet", color: COLORS["useragg"], values: ns.map(function (n) { return num(byKey(d.rows, "useragg", n).agg_cpu_ns_per_pkt_median); }) }
+    ];
+    return fetchCSV("../bench/v2/summary_latency.csv").then(function (l) {
+      cost.splice(2, 0, { name: "agg algorithm only (--profile)", color: "var(--critical)",
+        values: ns.map(function (n) { var r = byKey(l.rows, "useragg", n); return r ? num(r.agg_profile_ns_per_pkt) : 0; }) });
+      groupedBarChart(document.getElementById("costChart"), { categories: cats, series: cost, unit: "ns per packet", width: 1040, height: 240 });
+      legendFor(document.getElementById("costLegend"), cost);
+      var lat = function (field, lo, hi) {
+        return CONFIGS.map(function (cfg) {
+          return { name: cfg, color: COLORS[cfg], values: ns.map(function (n) { var r = byKey(l.rows, cfg, n); return r ? num(r[field]) : 0; }),
+            whiskers: lo ? ns.map(function (n) { var r = byKey(l.rows, cfg, n); return r ? { min: num(r[lo]), max: num(r[hi]) } : null; }) : null };
+        });
+      };
+      var p50 = lat("p50_us", "p50_ci_lo", "p50_ci_hi"), p99 = lat("p99_us", "p99_ci_lo", "p99_ci_hi");
+      groupedBarChart(document.getElementById("p50Chart"), { categories: cats, series: p50, unit: "µs" });
+      groupedBarChart(document.getElementById("p99Chart"), { categories: cats, series: p99, unit: "µs" });
+      legendFor(document.getElementById("latLegend"), p50);
+      var g = byKey(d.rows, "xdp-generic", 8), u = byKey(d.rows, "useragg", 8);
+      addStatTiles([
+        { label: "XDP generic vs userspace, 8 workers", value: "+" + ((num(g.values_per_s_median) / num(u.values_per_s_median) - 1) * 100).toFixed(1) + "%", note: "throughput, Holm-corrected p = 0.003" },
+        { label: "XDP program cost", value: Math.round(num(g.xdp_ns_per_run_median)) + " ns", note: "per packet, 8 workers, generic" },
+        { label: "userspace aggregator", value: (num(u.agg_cpu_ns_per_pkt_median) / 1000).toFixed(1) + " µs", note: "CPU per packet incl. syscalls" },
+        { label: "trials", value: "117", note: "every result exact; XDP accounting balanced in all" }
+      ], "v2");
+    });
+  }).catch(function (e) { fail("tpChart", e); });
 
-  var refreshBtn = document.getElementById("refreshBtn");
-  var lastUpdatedEl = document.getElementById("lastUpdated");
-  function markUpdated() {
-    var now = new Date();
-    lastUpdatedEl.textContent = "updated " + now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  }
-  refreshBtn.addEventListener("click", function () { loadBenchSection(); loadPercentilesSection(); loadFairnessSection(); markUpdated(); });
-  markUpdated();
+  fetchCSV("../bench/v2/comparisons.csv").then(function (d) {
+    table(document.getElementById("cmpTable"), ["test", "workers", "config", "ratio vs useragg [95% CI]", "p (Holm)"],
+      d.rows.map(function (r) {
+        var sig = num(r.p_holm) < 0.05;
+        return [r.family === "T_throughput" ? "throughput" : "median round time", r.workers, r.config,
+          num(r.ratio).toFixed(3) + " [" + num(r.ratio_ci_lo).toFixed(3) + ", " + num(r.ratio_ci_hi).toFixed(3) + "]",
+          '<span class="' + (sig ? "yes" : "no") + '">' + num(r.p_holm).toFixed(4) + "</span>"];
+      }));
+  }).catch(function (e) { fail("cmpTable", e); });
+
+  fetchCSV("../bench/v2/fairness_summary.csv").then(function (d) {
+    var cats = d.rows.map(function (r) { return r.policy; });
+    var jobs = [["goodput_job1_demand64", "job 1 (demand 64)", "var(--series-1)"], ["goodput_job2_demand32", "job 2 (demand 32)", "var(--series-3)"],
+                ["goodput_job3_demand16", "job 3 (demand 16)", "var(--series-2)"]];
+    var series = jobs.map(function (j) { return { name: j[1], color: j[2], values: d.rows.map(function (r) { return num(r[j[0]]); }) }; });
+    groupedBarChart(document.getElementById("fairChart"), { categories: cats, series: series, unit: "rounds/s" });
+    legendFor(document.getElementById("fairLegend"), series);
+    table(document.getElementById("fairTable"), ["policy", "Jain raw", "Jain / demand", "retransmissions", "in-network"],
+      d.rows.map(function (r) { return [r.policy, num(r.jain_raw).toFixed(3), num(r.jain_demand_normalised).toFixed(3), fmtInt(num(r.retransmissions)), (num(r.in_network_fraction) * 100).toFixed(1) + "%"]; }));
+  }).catch(function (e) { fail("fairChart", e); });
+
+  fetchCSV("../examples/train_mlp/results/curves.csv").then(function (d) {
+    var styles = { "float": ["var(--text-muted)", "6 4", 3], "quant": ["var(--series-2)", "", 3], "noagg": ["var(--series-3)", "2 3", 2],
+                   "useragg": ["var(--critical)", "4 3", 2], "xdp": ["var(--series-1)", "", 2], "xdp-loss5": ["var(--good)", "1 4", 2] };
+    var series = Object.keys(styles).map(function (cfg) {
+      return { name: cfg + (cfg === "xdp-loss5" ? " (5% loss)" : ""), color: styles[cfg][0], dash: styles[cfg][1], width: styles[cfg][2],
+        points: d.rows.filter(function (r) { return r.config === cfg; }).map(function (r) { return [num(r.step), num(r.loss)]; }) };
+    }).filter(function (s) { return s.points.length; });
+    lineChart(document.getElementById("trainChart"), { series: series, unit: "cross-entropy loss" });
+    legendFor(document.getElementById("trainLegend"), series);
+  }).catch(function (e) { fail("trainChart", e); });
+
+  fetch("../bench/v2/environment.json").then(function (r) { return r.json(); }).then(function (e) {
+    var rows = [["kernel", e.kernel], ["CPU", e.nproc + " vCPU, " + e.cpu_model], ["runner image", e.image_os + " " + e.image_version],
+      ["compiler / libbpf", e.clang + " / libbpf " + e.libbpf], ["native XDP attach on veth", e.native_attach],
+      ["CPU pinning", e.cpu_pinning], ["topology", e.topology], ["load", e.tp_rounds + " rounds x " + e.vector_len + " values, " + e.tp_trials + " trials (throughput); " + e.lat_rounds + " rounds x " + e.lat_trials + " trials (latency)"],
+      ["commit / date", e.git_commit.slice(0, 7) + " (merge ref), " + e.utc]];
+    table(document.getElementById("envTable"), ["", ""], rows);
+  }).catch(function (e) { fail("envTable", e); });
 })();
 </script>
 </body>

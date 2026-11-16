@@ -60,3 +60,19 @@ program's job is then narrowly scoped: parse the same header, do the same
 accumulate-and-check-completion logic (with `bpf_spin_lock` for the real
 multi-core-safety property the userspace version doesn't need), and emit via
 `XDP_TX` — not to reinvent or re-validate the algorithm itself.
+
+## How v2 was developed (November 2026)
+
+* **macOS:** `make && make test` (all userspace components and tests) and
+  `make bpf` (Homebrew LLVM compiles the XDP object with the vendored
+  `xdp_agg/bpf_compat.h`).
+* **Local verifier loop without a VM image:** a privileged throwaway container
+  on OrbStack's Linux kernel, e.g.
+  `docker run --rm --privileged -v $PWD:/src -w /src alpine:3.20 sh -c 'apk add bpftool && mount -t bpf bpf /sys/fs/bpf && bpftool prog loadall xdp_agg/xdp_agg.o /sys/fs/bpf/x'`;
+  adding `gcc musl-dev libbpf-dev linux-headers elfutils-dev zlib-dev` builds
+  `netsum-ctl` and the `BPF_PROG_TEST_RUN` harness there too. Build into a
+  copy of the tree (or a separate output path) so Linux binaries do not
+  overwrite the macOS ones in `bin/`.
+* **CI is the source of truth** for every committed number and kernel claim
+  (`xdp-loadtest.yml`, `bpf-unit.yml`, `bench.yml`, `train-demo.yml`).
+
