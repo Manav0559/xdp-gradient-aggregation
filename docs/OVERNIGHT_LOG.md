@@ -612,8 +612,8 @@ bpf-unit cases), worker --frac-bits.
   0.4361; float 0.355124 / 0.9889. The v2 step at S = 1 is unchanged.
 - `scripts/quant_study.py` now has the shipping lagged rule next to the
   oracle (`bench/v2/quant_scaled_training.csv`); it reproduces the earlier
-  scratch simulation digit for digit, so every number quoted at 08:xx now
-  has a committed source. Existing quant CSVs byte-identical.
+  scratch simulation digit for digit, so every number quoted in the 11:47
+  entry now has a committed source. Existing quant CSVs byte-identical.
 - Docs: DESIGN_NOTES §1-§3, §6, §16; RESULTS new section; README. Removed
   the RESULTS parenthetical describing how SwitchML picks its exponent: I
   could not verify it, so the text now describes only NetSum's own rule.
