@@ -1,172 +1,33 @@
-/* NetSum XDP aggregator -- the actual kernel-space program.
+/* NetSum XDP aggregator: sums gradient contributions in the kernel receive
+ * path and forwards one aggregate per (job, round, chunk) to the parameter
+ * server. Same state machine and admission rules as userspace_agg/agg.c:
+ * EMPTY -> ACCUMULATING -> COMPLETED (tombstone, kept until ACK or TTL).
  *
- * Parses Ethernet/IPv4/UDP down to the grad_hdr payload (protocol/grad_proto.h,
- * the SAME struct userspace_agg/agg.c uses), accumulates each worker's
- * contribution into a BPF_MAP_TYPE_HASH slot keyed by (job_id, round,
- * chunk_id) under a bpf_spin_lock, and once every expected worker has
- * contributed, rewrites the packet in place to carry the summed values,
- * retargets it at the configured parameter-server address, and returns
- * XDP_TX -- exactly mirroring userspace_agg/agg.c's slot/accumulate/emit
- * algorithm, just running in the kernel fast path instead of a process.
- *
- * Every partial (non-final) contribution returns XDP_DROP: fully absorbed
- * into the map, never forwarded -- this is the mechanism that cuts
- * aggregator-uplink traffic, and it means a tcpdump on the far side of this
- * program will see far fewer packets than arrived, by design.
- *
- * Compiles cleanly to real eBPF bytecode: `clang -target bpf -O2 -c` on
- * this file produces a valid eBPF ELF object (confirmed: proper `xdp`,
- * `.maps`, and `license` sections via `llvm-readelf -S`) -- this machine
- * has no Linux kernel, and libbpf has no macOS build (see
- * docs/DEV_ENVIRONMENT.md), but clang's BPF *codegen* backend needs
- * neither, only the struct layouts and helper IDs vendored in
- * bpf_compat.h. What this compile step does NOT catch: the in-kernel BPF
- * *verifier* only runs at load time (the `bpf()` syscall on a real Linux
- * box) and checks things codegen alone cannot -- e.g. whether every code
- * path's pointer arithmetic stays provably in-bounds. An early version of
- * this function DID fail at the codegen stage (a
- * `final_sum[NETSUM_MAX_CHUNK_LEN]` staging array blew BPF's hard 512-byte
- * kernel stack limit) and was fixed by writing summed values straight into
- * the packet under the lock instead of staging them on the stack -- a
- * genuine bug this compile step caught. Measured with
- * `clang -target bpf -O2 -fstack-usage`: this function currently uses 328
- * of the 512 allowed bytes (36% headroom) -- real margin today, but the
- * `struct grad_slot fresh` local (~300 bytes on its own) means raising
- * NETSUM_MAX_CHUNK_LEN in the future can reintroduce the exact same
- * class of failure (reproduced deliberately during review by bumping it
- * to 128, which immediately fails to compile again).
- *
- * Also measured, not assumed: the two `#pragma unroll` loops that have a
- * data-dependent early `break` (the accumulate loop and the write-back
- * loop, both bounded by a packet-derived chunk_len rather than a literal
- * constant) do NOT fully unroll under this compiler/flags combination --
- * `llvm-objdump -d` shows real backward conditional branches for both.
- * The two loops with no such break (the 10-word IP checksum, the 6-byte
- * MAC copy) do unroll completely. This is fine on kernels with bounded-loop
- * verifier support (5.3+, since the trip count is still provably bounded
- * by NETSUM_MAX_CHUNK_LEN either way) but is a real fact about the
- * compiled object, not a hypothetical -- claiming "fully unrolled" without
- * checking would have been wrong.
- *
- * A subsequent adversarial review of this file (after the above was
- * written) found and this version fixes: a critical out-of-bounds-write
- * risk (the write-back loop used to trust `slot->chunk_len` -- set by
- * whichever packet created the slot -- to bound writes into the CURRENT
- * packet's buffer, which was only ever proven safe against THAT packet's
- * own chunk_len; a chunk_len mismatch between workers could write past
- * what the verifier could prove safe), an unvalidated num_workers field
- * that could leak slot_map entries permanently, a forwarded packet that
- * never updated its own chunk_len field, and a silent, uncounted packet
- * loss window when config_map isn't populated yet. See the inline
- * comments at each fix site for the specific mechanism.
- *
- * Update: this program HAS now been run through a real Linux kernel's
- * in-kernel BPF verifier and loaded onto a real interface --
- * .github/workflows/xdp-loadtest.yml loads this exact object on a real
- * ubuntu-latest GitHub Actions runner (a real Linux box, real verifier,
- * no emulation), attaches it to a veth pair via xdpgeneric, and drives it
- * with real UDP gradient traffic from worker/paramserver across a real
- * netns boundary. That real verifier run found one genuine defect this
- * file's own codegen-only validation above could never have caught: the
- * accumulate and write-back loops' `values[i]` packet-pointer accesses
- * were rejected ("invalid access to packet ... R3 offset is outside of
- * the packet") because the verifier does not carry the single
- * `(values + chunk_len) > data_end` bounds proof taken once before each
- * loop through that loop's own back-edge (these loops do not fully
- * unroll, as noted above) -- fixed with a redundant, per-iteration
- * `(values + i + 1) > data_end` re-check immediately before each
- * dereference, the standard idiom for this exact situation. With that
- * fix, the workflow's full run is green: the verifier accepts the
- * program (see its captured log, uploaded as a build artifact, e.g.
- * "processed 55542 insns ... stack depth 344" with zero rejected paths),
- * `bpftool prog show` confirms it is really loaded and JITed (xlated
- * 2760B, jited 1679B), a real multi-worker round sent as genuine UDP
- * packets across the veth/netns boundary completes and sums correctly
- * through the live, attached program, and every adversarial scenario an
- * earlier review found bugs in (chunk_len mismatch, a truncated packet,
- * num_workers 0/oversized, and a missing config_map) is replayed against
- * this real kernel-loaded program and correctly rejected -- including,
- * for the missing-config case, the drop_stats[STAT_DROPPED_NO_CONFIG]
- * counter actually incrementing on a real kernel, not just in a userspace
- * model of one. The honest remaining status is "run through a real
- * Linux kernel's BPF verifier and a real veth interface, verified
- * correct under real traffic including known-adversarial inputs; not yet
- * benchmarked at load or deployed on physical NICs in driver/native XDP
- * mode (this workflow uses xdpgeneric/SKB mode, which is what a
- * software veth device supports)."
- *
- * Update #2: multi-tenant fairness admission quota ported into this file
- * (job_quota_map, struct netsum_config's new max_slots_per_job field,
- * STAT_DROPPED_FAIRNESS_QUOTA -- see the inline comments at each site),
- * mirroring userspace_agg.c's g_job_quota mechanism, and replayed against
- * the same real kernel-loaded program the workflow above already
- * verifier-loads: a greedy job (job_id=900) opening 3 concurrent
- * incomplete slots against a configured quota of 2 has its 3rd
- * slot-creation attempt genuinely rejected by the real, loaded program --
- * measured, not asserted: job_quota_map[900].concurrent_slots reads back
- * as exactly 2 via `bpftool map dump pinned`, drop_stats[STAT_DROPPED_FAIRNESS_QUOTA]
- * increments to exactly 1, and a second, unrelated job (job_id=901)
- * completes normally in the same run, unaffected by job 900 sitting at
- * its own quota -- real starvation-isolation on a real kernel, not just a
- * mechanism that compiles. Re-measured stack usage after this addition
- * with `clang -target bpf -O2 -fstack-usage`: 352 of the 512 allowed
- * bytes (up from 328 before this change, 31% headroom remaining) -- the
- * real, kernel-verifier-reported "stack depth 352" in this same CI run's
- * verifier log agrees exactly, not just the offline compiler estimate.
- *
- * Update #3: a netem-driven adversarial loss/reorder sweep (same
- * workflow, same veth1-inside-ns1 topology) drove real UDP gradient
- * traffic through this loaded program under `tc qdisc ... netem`
- * impairment. Findings, measured against the real kernel-loaded program:
- * a full 3-worker round still completes and sums correctly under a real
- * 20% per-packet loss rate (via redundant per-worker sends -- see the
- * workflow's own comment on the experimental design and its bounded
- * false-failure probability) and under real delay+reorder (confirming
- * this program's slot/accumulate logic is correctly order-independent,
- * as a pure per-worker sum must be). Separately, and this is the
- * genuinely interesting result rather than a surprise: when one worker's
- * single packet is made to be deterministically, permanently dropped by
- * netem (`loss 100%` for exactly that one send), the round never
- * completes, AND ITS SLOT IS NEVER RECLAIMED -- `bpftool map dump pinned
- * .../slot_map` after the fact still shows that job's entry, sitting
- * there incomplete. This is not a bug introduced by the fairness-quota
- * work above; it is this file's pre-existing, already-documented gap
- * (see "no TTL/eviction anywhere in this program" earlier in this
- * comment) confirmed empirically for the first time against a real
- * kernel rather than left as a theoretical risk. The fix -- a kernel-side
- * TTL/reaper, mirroring userspace_agg.c's slot_ttl_ms mechanism -- needs
- * bpf_timer (Linux 5.15+) and real-kernel testing of its own; it is
- * intentionally NOT attempted here, exactly as userspace_agg.c's own
- * header comment already called out as separate follow-up work.
- *
- * Known, explicit simplifications (see the corrected project spec,
- * docs/PROJECT_SPEC.md, for the design decisions this fixes relative to an
- * earlier flawed draft):
- *   - IPv4 + UDP only, no VLAN tag, no IP options (verified via bounds
- *     checks below; anything else falls through to XDP_PASS, i.e. treated
- *     as ordinary traffic this program has no opinion about).
- *   - UDP checksum on the rewritten (forwarded) packet is set to 0
- *     (checksum disabled) rather than incrementally recomputed -- valid
- *     per RFC 768 for IPv4, and avoids folding a second checksum algorithm
- *     into the verifier-bounded hot path; the IP header checksum (which
- *     IS mandatory) IS recomputed below, since the destination address
- *     genuinely changes.
- *   - The parameter-server destination (MAC + IP + port) is supplied by a
- *     tiny userspace loader via bpf_config_map, populated once at startup
- *     after an ordinary ARP resolution -- XDP has no business doing ARP
- *     itself.
- */
+ * Invariants: every packet access is bounds-checked against data_end in the
+ * same basic block; no helper is called while a slot's spin lock is held;
+ * at most one lock is held at a time.
+ * Design: docs/DESIGN_NOTES.md §Admission, §Concurrency, §Verifier constraints. */
+#ifdef NETSUM_USE_SYSTEM_LIBBPF
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+#else
 #include "bpf_compat.h"
-#include "../protocol/grad_proto.h"
+#endif
 
-struct ethhdr {
+#include "../protocol/grad_parse.h"
+#include "../protocol/netsum_maps.h"
+#include "../protocol/netsum_stats.h"
+
+char _license[] SEC("license") = "GPL";
+
+struct netsum_eth {
     uint8_t h_dest[6];
     uint8_t h_source[6];
     uint16_t h_proto;
 } __attribute__((packed));
 
-struct iphdr {
-    uint8_t ihl_version;   /* low nibble: IHL in 32-bit words; high nibble: version */
+struct netsum_ip {
+    uint8_t ihl_version;
     uint8_t tos;
     uint16_t tot_len;
     uint16_t id;
@@ -178,61 +39,16 @@ struct iphdr {
     uint32_t daddr;
 } __attribute__((packed));
 
-struct udphdr {
+struct netsum_udp {
     uint16_t source;
     uint16_t dest;
     uint16_t len;
     uint16_t check;
 } __attribute__((packed));
 
-#define ETH_P_IP 0x0800
-#define IPPROTO_UDP 17
-
-/* 256 trackable workers as a bitmap (1 bit each) rather than the userspace
- * agg.c's byte-per-worker array -- BPF map values live in kernel memory
- * per slot, and the verifier is happier with smaller, fixed-size structs;
- * 32 bytes vs. 256 bytes for the same 256-worker range costs nothing in
- * behavior, just memory, but at up to 65536 concurrent slots that
- * difference is real. */
-#define MAX_TRACKED_WORKERS_BITMAP_BYTES 32
-
-/* Slot value: the running sum plus bookkeeping, spin-lock protected so
- * concurrent packets for the same slot landing on different CPU cores
- * (via NIC RX-queue steering / RSS) accumulate correctly -- the exact
- * correctness property BPF_MAP_TYPE_PERCPU_ARRAY could not have given an
- * earlier draft of this design, since per-CPU slots never converge into
- * one true sum without a separate cross-core reduction step. */
-struct grad_slot {
-    struct bpf_spin_lock lock;
-    int32_t sum[NETSUM_MAX_CHUNK_LEN];
-    uint16_t chunk_len;
-    uint16_t num_workers_expected;
-    uint16_t contributions_received;
-    uint8_t seen_worker[MAX_TRACKED_WORKERS_BITMAP_BYTES];
-};
-
-struct grad_slot_key {
-    uint32_t job_id;
-    uint32_t round;
-    uint32_t chunk_id;
-};
-
-struct netsum_config {
-    uint8_t ps_mac[6];
-    uint16_t _pad;
-    uint32_t ps_ip;    /* network byte order */
-    uint16_t ps_port;  /* network byte order */
-    /* Multi-tenant fairness admission quota -- kernel-side port of
-     * userspace_agg.c's `g_job_quota` CLI arg (see that file's header
-     * comment). 0 = unlimited, the exact same convention userspace uses,
-     * so existing/default behavior (this field zero-initialized, e.g. by
-     * ci/netsum_cfg_loader.c's callers that never pass a quota) is
-     * unchanged unless a caller explicitly sets it. Host-native byte
-     * order (unlike ps_ip/ps_port): this value never goes on the wire, it
-     * only ever gets compared against an in-kernel counter. */
-    uint16_t _pad2;
-    uint32_t max_slots_per_job;
-};
+#define ETH_P_IP_BE 0x0008 /* htons(0x0800) */
+#define IPPROTO_UDP_NUM 17
+#define IP_MF_OFFSET_MASK_BE 0xFF3F /* htons(0x3FFF) */
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -248,354 +64,606 @@ struct {
     __type(value, struct netsum_config);
 } config_map SEC(".maps");
 
-/* Multi-tenant fairness -- kernel-side port of userspace_agg.c's
- * `g_jobs`/`find_or_create_job()` mechanism (see that file's header
- * comment; its title-quoted rationale -- ATP's paper is literally
- * "...for Multi-tenant Learning" -- applies here verbatim). One entry per
- * distinct job_id, tracking how many concurrently-incomplete slots that
- * job currently holds. Deliberately simpler than userspace's version:
- * userspace hand-rolls open-addressing over a fixed array because it has
- * no hash-map primitive of its own; a BPF_MAP_TYPE_HASH already IS a real
- * hash table (the kernel handles collision resolution), so there is no
- * probing logic to port, just the one-entry-per-job_id concept.
- * max_entries=256 matches userspace's JOB_TABLE_CAPACITY. */
-struct job_quota_entry {
-    uint32_t concurrent_slots;
-};
-
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 256);
-    __type(key, uint32_t);  /* job_id */
+    __type(key, uint32_t);
     __type(value, struct job_quota_entry);
 } job_quota_map SEC(".maps");
 
-/* Drop-reason counters, readable from userspace via bpf_map_lookup_elem on
- * a real box (a small netsum_stats loader is a natural companion to the
- * config loader). Exists specifically to close the "silent, unacknowledged
- * data loss" gap an adversarial review of this file found: a completed
- * aggregation dropped because config_map isn't populated yet used to
- * vanish with no counter, no bpf_trace_printk, nothing -- this is that
- * fix, not a general logging facility. */
-enum {
-    STAT_DROPPED_NO_CONFIG = 0,
-    /* A new-slot admission rejected because its job_id was already at
-     * cfg->max_slots_per_job concurrently-incomplete slots -- the kernel
-     * counterpart of userspace_agg.c's `[admission-reject]` log line,
-     * just as a counter instead of a stderr print a kernel program has no
-     * business making on the hot path. */
-    STAT_DROPPED_FAIRNESS_QUOTA = 1,
-};
-
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, NS_STAT__COUNT);
     __type(key, uint32_t);
     __type(value, uint64_t);
-} drop_stats SEC(".maps");
+} stats SEC(".maps");
 
-static __always_inline void bump_stat(uint32_t stat_key) {
-    uint64_t *cnt = bpf_map_lookup_elem(&drop_stats, &stat_key);
-    if (cnt) {
-        __sync_fetch_and_add(cnt, 1);
-    } else {
-        uint64_t one = 1;
-        bpf_map_update_elem(&drop_stats, &stat_key, &one, BPF_ANY);
-    }
+/* Zeroed template for new slots, so no 300-byte struct lives on the stack.
+ * Per-CPU maps may not hold a spin lock, hence the lock-free twin type. */
+struct grad_slot_init {
+    uint32_t lock_placeholder;
+    struct grad_slot_key tag;
+    uint8_t state, overflowed, charged, _pad0;
+    uint16_t fanin, chunk_len, contributors, _pad1;
+    uint64_t last_touched_ns;
+    uint8_t bitmap[NETSUM_BITMAP_BYTES];
+    int32_t sum[NETSUM_MAX_CHUNK_LEN];
+};
+
+_Static_assert(sizeof(struct grad_slot_init) == sizeof(struct grad_slot), "template matches slot layout");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, uint32_t);
+    __type(value, struct grad_slot_init);
+} slot_template SEC(".maps");
+
+/* Array mode (ATP-style): a fixed pool of aggregators indexed by
+ * netsum_slot_hash(key) & slot_mask, each tagged with the key that owns it.
+ * A busy aggregator owned by another key means fallback to the PS. netsum-ctl
+ * sets max_entries before load (--slots-log2). */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, uint32_t);
+    __type(value, struct grad_slot);
+} agg_array SEC(".maps");
+
+/* Keys that have fallen back: later contributions for them fall back too,
+ * so no worker is aggregated both in-network and at the PS. LRU: an evicted
+ * entry is safe because the PS merges by contributor set (DESIGN_NOTES §Fallback). */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct grad_slot_key);
+    __type(value, uint8_t);
+} fallback_keys SEC(".maps");
+
+static __always_inline void stat_inc(uint32_t id)
+{
+    uint64_t *v = bpf_map_lookup_elem(&stats, &id);
+    if (v)
+        (*v)++;
 }
 
-/* Bump a job's concurrent_slots by one, creating the job_quota_map entry
- * (count=1) if this is the job's first tracked slot -- same
- * lookup-then-BPF_NOEXIST-then-retry race pattern the slot_map creation
- * above already uses, since two CPUs can create each job's FIRST slot
- * concurrently. Must be called outside any bpf_spin_lock (it takes none
- * of its own, but see this file's header comment on lock discipline). */
-static __always_inline void job_quota_increment(uint32_t job_id) {
+/* Reserve one quota unit before creating a slot (bug C8): the atomic add
+ * returns the previous value, so concurrent CPUs cannot all pass the check. */
+static __always_inline int quota_reserve(uint32_t job_id, uint32_t max)
+{
     struct job_quota_entry *jq = bpf_map_lookup_elem(&job_quota_map, &job_id);
-    if (jq) {
-        __sync_fetch_and_add(&jq->concurrent_slots, 1);
-        return;
-    }
-    struct job_quota_entry fresh_jq = { .concurrent_slots = 1 };
-    if (bpf_map_update_elem(&job_quota_map, &job_id, &fresh_jq, BPF_NOEXIST) != 0) {
-        /* Lost the race -- another CPU created this job's entry first
-         * (with count=1 for ITS slot). Re-lookup and add ours on top,
-         * exactly like the slot_map creation race above. */
+    if (!jq) {
+        struct job_quota_entry fresh = {0, 0};
+        bpf_map_update_elem(&job_quota_map, &job_id, &fresh, BPF_NOEXIST);
         jq = bpf_map_lookup_elem(&job_quota_map, &job_id);
-        if (jq) __sync_fetch_and_add(&jq->concurrent_slots, 1);
+        if (!jq)
+            return -1; /* job table full: fail closed (bug C7) */
     }
+    uint32_t old = __sync_fetch_and_add(&jq->concurrent_slots, 1);
+    if (old >= max) {
+        __sync_fetch_and_sub(&jq->concurrent_slots, 1);
+        return -2;
+    }
+    return 0;
 }
 
-/* Decrement a job's concurrent_slots by one on slot teardown (completion
- * or a completed-but-undeliverable drop) -- mirrors userspace_agg.c's
- * free_slot(). Uses an atomic add of -1 (matching bump_stat()'s existing
- * atomic idiom), NOT a plain `count--`, because multiple CPUs can be
- * completing different slots for the same job_id concurrently. */
-static __always_inline void job_quota_decrement(uint32_t job_id) {
+/* Saturating decrement; frees the job's entry when it reaches zero. */
+static __always_inline void quota_release(uint32_t job_id)
+{
     struct job_quota_entry *jq = bpf_map_lookup_elem(&job_quota_map, &job_id);
-    if (jq && jq->concurrent_slots > 0) {
-        __sync_fetch_and_add(&jq->concurrent_slots, -1);
+    if (!jq)
+        return;
+    for (int i = 0; i < 4; i++) {
+        uint32_t cur = jq->concurrent_slots;
+        if (cur == 0)
+            return;
+        if (__sync_val_compare_and_swap(&jq->concurrent_slots, cur, cur - 1) == cur) {
+            if (cur == 1)
+                bpf_map_delete_elem(&job_quota_map, &job_id);
+            return;
+        }
     }
 }
 
-static __always_inline uint16_t ip_checksum(const struct iphdr *iph) {
-    /* Full recompute over the 20-byte header (5 x 32-bit words, IHL
-     * assumed 5 -- options are rejected before this is ever called): a
-     * bounded, verifier-friendly 10-halfword loop, chosen over an
-     * incremental RFC 1624 update because it is simpler to get right and
-     * the header is small enough that the extra cycles do not matter for
-     * a lab-scale benchmark. */
-    const uint16_t *words = (const uint16_t *)iph;
+static __always_inline uint16_t ip_checksum(const struct netsum_ip *iph)
+{
+    const uint16_t *w = (const uint16_t *)iph;
     uint32_t sum = 0;
 #pragma unroll
-    for (int i = 0; i < 10; i++) {
-        if (i == 5) continue; /* skip the existing checksum field itself */
-        sum += words[i];
-    }
+    for (int i = 0; i < 10; i++)
+        if (i != 5)
+            sum += w[i];
     sum = (sum & 0xffff) + (sum >> 16);
     sum = (sum & 0xffff) + (sum >> 16);
     return (uint16_t)~sum;
 }
 
+enum outcome {
+    OUT_ACCEPTED = 0,
+    OUT_COMPLETED,       /* forward the aggregate */
+    OUT_RESEND_RESULT,   /* RESEND on a completed slot: forward the stored aggregate again */
+    OUT_FLUSH,           /* RESEND of a held worker: forward the partial, slot -> FLUSHED */
+    OUT_FALLBACK,        /* contribution to a FLUSHED slot: forward it raw, flagged FALLBACK */
+    OUT_COLLISION,       /* array mode: aggregator owned by another key -> FALLBACK */
+    OUT_DUPLICATE,
+    OUT_RESEND_DUPLICATE,
+    OUT_LATE,
+    OUT_FANIN_MISMATCH,
+    OUT_CHUNK_LEN_MISMATCH,
+};
+
+/* Copies a slot's sum (and, for v2, its contributor bitmap) into the packet.
+ * Called with the slot lock held: no helpers, bounds checked per access. */
+static __always_inline void copy_slot_out(struct grad_slot *slot, int32_t *values, uint16_t chunk_len,
+                                          int v2, void *data_end)
+{
+    for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++) {
+        if (i >= chunk_len)
+            break;
+        if ((void *)(values + i + 1) > data_end)
+            break;
+        values[i] = (int32_t)netsum_htonl((uint32_t)slot->sum[i]);
+    }
+    if (!v2)
+        return;
+    uint8_t *bm = (uint8_t *)(values + chunk_len);
+    if ((void *)(bm + NETSUM_BITMAP_BYTES) > data_end)
+        return;
+#pragma unroll
+    for (int b = 0; b < NETSUM_BITMAP_BYTES; b++)
+        bm[b] = slot->bitmap[b];
+}
+
+/* ACK from the parameter server: the key is finished, drop our state. An ACK
+ * for a slot that is still accumulating means the PS completed the key from
+ * fallbacks or partials, so our partial sum is stale. */
+static __always_inline int handle_ack(const struct netsum_parsed *p, const struct netsum_config *cfg)
+{
+    stat_inc(NS_ACK_SEEN);
+    struct grad_slot_key key = {p->job_id, p->round, p->chunk_id};
+    bpf_map_delete_elem(&fallback_keys, &key);
+    int array = cfg && cfg->slot_mode == NETSUM_SLOT_MODE_ARRAY;
+    struct grad_slot *slot;
+    if (array) {
+        uint32_t idx = netsum_slot_hash(key.job_id, key.round, key.chunk_id) & cfg->slot_mask;
+        slot = bpf_map_lookup_elem(&agg_array, &idx);
+    } else {
+        slot = bpf_map_lookup_elem(&slot_map, &key);
+    }
+    if (!slot) {
+        stat_inc(NS_ACK_UNEXPECTED);
+        return XDP_DROP;
+    }
+    int accumulating, charged, owned = 1;
+    bpf_spin_lock(&slot->lock);
+    if (array && (slot->state == NETSUM_SLOT_EMPTY || slot->tag.job_id != key.job_id ||
+                  slot->tag.round != key.round || slot->tag.chunk_id != key.chunk_id))
+        owned = 0; /* the aggregator now belongs to another key */
+    accumulating = slot->state == NETSUM_SLOT_ACCUMULATING;
+    charged = owned ? slot->charged : 0;
+    if (owned) {
+        slot->charged = 0;
+        slot->state = NETSUM_SLOT_EMPTY;
+    }
+    bpf_spin_unlock(&slot->lock);
+    if (!owned) {
+        stat_inc(NS_ACK_UNEXPECTED);
+        return XDP_DROP;
+    }
+    if (!array)
+        bpf_map_delete_elem(&slot_map, &key);
+    if (charged)
+        quota_release(p->job_id);
+    stat_inc(accumulating ? NS_ACK_UNEXPECTED : NS_SLOT_RETIRED_ACK);
+    return XDP_DROP;
+}
+
 SEC("xdp")
-int netsum_xdp_aggregate(struct xdp_md *ctx) {
+int netsum_xdp_aggregate(struct xdp_md *ctx)
+{
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) return XDP_PASS;
-    if (netsum_bpf_ntohs(eth->h_proto) != ETH_P_IP) return XDP_PASS;
-
-    struct iphdr *iph = (struct iphdr *)(eth + 1);
-    if ((void *)(iph + 1) > data_end) return XDP_PASS;
-    if ((iph->ihl_version & 0x0f) != 5) return XDP_PASS;  /* IP options: not our traffic, let the stack handle it */
-    if (iph->protocol != IPPROTO_UDP) return XDP_PASS;
-
-    struct udphdr *udp = (struct udphdr *)(iph + 1);
-    if ((void *)(udp + 1) > data_end) return XDP_PASS;
-    if (netsum_bpf_ntohs(udp->dest) != NETSUM_PORT) return XDP_PASS;  /* not gradient traffic */
-
-    struct grad_hdr *hdr = (struct grad_hdr *)(udp + 1);
-    if ((void *)(hdr + 1) > data_end) return XDP_PASS;
-
-    uint16_t chunk_len = netsum_bpf_ntohs(hdr->chunk_len);
-    if (chunk_len > NETSUM_MAX_CHUNK_LEN) return XDP_DROP;  /* malformed -- mirrors userspace_agg's malformed-packet drop */
-
-    int32_t *values = (int32_t *)(hdr + 1);
-    if ((void *)(values + chunk_len) > data_end) return XDP_DROP;  /* header claims more data than the packet has */
-
-    uint16_t worker_id = netsum_bpf_ntohs(hdr->worker_id);
-    if (worker_id >= MAX_TRACKED_WORKERS_BITMAP_BYTES * 8) return XDP_DROP;
-
-    struct grad_slot_key key = {
-        .job_id = netsum_bpf_ntohl(hdr->job_id),
-        .round = netsum_bpf_ntohl(hdr->round),
-        .chunk_id = netsum_bpf_ntohl(hdr->chunk_id),
-    };
-
-    struct grad_slot *slot = bpf_map_lookup_elem(&slot_map, &key);
-    if (!slot) {
-        uint16_t num_workers_hdr = netsum_bpf_ntohs(hdr->num_workers);
-        /* Reject a degenerate or out-of-range num_workers before ever
-         * creating a slot for it -- an adversarial review found that
-         * num_workers==0 makes the completion equality
-         * (contributions_received == num_workers_expected) permanently
-         * unreachable (contributions_received only counts upward from 1),
-         * and anything beyond the dedup bitmap's own range
-         * (MAX_TRACKED_WORKERS_BITMAP_BYTES*8) is meaningless as a worker
-         * count. Either case would otherwise leak one of the 65536
-         * slot_map entries forever, with no TTL/eviction anywhere in this
-         * program -- enough bad packets exhausts the map and starts
-         * XDP_DROPping brand-new, legitimate traffic. Rejecting here,
-         * before the slot exists, is cheaper and simpler than detecting
-         * and cleaning up an already-created unkillable slot later. */
-        if (num_workers_hdr == 0 || num_workers_hdr > MAX_TRACKED_WORKERS_BITMAP_BYTES * 8) {
-            return XDP_DROP;
-        }
-
-        /* Multi-tenant fairness admission check -- kernel port of
-         * userspace_agg.c's find_or_create_slot(): "about to CREATE a
-         * brand-new slot for this job -- this is the one place the
-         * fairness admission policy applies. An existing slot this job
-         * already holds is never affected by its own quota; only a NEW
-         * one can be rejected." Deliberately done here, BEFORE the
-         * slot_map creation attempt below and well before any
-         * bpf_spin_lock is ever taken -- this file's lock-discipline rule
-         * (see header comment) is that no map lookup/update on a map
-         * OTHER than slot_map may happen while slot->lock is held, and
-         * this naturally already satisfies that since slot creation
-         * always precedes locking. cfg is looked up fresh here (not
-         * reusing the completion-time lookup further below, which hasn't
-         * happened yet) -- if config_map is unpopulated (e.g. during
-         * Scenario E's deliberate config wipe), max_slots_per_job reads as
-         * 0/unlimited, the same permissive fallback as every other
-         * not-yet-configured case in this program. */
-        uint32_t precheck_cfg_key = 0;
-        struct netsum_config *precheck_cfg = bpf_map_lookup_elem(&config_map, &precheck_cfg_key);
-        uint32_t max_slots_per_job = precheck_cfg ? precheck_cfg->max_slots_per_job : 0;
-        if (max_slots_per_job > 0) {
-            struct job_quota_entry *jq = bpf_map_lookup_elem(&job_quota_map, &key.job_id);
-            if (jq && jq->concurrent_slots >= max_slots_per_job) {
-                bump_stat(STAT_DROPPED_FAIRNESS_QUOTA);
-                return XDP_DROP;
-            }
-        }
-
-        struct grad_slot fresh = {0};
-        fresh.chunk_len = chunk_len;
-        fresh.num_workers_expected = num_workers_hdr;
-        int create_rc = bpf_map_update_elem(&slot_map, &key, &fresh, BPF_NOEXIST);
-        if (create_rc != 0) {
-            /* Lost the race to create this slot -- another CPU's packet for
-             * the same key got there first between our lookup and update.
-             * Re-lookup rather than treat this as an error: the winning
-             * creation is just as valid as ours would have been. */
-        }
-        slot = bpf_map_lookup_elem(&slot_map, &key);
-        if (!slot) return XDP_DROP;  /* map genuinely full; nothing more we can do */
-        if (create_rc == 0) {
-            /* We actually won the creation race for this slot (not just a
-             * re-lookup of one another CPU created first) -- bump this
-             * job's concurrent_slots exactly once per real slot creation,
-             * mirroring userspace's job->concurrent_slots++ which only
-             * fires in the branch that actually allocates a fresh slot. */
-            job_quota_increment(key.job_id);
-        }
+    struct netsum_eth *eth = data;
+    if ((void *)(eth + 1) > data_end || eth->h_proto != ETH_P_IP_BE)
+        return XDP_PASS;
+    struct netsum_ip *iph = (void *)(eth + 1);
+    if ((void *)(iph + 1) > data_end || (iph->ihl_version >> 4) != 4 ||
+        iph->protocol != IPPROTO_UDP_NUM)
+        return XDP_PASS;
+    if ((iph->ihl_version & 0x0f) != 5) {
+        stat_inc(NS_PASS_IP_OPTIONS);
+        return XDP_PASS;
     }
+    if (iph->frag_off & IP_MF_OFFSET_MASK_BE) {
+        stat_inc(NS_PASS_FRAGMENT);
+        return XDP_PASS;
+    }
+    struct netsum_udp *udp = (void *)(iph + 1);
+    if ((void *)(udp + 1) > data_end)
+        return XDP_PASS;
+    if (udp->dest != netsum_htons(NETSUM_PORT)) {
+        stat_inc(NS_PASS_NOT_OURS);
+        return XDP_PASS;
+    }
+    stat_inc(NS_RX_TOTAL);
 
-    /* No `int32_t final_sum[NETSUM_MAX_CHUNK_LEN]` staging copy here -- an
-     * earlier version of this function held the summed values in a local
-     * array between the locked accumulate step and the post-unlock packet
-     * rewrite, and real `clang -target bpf` compilation rejected it: BPF
-     * enforces a hard 512-byte kernel stack limit per function (a real
-     * constraint invisible in ordinary userspace C, where a 256-byte local
-     * array is nothing), and that staging array alone blew past it. Fixed
-     * by writing the summed values straight from `slot->sum[i]` into the
-     * packet's `values[i]` while still holding the lock -- removes the
-     * stack copy entirely, and is if anything more correct (no window
-     * where a completed slot's data exists only in a local copy the
-     * verifier can't see is still "the real state"). */
-    int is_complete = 0;
-    uint16_t final_chunk_len = 0;
-
-    bpf_spin_lock(&slot->lock);
-
-    /* Reject a contribution whose chunk_len disagrees with the slot's
-     * established chunk_len (fixed by whichever packet created it). This
-     * closes a critical finding from an adversarial review: the
-     * write-back loop below bounds itself with `slot->chunk_len`, but the
-     * ONLY thing that proved `values[]` safe to write into was the bounds
-     * check against THIS packet's own `chunk_len` (line ~180, checked
-     * against data_end). Those two are only provably the same pointer-safe
-     * extent once they're checked equal -- which is exactly what this
-     * does, before either value is trusted for anything past this point.
-     * Without this check, a later worker sending a different chunk_len
-     * than the slot's creator could make the write-back loop write past
-     * what was ever verified safe for its own buffer, or at minimum
-     * silently sum an inconsistent, wrong-length gradient chunk. Rejecting
-     * one malformed/inconsistent contribution, not the whole slot, means a
-     * single misconfigured worker can't poison an otherwise-healthy
-     * aggregation for everyone else. */
-    if (slot->chunk_len != chunk_len) {
-        bpf_spin_unlock(&slot->lock);
+    /* Frames may carry Ethernet padding, so the UDP length (not data_end)
+     * bounds the payload; it must agree with the IP length and the frame. */
+    uint16_t udp_len = netsum_ntohs(udp->len);
+    if (udp_len < sizeof(*udp) || netsum_ntohs(iph->tot_len) != sizeof(*iph) + udp_len ||
+        (void *)udp + udp_len > data_end) {
+        stat_inc(NS_REJ_UDP_LEN);
         return XDP_DROP;
     }
 
-    uint8_t byte = slot->seen_worker[worker_id / 8];
-    uint8_t bit = (uint8_t)(1 << (worker_id % 8));
-    if (!(byte & bit)) {
-        slot->seen_worker[worker_id / 8] = (uint8_t)(byte | bit);
-#pragma unroll
-        for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++) {
-            if (i >= chunk_len) break;
-            /* Redundant, per-iteration re-check of `values+i` against
-             * data_end, immediately before the packet-pointer dereference
-             * below -- discovered to be REQUIRED, not just defensive, by
-             * .github/workflows/xdp-loadtest.yml actually loading this
-             * program through a real Linux kernel's BPF verifier: this
-             * loop does not fully unroll (see this file's header
-             * comment), and the verifier will NOT carry the single
-             * `(values + chunk_len) > data_end` proof taken once before
-             * this loop through the loop's own back-edge with enough
-             * precision to accept a `values[i]` access inside it --
-             * observed verifier rejection was exactly "invalid access to
-             * packet ... R3 offset is outside of the packet" at this
-             * dereference. clang -target bpf codegen alone could not
-             * have caught this; only a real verifier run could, and did.
-             * Logically a no-op on this path (i < chunk_len is already
-             * established, and chunk_len was already checked against
-             * data_end above), but giving the verifier a fresh,
-             * syntactically-local bounds check at the access site is the
-             * standard, documented way real XDP programs satisfy its
-             * per-dereference packet-pointer proof requirement inside a
-             * loop it won't fully unroll. */
-            if ((void *)(values + i + 1) > data_end) break;
-            slot->sum[i] += (int32_t)netsum_bpf_ntohl((uint32_t)values[i]);
-        }
-        slot->contributions_received++;
-        if (slot->contributions_received == slot->num_workers_expected) {
-            is_complete = 1;
-            final_chunk_len = slot->chunk_len;
-#pragma unroll
-            for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++) {
-                if (i >= final_chunk_len) break;
-                /* Same fix, same reason, for the write-back direction. */
-                if ((void *)(values + i + 1) > data_end) break;
-                values[i] = (int32_t)netsum_bpf_htonl((uint32_t)slot->sum[i]);
-            }
-        }
+    struct netsum_parsed p;
+    void *payload = (void *)(udp + 1);
+    enum netsum_verdict v = netsum_parse(payload, data_end, &p);
+    if (v == NETSUM_OK && NETSUM_HDR_SIZE + p.payload_len > (uint32_t)udp_len - sizeof(*udp))
+        v = NETSUM_REJ_TRUNCATED;
+    if (v != NETSUM_OK) {
+        stat_inc(NS_FROM_VERDICT(v));
+        return XDP_DROP;
     }
-    /* else: duplicate worker_id for this slot -- silently absorbed, exactly
-     * like userspace_agg.c's seen_worker[] check, just without the stderr
-     * log a kernel program has no business printing on the hot path. */
-    bpf_spin_unlock(&slot->lock);
-
-    if (!is_complete) return XDP_DROP;  /* partial contribution: fully absorbed */
-
-    /* Config checked BEFORE the slot is torn down -- not because this
-     * makes the completed aggregation recoverable (an adversarial review
-     * correctly noted it doesn't: a retransmitted "last worker" packet
-     * would just be caught by the seen_worker dedup check above before
-     * ever re-reaching completion logic, so there is no real retry path
-     * either way), but because a dropped-for-missing-config completion
-     * must not vanish with zero observability the way it used to. Bumping
-     * a counter here is the fix; a full retry-safe redesign (e.g. clearing
-     * the relevant dedup bit so a retransmit could re-trigger completion)
-     * is a real, separate piece of future work, not attempted here. */
     uint32_t cfg_key = 0;
     struct netsum_config *cfg = bpf_map_lookup_elem(&config_map, &cfg_key);
-    if (!cfg) {
-        bpf_map_delete_elem(&slot_map, &key);
-        /* Slot is torn down either way -- decrement its job's fairness
-         * quota count here too (not just on the successful-forward path
-         * below), same as userspace's free_slot() decrementing
-         * unconditionally on eviction. Safe to call outside any lock (see
-         * this file's lock-discipline note at the admission-check site
-         * above): we are well past bpf_spin_unlock() by this point. */
-        job_quota_decrement(key.job_id);
-        bump_stat(STAT_DROPPED_NO_CONFIG);
+    if (p.kind == NETSUM_KIND_ACK)
+        return handle_ack(&p, cfg);
+    if (p.kind == NETSUM_KIND_REGISTER) {
+        stat_inc(NS_PASS_CONTROL);
+        return XDP_PASS;
+    }
+    if (p.kind != NETSUM_KIND_RAW) {
+        stat_inc(NS_REJ_KIND);
+        return XDP_PASS;
+    }
+    uint16_t chunk_len = p.chunk_len;
+    if (chunk_len > NETSUM_MAX_CHUNK_LEN)
+        return XDP_DROP; /* already guaranteed by the parser; bounds it for the verifier */
+    int v2 = p.version == NETSUM_VERSION_V2;
+    int resend = (p.flags & NETSUM_F_RESEND) != 0;
+
+    struct grad_slot_key key = {p.job_id, p.round, p.chunk_id};
+    uint64_t now = bpf_ktime_get_ns();
+    int array = cfg && cfg->slot_mode == NETSUM_SLOT_MODE_ARRAY;
+    int fallback_policy = cfg && cfg->quota_policy == NETSUM_QUOTA_FALLBACK;
+    int outcome = OUT_ACCEPTED;
+    struct grad_slot *slot = 0;
+    /* Everything the forwarding tail reads is initialised before the first
+     * goto: jumping over an initialiser leaves the value undefined, and the
+     * compiler may then spill a clobbered register the verifier rejects. */
+    int32_t *values = (int32_t *)((uint8_t *)payload + NETSUM_HDR_SIZE);
+    int release_quota = 0, overflowed = 0, copy_out = 0;
+    uint16_t fanin = 0, agg_flags = 0;
+
+    if ((array || fallback_policy) && bpf_map_lookup_elem(&fallback_keys, &key)) {
+        outcome = OUT_FALLBACK; /* this key already lives at the PS */
+        goto forward;
+    }
+    if (array) {
+        uint32_t idx = netsum_slot_hash(key.job_id, key.round, key.chunk_id) & cfg->slot_mask;
+        slot = bpf_map_lookup_elem(&agg_array, &idx);
+        if (!slot)
+            return XDP_DROP;
+        goto locked;
+    }
+    slot = bpf_map_lookup_elem(&slot_map, &key);
+    if (!slot) {
+        uint32_t max = cfg ? cfg->max_slots_per_job : 0;
+        int charged = 0;
+        if (max) {
+            int rc = quota_reserve(p.job_id, max);
+            if (rc == -1) {
+                stat_inc(NS_DROP_JOB_TABLE_FULL);
+                return XDP_DROP;
+            }
+            if (rc == -2) {
+                if (fallback_policy) { /* degrade to the PS instead of dropping */
+                    uint8_t one = 1;
+                    bpf_map_update_elem(&fallback_keys, &key, &one, BPF_ANY);
+                    stat_inc(NS_FALLBACK_QUOTA);
+                    outcome = OUT_FALLBACK;
+                    goto forward;
+                }
+                stat_inc(NS_DROP_QUOTA);
+                return XDP_DROP;
+            }
+            charged = 1;
+        }
+        uint32_t zero = 0;
+        struct grad_slot_init *tmpl = bpf_map_lookup_elem(&slot_template, &zero);
+        if (!tmpl) {
+            if (charged)
+                quota_release(p.job_id);
+            return XDP_DROP;
+        }
+        tmpl->state = NETSUM_SLOT_ACCUMULATING;
+        tmpl->fanin = p.num_workers;
+        tmpl->chunk_len = chunk_len;
+        tmpl->charged = (uint8_t)charged;
+        tmpl->last_touched_ns = now;
+        long rc = bpf_map_update_elem(&slot_map, &key, tmpl, BPF_NOEXIST);
+        if (rc == 0) {
+            stat_inc(NS_SLOT_CREATED);
+        } else if (charged) {
+            quota_release(p.job_id); /* lost the creation race, or the map is full */
+        }
+        slot = bpf_map_lookup_elem(&slot_map, &key);
+        if (!slot) {
+            if (fallback_policy) {
+                uint8_t one = 1;
+                bpf_map_update_elem(&fallback_keys, &key, &one, BPF_ANY);
+                stat_inc(NS_FALLBACK_COLLISION); /* no aggregator available */
+                outcome = OUT_FALLBACK;
+                goto forward;
+            }
+            stat_inc(NS_DROP_MAP_FULL);
+            return XDP_DROP;
+        }
+    }
+
+locked:
+
+    bpf_spin_lock(&slot->lock);
+    if (array && slot->state == NETSUM_SLOT_EMPTY) { /* claim a free aggregator */
+        slot->tag = key;
+        slot->state = NETSUM_SLOT_ACCUMULATING;
+        slot->fanin = p.num_workers;
+        slot->chunk_len = chunk_len;
+        slot->contributors = 0;
+        slot->overflowed = 0;
+        slot->charged = 0;
+        slot->last_touched_ns = now;
+#pragma unroll
+        for (int b = 0; b < NETSUM_BITMAP_BYTES; b++)
+            slot->bitmap[b] = 0;
+        for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++) {
+            slot->sum[i] = 0;
+            asm volatile("" ::: "memory"); /* keep LLVM from turning this into memset() */
+        }
+    }
+    int held = (slot->bitmap[(p.worker_id >> 3) & 31] >> (p.worker_id & 7)) & 1;
+    if (array && (slot->tag.job_id != key.job_id || slot->tag.round != key.round ||
+                  slot->tag.chunk_id != key.chunk_id)) {
+        outcome = OUT_COLLISION; /* aggregator busy with another key */
+    } else if (p.num_workers != slot->fanin) {
+        outcome = OUT_FANIN_MISMATCH;
+    } else if (chunk_len != slot->chunk_len) {
+        outcome = OUT_CHUNK_LEN_MISMATCH;
+    } else if (slot->state == NETSUM_SLOT_COMPLETED) {
+        if (resend) { /* the aggregate or the PS's result was lost */
+            outcome = OUT_RESEND_RESULT;
+            copy_out = 1;
+        } else {
+            outcome = OUT_LATE;
+        }
+    } else if (slot->state == NETSUM_SLOT_FLUSHED) {
+        outcome = (held && !resend) ? OUT_DUPLICATE : (v2 ? OUT_FALLBACK : OUT_LATE);
+    } else if (slot->state != NETSUM_SLOT_ACCUMULATING) {
+        outcome = OUT_LATE;
+    } else if (held) {
+        if (resend && v2) { /* stuck round: hand the partial to the PS (ATP flush) */
+            outcome = OUT_FLUSH;
+            copy_out = 1;
+            slot->state = NETSUM_SLOT_FLUSHED;
+            slot->last_touched_ns = now;
+            release_quota = slot->charged;
+            slot->charged = 0;
+        } else {
+            outcome = resend ? OUT_RESEND_DUPLICATE : OUT_DUPLICATE;
+        }
+    } else {
+        int completing = slot->contributors + 1 == slot->fanin;
+        for (int i = 0; i < NETSUM_MAX_CHUNK_LEN; i++) {
+            if (i >= chunk_len)
+                break;
+            if ((void *)(values + i + 1) > data_end)
+                break;
+            int32_t acc = slot->sum[i];
+            slot->overflowed |= (uint8_t)netsum_add_i32(&acc, (int32_t)netsum_ntohl((uint32_t)values[i]));
+            slot->sum[i] = acc;
+            if (completing)
+                values[i] = (int32_t)netsum_htonl((uint32_t)acc);
+        }
+        slot->bitmap[(p.worker_id >> 3) & 31] |= (uint8_t)(1u << (p.worker_id & 7));
+        slot->contributors++;
+        slot->last_touched_ns = now;
+        if (completing) {
+            outcome = OUT_COMPLETED;
+            slot->state = NETSUM_SLOT_COMPLETED;
+            release_quota = slot->charged;
+            slot->charged = 0;
+            if (v2) {
+                uint8_t *bm = (uint8_t *)(values + chunk_len);
+                if ((void *)(bm + NETSUM_BITMAP_BYTES) <= data_end) {
+#pragma unroll
+                    for (int b = 0; b < NETSUM_BITMAP_BYTES; b++)
+                        bm[b] = slot->bitmap[b];
+                }
+            }
+        }
+    }
+    if (copy_out)
+        copy_slot_out(slot, values, chunk_len, v2, data_end);
+    overflowed = slot->overflowed;
+    fanin = slot->fanin;
+    bpf_spin_unlock(&slot->lock);
+
+    if (release_quota)
+        quota_release(p.job_id);
+
+    switch (outcome) {
+    case OUT_ACCEPTED:
+        stat_inc(NS_ACCEPTED);
+        return XDP_DROP; /* consumed into the slot */
+    case OUT_DUPLICATE:
+        stat_inc(NS_DUPLICATE);
+        return XDP_DROP;
+    case OUT_RESEND_DUPLICATE:
+        stat_inc(NS_RESEND_DUPLICATE);
+        return XDP_DROP;
+    case OUT_LATE:
+        stat_inc(NS_LATE_DUPLICATE);
+        return XDP_DROP;
+    case OUT_FANIN_MISMATCH:
+        stat_inc(NS_NUM_WORKERS_MISMATCH);
+        return XDP_DROP;
+    case OUT_CHUNK_LEN_MISMATCH:
+        stat_inc(NS_CHUNK_LEN_MISMATCH);
+        return XDP_DROP;
+    case OUT_COMPLETED:
+        stat_inc(NS_ACCEPTED);
+        stat_inc(NS_SLOT_COMPLETED);
+        if (overflowed)
+            stat_inc(NS_OVERFLOW);
+        break;
+    case OUT_RESEND_RESULT:
+        stat_inc(NS_TX_RESULT_RESEND);
+        break;
+    case OUT_FLUSH:
+        stat_inc(NS_RESEND_DUPLICATE);
+        stat_inc(NS_SLOT_FLUSHED_PARTIAL);
+        agg_flags = NETSUM_F_PARTIAL;
+        break;
+    case OUT_COLLISION: {
+        uint8_t one = 1;
+        bpf_map_update_elem(&fallback_keys, &key, &one, BPF_ANY);
+        stat_inc(NS_FALLBACK_COLLISION);
+        outcome = OUT_FALLBACK;
+        break;
+    }
+    default: /* OUT_FALLBACK */
+        break;
+    }
+
+forward:
+    if (outcome == OUT_FALLBACK && !v2) {
+        stat_inc(NS_LATE_DUPLICATE); /* v1 has no FALLBACK flag */
         return XDP_DROP;
     }
-    bpf_map_delete_elem(&slot_map, &key);  /* mirrors userspace_agg's free_slot() -- bounded map growth */
-    job_quota_decrement(key.job_id);
 
-    hdr->worker_id = netsum_bpf_htons(0);
-    hdr->num_workers = netsum_bpf_htons(1);  /* tells the receiver: exactly one contribution closes this slot */
-    /* Fixed: an earlier version never rewrote this field, so the forwarded
-     * packet could carry the completing packet's own original chunk_len
-     * instead of final_chunk_len -- harmless now that the consistency
-     * check above guarantees they're equal, but writing it explicitly
-     * documents the invariant instead of relying on it silently. */
-    hdr->chunk_len = netsum_bpf_htons(final_chunk_len);
+    if (!cfg) {
+        stat_inc(NS_DROP_NO_CONFIG);
+        return XDP_DROP;
+    }
+    if (iph->ttl <= 1) {
+        stat_inc(NS_REJ_TTL);
+        return XDP_DROP;
+    }
+    struct grad_hdr *h = payload;
+    if ((void *)(h + 1) > data_end)
+        return XDP_DROP;
+    if (outcome == OUT_FALLBACK) {
+        h->flags = netsum_htons((uint16_t)(p.flags | NETSUM_F_FALLBACK));
+        stat_inc(NS_TX_FALLBACK);
+    } else if (v2) {
+        h->worker_id = netsum_htons(NETSUM_WORKER_AGGREGATE);
+        h->num_workers = netsum_htons(fanin);
+        h->flags = netsum_htons((uint16_t)(NETSUM_FLAGS_V2 | agg_flags | (overflowed ? NETSUM_F_OVERFLOW : 0)));
+        stat_inc(agg_flags ? NS_TX_PARTIAL : NS_TX_AGGREGATE);
+    } else {
+        if (overflowed)
+            return XDP_DROP; /* v1 cannot signal overflow; counted above */
+        h->worker_id = 0;  /* legacy v1 aggregate: worker 0 of fan-in 1 */
+        h->num_workers = netsum_htons(1);
+        stat_inc(NS_TX_AGGREGATE);
+    }
 
-    /* Retarget L2/L3/L4 destination at the configured parameter server. */
-#pragma unroll
-    for (int i = 0; i < 6; i++) eth->h_dest[i] = cfg->ps_mac[i];
+    /* Shared forwarding tail: address everything we emit to the PS. */
+    for (int i = 0; i < 6; i++)
+        eth->h_dest[i] = cfg->ps_mac[i];
+    if (cfg->agg_mac[0] | cfg->agg_mac[1] | cfg->agg_mac[2] | cfg->agg_mac[3] | cfg->agg_mac[4] | cfg->agg_mac[5])
+        for (int i = 0; i < 6; i++)
+            eth->h_source[i] = cfg->agg_mac[i];
+    if (cfg->agg_ip)
+        iph->saddr = cfg->agg_ip;
     iph->daddr = cfg->ps_ip;
-    udp->dest = cfg->ps_port;
-    udp->check = 0;  /* checksum disabled -- valid for UDP/IPv4, see file header comment */
+    iph->ttl--;
     iph->check = 0;
     iph->check = ip_checksum(iph);
-
+    udp->dest = cfg->ps_port;
+    udp->check = 0; /* optional for IPv4 (RFC 768) */
+    if (cfg->egress_ifindex && cfg->egress_ifindex != ctx->ingress_ifindex)
+        return bpf_redirect(cfg->egress_ifindex, 0);
     return XDP_TX;
+}
+
+/* TTL sweeper step, run from userspace with BPF_PROG_TEST_RUN (never
+ * attached). Input: a frame whose payload is a grad_hdr naming the key,
+ * followed by the TTL in ns (u64, host order) and room for a full packet.
+ * Under the slot lock, an ACCUMULATING slot idle for longer than the TTL is
+ * flushed: the frame is rewritten into a PARTIAL aggregate (XDP_TX tells the
+ * caller to send it to the PS) and the slot becomes FLUSHED. An expired
+ * COMPLETED or FLUSHED slot is deleted (XDP_DROP). Otherwise XDP_PASS.
+ * Doing the transition here keeps every slot write under the kernel lock. */
+SEC("xdp")
+int netsum_sweep(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct grad_hdr *h = (struct grad_hdr *)((uint8_t *)data + NETSUM_SWEEP_PAYLOAD_OFFSET);
+    int32_t *values = (int32_t *)(h + 1);
+    if ((void *)(values + NETSUM_MAX_CHUNK_LEN) + NETSUM_BITMAP_BYTES > data_end)
+        return XDP_ABORTED;
+    uint64_t ttl_ns;
+    __builtin_memcpy(&ttl_ns, values, sizeof(ttl_ns));
+    /* flags == NETSUM_SWEEP_ARRAY_INDEX: job_id carries an agg_array index */
+    int array = netsum_ntohs(h->flags) == NETSUM_SWEEP_ARRAY_INDEX;
+    struct grad_slot_key key = {netsum_ntohl(h->job_id), netsum_ntohl(h->round), netsum_ntohl(h->chunk_id)};
+    struct grad_slot *slot;
+    if (array) {
+        uint32_t idx = key.job_id;
+        slot = bpf_map_lookup_elem(&agg_array, &idx);
+    } else {
+        slot = bpf_map_lookup_elem(&slot_map, &key);
+    }
+    if (!slot)
+        return XDP_PASS;
+    uint64_t now = bpf_ktime_get_ns();
+    int action = XDP_PASS, release_quota = 0, overflowed = 0;
+    uint16_t fanin = 0, chunk_len = 0;
+
+    bpf_spin_lock(&slot->lock);
+    if (array)
+        key = slot->tag;
+    if (slot->state != NETSUM_SLOT_EMPTY && now - slot->last_touched_ns >= ttl_ns) {
+        if (slot->state == NETSUM_SLOT_ACCUMULATING) {
+            action = XDP_TX;
+            slot->state = NETSUM_SLOT_FLUSHED;
+            slot->last_touched_ns = now;
+            release_quota = slot->charged;
+            slot->charged = 0;
+            fanin = slot->fanin;
+            chunk_len = slot->chunk_len;
+            overflowed = slot->overflowed;
+            if (chunk_len > NETSUM_MAX_CHUNK_LEN)
+                chunk_len = NETSUM_MAX_CHUNK_LEN;
+            copy_slot_out(slot, values, chunk_len, 1, data_end);
+        } else {
+            action = XDP_DROP;
+            if (array)
+                slot->state = NETSUM_SLOT_EMPTY;
+        }
+    }
+    bpf_spin_unlock(&slot->lock);
+
+    if (action == XDP_DROP) {
+        if (!array)
+            bpf_map_delete_elem(&slot_map, &key);
+        stat_inc(NS_SLOT_RETIRED_TTL);
+    } else if (action == XDP_TX) {
+        h->job_id = netsum_htonl(key.job_id);
+        h->round = netsum_htonl(key.round);
+        h->chunk_id = netsum_htonl(key.chunk_id);
+        if (release_quota)
+            quota_release(key.job_id);
+        h->worker_id = netsum_htons(NETSUM_WORKER_AGGREGATE);
+        h->num_workers = netsum_htons(fanin);
+        h->chunk_len = netsum_htons(chunk_len);
+        h->flags = netsum_htons((uint16_t)(NETSUM_FLAGS_V2 | NETSUM_F_PARTIAL | (overflowed ? NETSUM_F_OVERFLOW : 0)));
+        stat_inc(NS_SLOT_FLUSHED_PARTIAL);
+        stat_inc(NS_TX_PARTIAL);
+    }
+    return action;
 }

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# HISTORY (v1): measured serial process launches on macOS loopback, not
+# aggregation; superseded by scripts/bench_v2.sh. Kept so the v1 numbers in
+# bench/v1-macos-loopback/ stay reproducible. See README "History".
 """NetSum benchmark harness: runs the no-aggregation baseline (#1) and the
 userspace-aggregation baseline (#2) across a sweep of worker counts, and
 records real, measured completion latency and aggregator-uplink packet
@@ -35,7 +38,7 @@ import subprocess
 import sys
 import time
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(REPO_ROOT, "bin")
 WORKER = os.path.join(BIN, "worker")
 PARAMSERVER = os.path.join(BIN, "paramserver")
@@ -215,8 +218,8 @@ def bench_useragg(num_workers, job_id):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
-    parser.add_argument("--out", default=os.path.join(REPO_ROOT, "bench", "results.csv"))
-    parser.add_argument("--percentiles-out", default=os.path.join(REPO_ROOT, "bench", "results_percentiles.csv"),
+    parser.add_argument("--out", default=os.path.join(REPO_ROOT, "bench", "v1-macos-loopback", "results.csv"))
+    parser.add_argument("--percentiles-out", default=os.path.join(REPO_ROOT, "bench", "v1-macos-loopback", "results_percentiles.csv"),
                          help="companion file for per-cell p50/p95/p99, bootstrap median CI, and the "
                               "noagg-vs-useragg permutation-test result -- a separate file rather than "
                               "changing results.csv's existing per-trial schema, since dashboard/index.html "

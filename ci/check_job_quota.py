@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
-"""CI-only assertion helper for the xdp-loadtest workflow's kernel-side
-fairness-quota scenario: checks a `bpftool -j map dump pinned
-<job_quota_map path>` JSON dump for a specific job_id key and asserts its
-`concurrent_slots` field equals an expected value -- proof that the real,
-kernel-verifier-approved xdp_agg.o is actually tracking per-job
-concurrent-slot counts in job_quota_map, not just rejecting packets for
-some other reason.
-
-Tolerates the same two bpftool JSON renderings check_drop_stat.py already
-documents: with BTF, key/value come back as decoded JSON
-scalars/objects (key: int, value: {"concurrent_slots": N}); without BTF,
-as arrays of "0x.." hex byte strings in map-native (little-endian) order
-(key: 4-byte job_id; value: 4-byte concurrent_slots).
+"""Asserts a job's charged-slot count in netsum-ctl --json jobs output (or a
+bpftool dump of job_quota_map).
 
 Usage: check_job_quota.py <bpftool -j map dump output as a file> <job_id> <expected_concurrent_slots>
 """
@@ -46,6 +35,8 @@ def main():
         data = json.load(f)
 
     for entry in data:
+        if "concurrent_slots" in entry:  # netsum-ctl --json jobs
+            entry = {"key": entry["job_id"], "value": entry["concurrent_slots"]}
         key_job_id = to_int(entry["key"]) if not isinstance(entry["key"], dict) else int(entry["key"]["job_id"])
         if key_job_id == expect_job_id:
             got = concurrent_slots_of(entry["value"])

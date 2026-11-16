@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
-"""NetSum correctness tests: launches the real compiled binaries as
-subprocesses and asserts on their actual stderr output -- this test suite
-does not re-implement any protocol/aggregation logic in Python to compare
-against; it drives the real C programs and checks their real behavior,
-the same discipline as reproducing a bug with the actual binary rather than
-a model of it.
-
-Run: python3 tests/test_correctness.py   (after `make` in the repo root)
-"""
+"""NetSum correctness tests: drive the real binaries over UDP and assert on
+their stderr. Run: python3 tests/test_correctness.py (after `make`)."""
 import os
 import re
 import socket
@@ -15,6 +8,9 @@ import struct
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from netsum_packets import grad_packet  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(REPO_ROOT, "bin")
@@ -26,15 +22,8 @@ Q16_16_ULP = 1.0 / 65536.0
 
 
 def sum_tolerance(num_workers):
-    """Worst-case accumulated Q16.16 truncation error when summing
-    `num_workers` independently-quantized contributions is num_workers
-    ULPs, not a fixed epsilon -- 0.1, for instance, truncates to
-    6553/65536 = 0.09999847..., and 5 workers' truncation errors can all
-    point the same direction. A fixed tolerance that happens to work for
-    one num_workers value will spuriously fail for another; this is the
-    honestly-reported "quantization error" cost the project spec names as
-    a real, measured quantity, not something to paper over with a looser
-    fixed constant."""
+    """Each contribution is quantized independently, so a sum of n values can
+    be off by up to n ULPs."""
     return num_workers * Q16_16_ULP + 1e-9
 
 
@@ -47,25 +36,9 @@ def free_port():
 
 
 class Server:
-    """Launches a server binary, blocks until its "listening" readiness
-    line appears on stderr (not a sleep-and-hope), and captures every
-    subsequent stderr line for the test to assert against.
-
-    Reads via raw, non-blocking os.read() on the pipe's file descriptor,
-    NOT via the stderr TextIOWrapper's own readline() -- an earlier version
-    of this harness mixed `selectors.select()` (which watches the raw OS
-    pipe) with buffered readline() calls, and lost lines: a single
-    readline() call can pull an entire multi-line chunk out of the OS pipe
-    into Python's internal text-buffer in one underlying read() syscall,
-    return just the first line, and leave the rest sitting in that
-    userspace buffer -- invisible to select(), which only sees the
-    (now-truly-empty) OS-level pipe and correctly reports nothing new,
-    while a real second line silently waits unread until the test's
-    deadline expires. Reading raw bytes ourselves and splitting on
-    newlines avoids the mismatch entirely -- a small, real lesson about
-    not layering two different buffering models on top of each other over
-    the same fd, worth keeping as a comment for exactly that reason.
-    """
+    """Starts a server binary, waits for its "listening" line, and collects its
+    stderr. Reads raw bytes with os.read (see docs/HISTORY.md, "Two buffering
+    models on one pipe")."""
 
     def __init__(self, argv):
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -182,9 +155,11 @@ def test_agg_basic_sum():
     assert int(contributions) == 1, "paramserver in agg mode should see exactly 1 (already-summed) contribution"
     expected = num_workers * fixed_value
     assert abs(float(total) - expected) < sum_tolerance(num_workers), f"expected {expected}, got {total}"
-    assert "packets in, " in agg.text() and f"{num_workers} packets in" in agg.text().replace(
-        f"{num_workers} packets in", f"{num_workers} packets in"
-    ) or True  # summary line format checked loosely; core assertion is the paramserver sum above
+    agg_completes = [c for c in extract_complete_lines(agg.text()) if c[0] == "2"]
+    assert len(agg_completes) == 1 and int(agg_completes[0][3]) == num_workers, (
+        f"aggregator must complete job 2 exactly once from {num_workers} contributions, "
+        f"got {agg_completes}\nfull log:\n{agg.text()}"
+    )
     print("PASS: test_agg_basic_sum")
 
 
@@ -291,18 +266,8 @@ def test_aggregator_reduces_packet_count():
 
 def _raw_grad_packet(job_id, round_, chunk_id, worker_id, num_workers, declared_chunk_len,
                       values=None):
-    """Builds a raw grad_hdr + payload byte string by hand (bypassing the
-    worker binary entirely), so a test can send something the worker
-    binary would never construct on its own -- specifically, a header that
-    LIES about chunk_len relative to how many values actually follow (or
-    none at all). `values` is a list of real int32 fixed-point values to
-    append; declared_chunk_len is what the header claims, independently of
-    len(values), which is exactly the mismatch these tests need to
-    trigger."""
-    header = struct.pack(">IIIHHHH", job_id, round_, chunk_id, worker_id,
-                          num_workers, declared_chunk_len, 0)
-    payload = b"".join(struct.pack(">i", v) for v in (values or []))
-    return header + payload
+    return grad_packet(job_id, round_, chunk_id, worker_id, num_workers,
+                       declared_chunk_len, values)
 
 
 def test_truncated_packet_not_summed_as_stale_bytes():
@@ -384,13 +349,8 @@ def test_chunk_len_mismatch_rejected_not_silently_summed():
 
 
 def test_fairness_quota_isolates_greedy_job():
-    # Reproduces ATP's actual headline contribution -- its full paper
-    # title is "In-network Aggregation for MULTI-TENANT Learning," not
-    # just streaming aggregation (which SwitchML, ATP's own predecessor,
-    # already had). A per-job admission quota on concurrently-incomplete
-    # slots must isolate one greedy job's excess demand from a second,
-    # well-behaved job sharing the same aggregator -- proving real
-    # starvation-isolation, not just that the quota mechanism compiles.
+    # An optional per-job admission quota (NetSum's policy, not ATP's mechanism,
+    # which is fallback to the PS) must isolate a greedy job from a second job.
     ps_port = free_port()
     agg_port = free_port()
     quota = 2

@@ -1,316 +1,210 @@
-# NetSum — In-Network Gradient Aggregation on Commodity Linux via XDP/eBPF
+# NetSum: in-network gradient aggregation on commodity Linux with XDP/eBPF
 
 [![CI](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/ci.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/ci.yml)
 [![XDP real-kernel load test](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/xdp-loadtest.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/xdp-loadtest.yml)
+[![BPF unit tests](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/bpf-unit.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/bpf-unit.yml)
 [![Fuzz](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/fuzz.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/fuzz.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A CN + OS + distributed-systems research project: reproducing **ATP**'s
-(*"In-network Aggregation for Multi-tenant Learning,"* NSDI 2021 Best Paper)
-streaming, multi-tenant, fairness-aware gradient-aggregation mechanism — normally
-built on a Barefoot/Intel Tofino programmable switch — on an ordinary Linux box
-using XDP/eBPF instead. No specialized hardware.
+Distributed training sums every worker's gradient on every step. ATP (NSDI
+2021) does that summing inside a programmable switch; NetSum does it on an
+ordinary Linux host with an XDP program in the kernel's receive path.
 
-**Scope of the results:** correctness and fairness are tested, including on
-a real kernel in CI. No performance gain from XDP has been measured. See
-[Measured results](#measured-results-what-the-numbers-do-and-dont-show).
+NetSum implements best-effort in-kernel aggregation with fallback to the
+parameter server, resend-driven partial flushing, ACK-driven slot retirement,
+an ATP-style aggregator pool with collision fallback, and a reliable windowed
+worker. It is verified on a real kernel in CI and benchmarked on GitHub-hosted
+runners over veth. **It is not a line-rate system;** see
+[Results](#measured-results).
 
-**Full project specification:** [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md)
-(also available as a formatted PDF: [`docs/NetSum_Project_Spec.pdf`](docs/NetSum_Project_Spec.pdf))
-**Live results dashboard:** <https://manav0559.github.io/xdp-gradient-aggregation/dashboard/>
+* Live dashboard: <https://manav0559.github.io/xdp-gradient-aggregation/dashboard/>
+* Results: [`docs/RESULTS.md`](docs/RESULTS.md) · Design: [`docs/DESIGN_NOTES.md`](docs/DESIGN_NOTES.md) · History: [`docs/HISTORY.md`](docs/HISTORY.md)
 
-## What's built and tested right now
+## Architecture
 
-The wire protocol, both non-kernel benchmark baselines, and the XDP/eBPF kernel
-program (loaded through the real in-kernel verifier and driven with real UDP
-traffic in CI — see below) are all implemented and passing a real
-correctness test suite:
-
-```sh
-make                              # builds bin/worker, bin/paramserver, bin/agg
-make bpf                          # compiles xdp_agg/xdp_agg.c to real eBPF bytecode
-                                  # (loading it needs Linux; CI does that in xdp-loadtest.yml)
-python3 tests/test_correctness.py # 10/10 passing
-python3 scripts/benchmark.py      # runs the real noagg-vs-useragg benchmark sweep
+```
+ ns_w: workers                    aggregator host                        ns_ps: parameter server
+ ┌───────────────┐  gradients   ┌──────────────────────────────┐ aggregates ┌───────────────┐
+ │ worker 0..N-1 │ ───────────► │ veth_w0 ─► XDP: netsum_xdp_   │ ─────────► │ paramserver   │
+ │ (reliable,    │              │           aggregate          │  partials  │ (merges by    │
+ │  windowed)    │ ◄─────────── │           (slot map / array) │  fallbacks │  contributor  │
+ └───────────────┘   results    │ veth_p0 ◄─ ACK retires slot  │ ◄───────── │  bitmap)      │
+                     (routed)   └──────────────────────────────┘    ACK     └───────────────┘
+                                  netsum-ctl: attach, config, stats, slots, sweep (TTL)
 ```
 
-| Component | What it is | Status |
+Every packet is a 20-byte header, up to 64 Q16.16 values, and (in v2) a
+32-byte contributor bitmap. Packet kinds: raw contribution, RESEND, FALLBACK
+(a contribution the aggregator passed through), PARTIAL (a flushed incomplete
+sum), aggregate, ACK (the result) and REGISTER. A slot moves
+`EMPTY -> ACCUMULATING -> COMPLETED -> EMPTY` (or `-> FLUSHED -> EMPTY`).
+Details: [`docs/DESIGN_NOTES.md`](docs/DESIGN_NOTES.md) §1-§13.
+
+## Quick start
+
+**macOS or Linux, userspace only** (no kernel features needed):
+
+```sh
+make && make test            # unit tests + 5 Python suites, about 30 s
+scripts/demo_local.sh        # PS + userspace aggregator + 3 reliable workers, with simulated loss
+```
+
+**Linux, with the XDP program** (root):
+
+```sh
+make bpf && make all ctl
+sudo scripts/topo.sh up                                         # three namespaces
+sudo ./bin/netsum-ctl attach --ifname veth_w0 --ifname veth_p0 --mode auto   # prints the mode the kernel chose
+sudo ./bin/netsum-ctl config --ps-mac "$(sudo scripts/topo.sh mac ns_ps veth_p1)" --ps-ip 10.10.2.2 \
+     --ps-port 9000 --agg-mac "$(sudo scripts/topo.sh mac '' veth_p0)" --agg-ip 10.10.2.1 --egress-ifname veth_p0
+sudo ip netns exec ns_ps ./bin/paramserver --ack-to 10.10.2.1:9876 9000 agg &
+for w in 0 1 2; do sudo ip netns exec ns_w ./bin/worker --mode reliable --to 10.10.1.1:9876 \
+     --ps 10.10.2.2:9000 --job 1 --worker $w --workers 3 --rounds 100 --vector-len 1024 --fixed 0.5 & done; wait
+sudo ./bin/netsum-ctl stats ; sudo ./bin/netsum-ctl slots
+sudo ./bin/netsum-ctl sweep --ttl-ms 500 --once                   # reclaim stuck slots
+make bpf-unit                                                    # BPF_PROG_TEST_RUN unit cases
+```
+
+## What is implemented
+
+| Component | What it does | Verified by |
 |---|---|---|
-| `protocol/grad_proto.h` | The wire format every other piece includes verbatim — Q16.16 fixed-point (no floats, since the BPF verifier forbids them), network byte order | Done, tested |
-| `worker/worker.c` | Synthetic gradient-chunk sender | Done, tested |
-| `paramserver/paramserver.c` | Baseline #1 (no aggregation) — sums raw contributions itself | Done, tested |
-| `userspace_agg/agg.c` | Baseline #2 — the *same* slot/accumulate/emit algorithm the XDP program runs, as an ordinary socket program; now also enforces a per-job **multi-tenant fairness quota** (see below) | Done, tested |
-| `xdp_agg/xdp_agg.c` | The actual kernel-space aggregator | **Verified on a real Linux kernel** — loaded, verifier-accepted, and driven with real UDP traffic in CI (see below); this dev machine still can't run it directly (macOS has no Linux kernel), but that's now closed via CI rather than an open gap |
-| `scripts/benchmark.py` | Real measurement harness across a worker-count sweep | Done, real data in `bench/results.csv` |
-| `dashboard/index.html` | Live results dashboard charting `bench/results.csv` | Done |
+| `protocol/` | wire format v2, one shared parser (`grad_parse.h`) for every path, counters, map layouts | unit tests, libFuzzer differential fuzzing, kernel corpus replay |
+| `xdp_agg/xdp_agg.c` | in-kernel aggregation: admission checks, tombstones, overflow detection, quota with fallback, ACK retirement, RESEND flush, FALLBACK, array-mode aggregators, source rewrite, redirect; `netsum_sweep` for TTL | `bpf-unit.yml` (69 cases), `xdp-loadtest.yml` (real kernel, real UDP) |
+| `userspace_agg/agg.c` | the same algorithm in a process (hash mode) | `tests/`, benchmark |
+| `paramserver/` | final summing node, merges raw/fallback/partial/aggregate packets by contributor set, sends results | `tests/test_fallback.py`, `tests/test_reliability.py` |
+| `worker/` | one-shot sender and a reliable windowed worker with retransmission | `tests/test_reliability.py`, Scenarios H2/I2/J2 |
+| `ctl/netsum_ctl.c` | libbpf control plane: attach (reports the real mode), config, stats, slots, jobs, sweep, verify | `ci/test_netsum_ctl.sh` |
+| `scripts/bench_v2.sh` | closed-loop benchmark and fairness sweep on three namespaces | `bench.yml` |
+| `examples/train_mlp/` | SGD training through NetSum, bit-identity checked | `train-demo.yml` |
 
-### Real-kernel verification (closing the project's single biggest gap)
+## Measured results
 
-Every prior claim about `xdp_agg.c` was argued from `clang -target bpf`
-codegen success alone — the file's own header comment admitted plainly that
-it had "compiled to valid bytecode... not yet run through the in-kernel
-verifier or loaded onto a real interface." That's now closed:
-[`.github/workflows/xdp-loadtest.yml`](.github/workflows/xdp-loadtest.yml)
-runs on a real `ubuntu-latest` Linux kernel (this macOS dev machine
-categorically cannot do this — GitHub Actions CI is what makes it possible
-at all), builds a veth pair across two network namespaces (the standard
-kernel-selftests pattern), loads the compiled object with `bpftool`,
-attaches it to the veth via `xdpgeneric`, populates its config map with a
-small libbpf-based loader (`ci/netsum_cfg_loader.c`), and drives it with
-real UDP gradient traffic — including every adversarial scenario an earlier
-human code review found bugs in (chunk_len mismatch, a truncated packet,
-`num_workers` 0/oversized, a missing config map).
+From CI run 43765091283: GitHub runner, Linux 7.0, 4 vCPU Xeon, veth, 117
+trials, every result checked exact, XDP packet accounting balanced in every
+trial. Full tables, method and threats to validity:
+[`docs/RESULTS.md`](docs/RESULTS.md).
 
-**This found a real bug clang's codegen-only compile could never have
-caught:** the real verifier rejected the original object —
-`invalid access to packet ... R3 offset is outside of the packet` — because
-the accumulate/write-back loops don't fully unroll (already documented in
-the file's own header comment) and the verifier doesn't carry a single
-upfront bounds proof through a loop's back-edge with enough precision to
-accept a per-iteration packet-pointer dereference. Fixed with the standard
-idiom: a redundant, logically-no-op `(values + i + 1) > data_end` re-check
-immediately before each dereference, giving the verifier a fresh, local
-proof at the access site. With that fix, the workflow is green: the
-verifier accepts the program, and `bpftool prog show` confirms it's really
-loaded and JITed. (Sizes from the most recent `main` run checked, 10 Oct 2026,
-kernel `6.17.0-1022-azure`, after the fairness quota was ported in:
-`processed 110791 insns (limit 1000000)`, `xlated 3568B jited 2138B`. The
-first green run, before that change, reported 55542 insns / 2760B / 1679B.
-Each run uploads the full verifier log as the `xdp-loadtest-evidence`
-artifact.) A real multi-worker round sums correctly
-through the live program, and every adversarial input is correctly
-rejected — including `drop_stats[STAT_DROPPED_NO_CONFIG]` actually
-incrementing on a real kernel, not a userspace model of one. Honest scope
-note: this uses `xdpgeneric` (SKB) mode, which is what a software veth
-supports — native driver-mode XDP on real NIC hardware remains untested
-(see Stretch Goals in `docs/PROJECT_SPEC.md`).
+| | 2 workers | 4 workers | 8 workers |
+|---|---|---|---|
+| throughput, XDP generic / userspace aggregator | **1.020** [1.014, 1.025] | **1.081** [1.076, 1.087] | **1.109** [1.105, 1.127] |
+| throughput, XDP native / userspace aggregator | 0.949 [0.944, 0.958] | 1.006 [0.999, 1.012] (n.s.) | 1.024 [1.020, 1.042] |
+| median round time, XDP generic / userspace | **0.919** [0.897, 0.951] | **0.950** [0.938, 0.962] | **0.929** [0.917, 0.940] |
 
-### Multi-tenant fairness (ATP's actual headline contribution)
+Ratios of medians with bootstrap 95% CIs; permutation tests, Holm-corrected
+(p_Holm <= 0.033 for every bold entry).
 
-ATP's full paper title is *"In-network Aggregation for **Multi-tenant** Learning"*
-— the fairness mechanism, not bare streaming aggregation, is its real
-contribution (streaming aggregation alone was already in SwitchML, ATP's own
-predecessor). `userspace_agg/agg.c` now reproduces that mechanism: an optional
-`max_slots_per_job` CLI argument caps how many concurrently-incomplete slots
-a single `job_id` may hold in the slot table at once, so one greedy job
-opening many concurrent rounds cannot exhaust the table and starve every
-other job sharing the aggregator.
+* **Replicated:** a second run on the same runner type reproduced these
+  ratios to about one percentage point; a run on a different runner CPU
+  (Xeon Platinum 8573C) showed a much larger gap, 1.37-1.69x throughput and
+  21-34% lower round time, because the userspace aggregator was far slower
+  there. The direction held in all three runs; the size depends on the machine.
+* **In-kernel aggregation helps: by 2-11% on one runner type, by 37-69% on
+  another, never by multiples of the work it removes.** The XDP
+  program costs 191-316 ns per packet; the userspace aggregator spends
+  2.0-2.3 us of CPU per packet. On veth the XDP work runs on the sending CPU.
+* **Native XDP on veth is slower than generic** (veth's native path adds a
+  ring and NAPI hop); native numbers on veth say nothing about hardware NICs.
+* **Multi-tenancy:** a drop-based per-job quota starves greedy jobs (Jain's
+  index 0.34); falling back to the parameter server keeps
+  demand-proportional shares (1.000), as does a small aggregator pool where
+  half the contributions fall back.
+* **Training:** an MLP trained through noagg, userspace and XDP aggregation,
+  and through XDP with 5% packet loss, ends with weights bit-identical to the
+  local quantized all-reduce and within 1e-6 loss of float training.
+* **Quantization:** Q16.16 loses gradients below ~1e-5 (6% of N(0, 1e-4)
+  values round to zero); a per-chunk shared exponent is the recommended next
+  wire format.
 
-```sh
-bin/agg <listen_port> <downstream_ip> <downstream_port> [max_packets=0] [max_slots_per_job=0]
-```
+Not shown: physical NICs, native XDP on hardware, multi-host topologies,
+line rate. The environment is a shared VM and veth is a software device.
 
-A rejected admission logs `[admission-reject] job=... round=... chunk=... --
-slot table full or job at fairness quota, dropping` and is dropped exactly
-like a malformed packet — the job's *other* already-admitted slots, and every
-other job's slots, are unaffected. `tests/test_correctness.py`'s
-`test_fairness_quota_isolates_greedy_job` proves real starvation isolation,
-not just that the mechanism compiles: a greedy job (`job_id=900`) opens 3
-concurrent incomplete slots against a quota of 2 — exactly one is rejected —
-while a second, unrelated job (`job_id=901`) completes normally regardless.
-**Now also ported into the XDP kernel program itself** (`job_quota_map`,
-`struct netsum_config`'s new `max_slots_per_job` field, `STAT_DROPPED_FAIRNESS_QUOTA`)
-and verified on a real loaded kernel in the same CI job described above: a
-greedy job's 3rd concurrent slot is genuinely rejected (`drop_stats[1]`
-increments to exactly 1, `job_quota_map[900].concurrent_slots` reads back as
-exactly 2 via `bpftool map dump`) while a second, unrelated job completes
-normally. A **formal Jain's-fairness-index sweep** (`scripts/fairness_sweep.py`,
-charted on the dashboard) now also quantifies this: 3 concurrently-contending
-jobs with uneven demand (16/4/8) show Jain's index climbing from 0.778 at
-`quota=0` (unlimited) toward 1.0 as the quota tightens to 1–4, confirming the
-mechanism's real effect, not just that one greedy job's excess gets rejected
-once.
+## Correctness evidence
 
-A **netem-driven adversarial sweep** (same CI job, `tc qdisc ... netem`
-against the real loaded program) confirms a full round still aggregates
-correctly under 20% packet loss (via redundant sends) and under real
-delay+reordering (confirming the slot/accumulate logic is correctly
-order-independent) — and empirically confirms a known, honest gap: when one
-worker's packet is permanently, deterministically dropped, its slot is
-never reclaimed (`bpftool map dump pinned .../slot_map` still shows it stuck
-afterward) — `xdp_agg.c` has no TTL/reaper of its own yet (only the
-userspace baseline does). Not yet done: a kernel-side TTL/reaper (needs
-`bpf_timer`, Linux 5.15+) to close that gap, and real per-packet XDP
-latency numbers via `BPF_PROG_TEST_RUN` (see `docs/PROJECT_SPEC.md` §5).
+* **Bugs fixed red-first** (`docs/DESIGN_NOTES.md` §16): late duplicates
+  re-creating slots (C1), worker ids beyond the fan-in (C2), fan-in
+  disagreement (C3), silent overflow (C4), a parameter server without the
+  aggregator's checks (C5), probe chains broken by deletion (C6), a quota that
+  failed open (C7), a racy kernel quota (C8), the aggregate's source address
+  (C9), a benchmark that did not measure aggregation (C10), a fuzzer testing
+  copies (C11), tests that could not fail (C12), unrecoverable lost results
+  (C13), and a livelock between partial flushes and retransmissions found by
+  a kernel scenario (C14).
+* **Kernel unit tests:** 69 `BPF_PROG_TEST_RUN` cases on the loaded program,
+  covering every verdict and state transition, plus the fuzz corpus and
+  5,000 mutations replayed against the userspace parser, on two builds whose
+  disassembly is identical.
+* **Kernel end to end:** 20 scenarios over real UDP and veth, including 20%
+  loss, reordering, a permanently lost packet recovered through a sweeper
+  flush, retransmission and fallback, and the sweeper leaving no slot behind;
+  assertions on exact counter deltas.
+* **Fuzzing:** the shipped parser against a reference parser under ASan.
+* **Accounting:** every packet the XDP program sees ends in exactly one
+  outcome counter; checked in every benchmark trial.
 
-### Slot-table TTL / reaper (the crashed-worker case the quota doesn't cover)
+## How this relates to ATP
 
-The fairness quota above stops an *abusive* job from hoarding slots — it does
-nothing for the opposite, *honest* failure: a well-behaved job whose worker
-legitimately crashes or drops off mid-round, leaving its slot incomplete
-forever. Without a timeout, that slot occupies its `g_slots` entry **and**
-permanently shrinks that job's fairness-quota allowance for the life of the
-process — `xdp_agg.c`'s own header comment admitted this gap outright ("no
-TTL/eviction anywhere in this program"). `userspace_agg/agg.c` now closes the
-userspace half of it:
+[ATP](https://www.usenix.org/conference/nsdi21/presentation/lao) (Lao, Le,
+Mahajan, Chen, Wu, Akella, Swift; NSDI 2021, Best Paper) aggregates gradient
+fragments in programmable top-of-rack switches.
 
-```sh
-bin/agg <listen_port> <downstream_ip> <downstream_port> [max_packets=0] [max_slots_per_job=0] [slot_ttl_ms=0]
-```
-
-`slot_ttl_ms` (0 = disabled, the original behavior) bounds how long a slot may
-sit incomplete before a periodic reaper evicts it through the exact same
-`free_slot()` path a normal completion uses, so fairness accounting stays
-correct. The timer is measured from each slot's most recent *accepted*
-contribution, not its creation time, so a slot still making genuine progress
-under ordinary network jitter is never evicted out from under it — only one
-gone fully silent for the whole TTL window (the real crashed-worker
-signature) is reclaimed. A reaped slot logs `[reaped] job=... round=...
-chunk=... -- incomplete after ...ms, evicting`.
-`test_slot_ttl_reaper_reclaims_permanently_incomplete_slot` proves this with a
-real crashed-worker scenario (one of two expected workers never sends), then
-confirms a second, healthy job's round still completes normally afterward.
-Porting an equivalent into the XDP kernel program is separate follow-up work
-(no arbitrary timer inside the BPF hot path without `bpf_timer`, which needs
-real-kernel testing this dev environment can't do locally) — not attempted
-here.
-
-### Differential fuzz harness (`fuzz/`)
-
-`userspace_agg/agg.c` and `xdp_agg/xdp_agg.c` both carry a header comment
-asserting they implement "byte-for-byte the same algorithm" — a claim that
-used to be backed only by 9 hand-written example-based unit tests, not an
-adversarial search. `fuzz/parse_shared.h` extracts each file's per-packet
-*stateless* admission logic (header-fits, `chunk_len` bound, length-covers-
-payload, `worker_id`/`num_workers` bounds) into two pure functions, and
-`fuzz/fuzz_grad_parse.cpp` (a libFuzzer + AddressSanitizer harness, run via
-`fuzz/build_and_run_fuzz.sh [seconds]`) feeds both the exact same raw bytes
-and aborts on any verdict disagreement or out-of-bounds read. Run for real —
-locally (~49M executions in 30s) and in CI (133M executions in 120s,
-`.github/workflows/fuzz.yml`) — it found **zero crashes and zero verdict
-divergences**: a clean bill of health, not a shortcut, and now a
-continuously-checked proof of the parity claim instead of a one-time human
-read-through. The one deliberately out-of-scope nuance (a stateful
-`slot->chunk_len` consistency check neither extracted function can model
-without a live slot table) is documented in `fuzz/README.md`, not hidden.
-
-### Measured results: what the numbers do and don't show
-
-**Short version:** no latency or throughput gain has been measured for
-aggregation in this repo. The XDP path has been checked for correctness on a
-real kernel only. Its performance has not been benchmarked.
-
-**What was measured.** `scripts/benchmark.py` compares two userspace setups.
-In `noagg`, workers send straight to the parameter server. In `useragg`,
-`bin/agg` sums the packets first. For each trial the script recorded a
-completion latency and an uplink packet count. The latency is the gap between
-the first and the last contribution arriving at the node that does the
-summing: the parameter server under `noagg`, the aggregator under `useragg`.
-It does not include the aggregator-to-parameter-server hop. The workers are
-launched one after another as separate processes, so this gap mostly measures
-how far apart the harness starts them: the p50 grows by roughly 3 ms per
-extra worker in both setups (see the table). It ran on the macOS development machine over
-loopback: one host, no NIC, no XDP. That run produced the committed
-`bench/results.csv`, with 30 trials for each (config, worker count) cell and
-240 rows in total. The p-values come from a two-sided permutation test (2000
-iterations, fixed seed). The effect size is Cliff's delta for useragg vs.
-noagg.
-
-| Workers | n per config | noagg p50 (us) | useragg p50 (us) | Cliff's delta | p-value |
-|---:|---:|---:|---:|---:|---:|
-| 2  | 30 | 3329.5  | 3542.0  | +0.029 | 0.848 |
-| 4  | 30 | 11531.5 | 11013.0 | -0.124 | 0.421 |
-| 8  | 30 | 24132.5 | 22245.0 | -0.056 | 0.710 |
-| 16 | 30 | 49258.5 | 47125.5 | -0.133 | 0.381 |
-
-(`bench/results_percentiles.csv`. These values were recomputed from the raw
-`bench/results.csv` with the script's own statistics functions and match
-exactly.)
-
-**Interpretation.**
-- *Latency:* no worker count shows a statistically significant difference
-  (every p ≥ 0.38, and every |delta| ≤ 0.134, below the usual 0.147 cutoff
-  for a "negligible" Cliff's delta). With 30 trials per cell, this run cannot tell the two setups
-  apart. This is expected: both latencies are dominated by the serial worker
-  launches described above, not by the cost of summing, so this benchmark
-  cannot show an aggregation speedup in either direction.
-- *Packets:* this is the only clear effect. Under `useragg` the aggregator's
-  own log reports exactly 1 packet sent upstream per round, in every trial at
-  every worker count (2, 4, 8, 16). Under `noagg` the script does not count
-  packets; it records N because each of the N workers sends its packet
-  straight to the parameter server. This is a count of messages by design,
-  not a timing result.
-- *XDP:* `xdp_agg.c` is **not** included in the latency comparison above.
-  The CI load test (`.github/workflows/xdp-loadtest.yml`) loads the program
-  through the verifier and checks that sums are correct and that bad input is
-  rejected. It does not record any timing. The test also runs in
-  `xdpgeneric` (SKB) mode on a veth pair inside one GitHub-hosted VM. Generic
-  XDP runs after the kernel has already allocated an skb, so it skips most of
-  the work that native XDP avoids. Even if timing were added, this setup
-  would not be expected to show the kernel-fast-path gain that motivates the
-  project.
-
-**What it would take to show a gain (not done).** Run native (driver-mode)
-XDP on a real NIC that supports it, on separate hosts. Generate realistic
-traffic with many workers and large gradient chunks. Then compare the XDP
-path against the userspace aggregator and report per-packet latency (for
-example with `BPF_PROG_TEST_RUN` for the program alone) and end-to-end
-round-completion time. Report the same sample sizes and significance tests
-as above. Until that is done, this project shows that ATP's
-aggregation-and-fairness mechanism *works correctly* in XDP. It does not
-show that it is faster.
-
-Real bugs were found and fixed during this build (not just written and assumed
-correct) — this is the honest, complete list, not a curated subset:
-- Neither server originally deduplicated by `worker_id` — a duplicate/retried
-  packet from the same worker would have been double-counted, silently corrupting
-  the sum. Fixed with a per-slot `seen_worker[]` table.
-- The test harness itself had a real bug: mixing `selectors.select()` (which
-  watches the raw OS pipe) with a buffered `TextIOWrapper.readline()` silently lost
-  lines. See the `Server` class docstring in `tests/test_correctness.py`.
-- An early `xdp_agg.c` blew BPF's hard 512-byte kernel stack limit via a staging
-  array that's invisible-sized in ordinary userspace C — caught by a real
-  `clang -target bpf` compile, fixed by writing summed values directly into the
-  packet under the lock instead.
-- `scripts/benchmark.py` first measured `useragg`'s latency at the parameter
-  server, which in "agg" mode only ever sees one already-summed packet per slot —
-  every reading came back ~0us regardless of worker count, the tell that the
-  measurement was happening in the wrong place. Fixed by instrumenting the real
-  accumulation point (the aggregator itself).
-- **An independent adversarial code review of `xdp_agg.c` found 10 confirmed
-  issues, 2 critical**, all since fixed and regression-tested: (1) the packet
-  write-back loop trusted a length value with no proven relationship to the
-  current packet's own verified-safe buffer extent — a real out-of-bounds-write
-  risk the in-kernel verifier should reject at load time, now closed by requiring
-  every contribution's chunk_len to match the slot's before it's ever accumulated;
-  (2) the userspace baseline was missing a length check XDP already had, so a
-  truncated packet could silently sum stale bytes left over in a reused buffer
-  from a prior, larger packet. See `xdp_agg.c`'s header comment for the complete
-  list (including the moderate/minor findings: an unvalidated `num_workers` field
-  that could leak map entries permanently, a forwarded packet that never updated
-  its own `chunk_len` field, and a silent, now-counted packet-loss window at
-  startup) and `tests/test_correctness.py`'s two newest tests for the regression
-  coverage.
+* **Reproduced:** best-effort aggregation with a hash-indexed aggregator pool
+  and fallback to the parameter server on collision (§3.5); the resend flag
+  flushing partial aggregates to the PS (§3.7); deallocation of aggregators by
+  the parameter packet, i.e. the ACK (§3.5); reclamation of abandoned
+  aggregators by timestamp (§3.7); scaled-integer arithmetic with an overflow
+  flag (§3.8); contributor bitmaps that prevent double counting at the PS.
+* **Adapted:** one Linux host per aggregation point instead of a switch; a
+  BPF hash map or a BPF array instead of switch registers; a userspace sweeper
+  driving an in-kernel program instead of the switch's timestamp check;
+  results unicast to workers instead of IGMP multicast; an optional per-job
+  admission quota as an extra policy (it is not ATP's mechanism).
+* **Not reproduced:** the two-level (rack) hierarchy, ECN-based AIMD
+  congestion control, the floating-point re-request on overflow (NetSum only
+  flags it), dynamic re-hashing of colliding indexes, and Tofino line rate.
 
 ## Repository layout
 
 ```
-protocol/       shared wire-format header (single source of truth)
-worker/         synthetic gradient-chunk sender
-paramserver/    baseline #1 (no aggregation) + the final receiver for #2/#3
-userspace_agg/  baseline #2 (userspace aggregation, same algorithm as XDP)
-xdp_agg/        the kernel-space XDP/eBPF aggregator -- verifier-loaded and traffic-tested in CI (xdpgeneric on veth)
-tests/          correctness test suite (10/10 passing, driving the real binaries)
-scripts/        benchmark harness -- real measured data in bench/results.csv
-dashboard/      live results dashboard (dark/light, charts bench/results.csv)
-docs/           full project spec (.md + .pdf) and the Linux/XDP dev-environment guide
+protocol/      wire format, shared parser, counters, BPF map layouts
+xdp_agg/       the XDP program (aggregation + sweep) and vendored BPF headers
+userspace_agg/ the same algorithm as a process
+paramserver/   parameter server
+worker/        one-shot and reliable workers
+common/        slot table shared by agg and paramserver
+ctl/           netsum-ctl control plane (libbpf)
+tests/         unit, Python suites, BPF_PROG_TEST_RUN harness
+fuzz/          libFuzzer differential harness and corpus
+ci/            helpers for the kernel scenarios
+scripts/       topology, benchmarks, analysis, quantization study, demo
+bench/         committed results: v2/, lite/, v1-macos-loopback/ (history)
+examples/      training demo
+dashboard/     static results page (GitHub Pages)
+docs/          design notes, results, history, the original spec, the work log
 ```
+
+## History
+
+v1 had the protocol, the components and a real-kernel CI test, but its
+benchmark measured process start-up on macOS loopback and never the XDP
+path. v2 fixed the bugs above, added the reliability and fallback machinery,
+and measured the XDP path. See [`docs/HISTORY.md`](docs/HISTORY.md) and the
+step-by-step [`docs/OVERNIGHT_LOG.md`](docs/OVERNIGHT_LOG.md).
 
 ## Research grounding
 
-- **ATP: In-network Aggregation for Multi-tenant Learning** — Lao, Le, Mahajan,
-  Chen, Wu, Akella, Swift. NSDI 2021, Best Paper Award.
-- **Accelerating Distributed Training With Collaborative In-Network Aggregation**
-  — IEEE/ACM Transactions on Networking, 2024 (DOI 10.1109/TNET.2024.3387948),
-  cited as a related extension (multi-switch, asynchronous arrival), not the
-  source of the fairness mechanism itself — see `docs/PROJECT_SPEC.md` §2.2 for
-  why that distinction matters.
+* C. Lao, Y. Le, K. Mahajan, Y. Chen, W. Wu, A. Akella, M. Swift. *ATP:
+  In-network Aggregation for Multi-tenant Learning.* USENIX NSDI 2021.
+* A. Sapio, M. Canini, C.-Y. Ho, J. Nelson, P. Kalnis, C. Kim,
+  A. Krishnamurthy, M. Moshref, D. Ports, P. Richtarik. *Scaling Distributed
+  Machine Learning with In-Network Aggregation* (SwitchML). USENIX NSDI 2021.
+* J. Fang, H. Xu, G. Zhao, Z. Yu, B. Shen, L. Xie. *Accelerating Distributed
+  Training With Collaborative In-Network Aggregation.* IEEE/ACM Transactions
+  on Networking 32(4):3437-3452, 2024. DOI 10.1109/TNET.2024.3387948.
 
-See the full spec for the corrected architecture (why `BPF_MAP_TYPE_HASH` +
-`bpf_spin_lock`, not `BPF_MAP_TYPE_PERCPU_ARRAY`; why `XDP_TX` alone, not a
-conflated `XDP_TX`/AF_XDP-zero-copy claim), the evaluation plan, the semester build
-timeline, and the honest scope boundaries.
+The original project specification is in
+[`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md).
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT, see [LICENSE](LICENSE).

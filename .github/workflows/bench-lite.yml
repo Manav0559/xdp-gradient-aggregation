@@ -1,0 +1,55 @@
+# Benchmark-lite: open-loop noagg vs userspace vs XDP (xdpgeneric) on the
+# two-namespace veth topology. Runs only when the benchmark itself changes;
+# performance is reported, never gated. Artifact: bench-lite-<run id>.
+name: Benchmark-lite (noagg vs userspace vs XDP)
+
+on:
+  pull_request:
+    paths:
+      - "bench/**"
+      - "scripts/bench_lite*"
+      - ".github/workflows/bench-lite.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench-lite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev python3 iproute2
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          MULTIARCH=$(gcc -print-multiarch)
+          make bpf BPF_CC="clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH}"
+          make all ctl
+
+      - name: Run benchmark-lite
+        run: sudo -E env "PATH=$PATH" OUT=bench-out/lite TRIALS=8 ROUNDS=25000 bash scripts/bench_lite.sh
+
+      - name: Analyse
+        if: always()
+        run: |
+          set -o pipefail
+          sudo chown -R "$(id -u):$(id -g)" bench-out
+          python3 scripts/bench_lite_analyze.py bench-out/lite/raw.csv bench-out/lite/summary | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-lite-${{ github.run_id }}
+          path: |
+            bench-out/lite/raw.csv
+            bench-out/lite/environment.json
+            bench-out/lite/summary/

@@ -1,0 +1,86 @@
+# Training demo: a small MLP trained with synchronous data-parallel SGD whose
+# gradients travel through NetSum. Checks that every network path (noagg,
+# userspace aggregation, XDP aggregation, XDP under 5% loss) returns a summed
+# gradient bit-identical to the local quantized sum at every step.
+# Artifact: train-demo-<run id> (examples/train_mlp/results/curves.csv).
+name: Training demo (MLP through NetSum)
+
+on:
+  pull_request:
+    paths:
+      - "examples/**"
+      - "xdp_agg/**"
+      - "paramserver/**"
+      - "userspace_agg/**"
+      - "protocol/**"
+      - ".github/workflows/train-demo.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install and build
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev python3 iproute2 ethtool
+          sudo modprobe sch_netem || true
+          MULTIARCH=$(gcc -print-multiarch)
+          make bpf BPF_CC="clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH}"
+          make all ctl
+          sudo bash scripts/topo.sh up
+
+      - name: Train through every path
+        run: |
+          set -euo pipefail
+          OUT=examples/train_mlp/results/curves.csv
+          rm -f "$OUT"
+          CTL="sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum_train"
+          PSMAC=$(sudo bash scripts/topo.sh mac ns_ps veth_p1); AGGMAC=$(sudo bash scripts/topo.sh mac "" veth_p0)
+          ps_up() { sudo ip netns exec ns_ps ./bin/paramserver --quiet --ack-to 10.10.2.1:9876 9000 agg > /tmp/ps.log 2>&1 & sleep 0.5; }
+          ps_down() { sudo pkill -f bin/paramserver || true; sleep 0.3; }
+          train() { # label paths to [extra]
+            sudo ip netns exec ns_w python3 examples/train_mlp/train.py --steps 200 --paths "$2" \
+              --to "$3" --ps 10.10.2.2:9000 --label "$1" --job $((RANDOM % 60000 + 1000)) --out "$OUT" | tee "/tmp/train-$1.txt"
+          }
+          # local reference curves (no network)
+          python3 examples/train_mlp/train.py --steps 200 --paths float,quant --out "$OUT"
+          ps_up; train noagg net 10.10.2.2:9000; ps_down
+          ps_up; sudo ./bin/agg --quiet 9876 10.10.2.2 9000 > /tmp/agg.log 2>&1 & sleep 0.3
+          train useragg net 10.10.1.1:9876; sudo pkill -f bin/agg || true; ps_down
+          $CTL attach --ifname veth_w0 --ifname veth_p0 --mode generic --obj xdp_agg/xdp_agg.o
+          $CTL config --ps-mac "$PSMAC" --ps-ip 10.10.2.2 --ps-port 9000 --agg-mac "$AGGMAC" --agg-ip 10.10.2.1 --egress-ifname veth_p0
+          ps_up; train xdp net 10.10.1.1:9876; ps_down
+          sudo ip netns exec ns_w tc qdisc add dev veth_w1 root netem loss 5%
+          ps_up; train xdp-loss5 net 10.10.1.1:9876; ps_down
+          sudo ip netns exec ns_w tc qdisc del dev veth_w1 root
+          $CTL --json stats | python3 -c "import json,sys; d=json.load(sys.stdin); print({k: v for k, v in d.items() if v})"
+          $CTL detach --ifname veth_w0 --ifname veth_p0 --unpin
+          grep -h "steps whose summed gradient" /tmp/train-*.txt
+          python3 - "$OUT" <<'PY'
+          import csv, sys
+          rows = list(csv.DictReader(open(sys.argv[1])))
+          final = {r["config"]: r for r in rows if r["step"] == "200"}
+          print({k: (v["loss"], v["accuracy"], v["retransmissions"]) for k, v in final.items()})
+          net = [r for r in rows if r["bit_identical_to_quant"] != ""]
+          assert net and all(r["bit_identical_to_quant"] == "1" for r in net), "a network path diverged from the local quantized sum"
+          for cfg in ("noagg", "useragg", "xdp", "xdp-loss5"):
+              assert final[cfg]["loss"] == final["quant"]["loss"], (cfg, final[cfg], final["quant"])
+          assert float(final["quant"]["loss"]) < float([r for r in rows if r["config"] == "quant" and r["step"] == "0"][0]["loss"])
+          assert int(final["xdp-loss5"]["retransmissions"]) > 0, "5% loss but no retransmissions"
+          print("PASS: every network path is bit-identical to the local quantized all-reduce; loss decreased")
+          PY
+
+      - name: Upload curves
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: train-demo-${{ github.run_id }}
+          path: examples/train_mlp/results/curves.csv

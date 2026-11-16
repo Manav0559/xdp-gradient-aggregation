@@ -1,117 +1,374 @@
-/* NetSum parameter server -- the final receiver in all three benchmark
- * configurations:
- *   --mode noagg : baseline #1. Every worker sends here directly; this
- *                  process itself sums num_workers raw contributions per
- *                  (job_id, round, chunk_id) slot -- the naive
- *                  parameter-server pattern ATP/SwitchML improve on.
- *   --mode agg   : baseline #2/#3 receiver. An upstream aggregator (the
- *                  userspace AF_INET aggregator, or eventually the XDP
- *                  program) has already summed all workers' contributions
- *                  into one packet per slot; this process just records it.
- *                  Same slot-table code path either way -- in "agg" mode
- *                  num_workers is effectively 1 (one packet closes the
- *                  slot), so there is exactly one accumulation code path
- *                  for both modes, not two.
- *
- * Slot table: fixed-capacity open-addressing hash table keyed by
- * (job_id, round, chunk_id). Sized for one benchmark run's worth of
- * (job, round) pairs, not designed as a general-purpose long-running
- * service -- a real production parameter server would need slot eviction
- * for state that never completes; this is out of scope for the MVP and
- * noted as such rather than silently absent.
- */
+/* NetSum parameter server: the final summing node. Behaviour is driven by
+ * the packet itself, not the CLI mode: raw and FALLBACK contributions are
+ * summed here, complete or PARTIAL aggregates are merged by contributor
+ * bitmap, and a key completes when its contributors cover the fan-in.
+ * Overlapping contributor sets are rejected so nothing is counted twice.
+ * Design: docs/DESIGN_NOTES.md §Admission, §Fallback. */
+#define _POSIX_C_SOURCE 200809L
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
-#include "../protocol/grad_proto.h"
+#include "../common/slot_table.h"
+#include "../protocol/grad_parse.h"
+#include "../protocol/netsum_stats.h"
 
-#define SLOT_TABLE_CAPACITY 65536  /* must be a power of 2 */
+#define HOUSEKEEPING_MS 50
+#define MAX_JOBS 64
 
-#define MAX_TRACKED_WORKERS 256
+/* Per-job worker addresses, learned from REGISTER packets (and from direct raw
+ * contributions), where results are sent. */
+struct job_reg {
+    int used;
+    uint32_t job_id;
+    uint8_t have[NETSUM_BITMAP_BYTES];
+    struct sockaddr_in addr[NETSUM_MAX_FANIN];
+};
 
-typedef struct {
-    int in_use;
-    uint32_t job_id, round, chunk_id;
-    uint16_t num_workers_expected;
-    uint16_t contributions_received;
-    int32_t sum[NETSUM_MAX_CHUNK_LEN];
-    uint16_t chunk_len;
-    long first_seen_micros;
-    long completed_micros;  /* 0 until complete */
-    /* Which worker_ids have already contributed to this slot -- without
-     * this, a duplicate send from the same worker_id (a retried packet, a
-     * buggy worker, or a deliberate adversarial test) gets double-counted
-     * as if it were a distinct worker's contribution, closing the slot
-     * with a silently wrong sum and an undercount of real contributors.
-     * worker_id > MAX_TRACKED_WORKERS is rejected outright below. */
-    uint8_t seen_worker[MAX_TRACKED_WORKERS];
-} slot_t;
+static struct {
+    struct slot_table table;
+    struct tomb_fifo tombs;
+    long tomb_ttl_ms;
+    int quiet;
+    uint64_t stats[NS_STAT__COUNT];
+    uint64_t rx_fallback, rx_partial, rx_aggregate;
+    long completed;
+    int64_t first_complete_us, last_complete_us;
+    int sock;
+    int ack_to_set;
+    struct sockaddr_in ack_to;  /* aggregator that retires its slot on ACK */
+    struct job_reg regs[MAX_JOBS];
+} g;
 
-static slot_t g_slots[SLOT_TABLE_CAPACITY];
+static volatile sig_atomic_t g_dump_requested, g_stop;
 
-static uint64_t slot_key(uint32_t job_id, uint32_t round, uint32_t chunk_id) {
-    /* FNV-1a over the three fields -- good-enough dispersion for a bounded
-     * benchmark run's key space, no external hash library needed. */
-    uint64_t h = 1469598103934665603ULL;
-    uint32_t fields[3] = {job_id, round, chunk_id};
-    const uint8_t *bytes = (const uint8_t *)fields;
-    for (size_t i = 0; i < sizeof(fields); i++) {
-        h ^= bytes[i];
-        h *= 1099511628211ULL;
+static void on_signal(int sig)
+{
+    if (sig == SIGUSR1)
+        g_dump_requested = 1;
+    else
+        g_stop = 1;
+}
+
+static int64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static void dump_stats(void)
+{
+    fprintf(stderr, "[stats-all] {");
+    for (int i = 0; i < NS_STAT__COUNT; i++)
+        fprintf(stderr, "\"%s\":%llu,", netsum_stat_names[i], (unsigned long long)g.stats[i]);
+    fprintf(stderr, "\"rx_fallback\":%llu,\"rx_partial\":%llu,\"rx_aggregate\":%llu}\n",
+            (unsigned long long)g.rx_fallback, (unsigned long long)g.rx_partial,
+            (unsigned long long)g.rx_aggregate);
+    fflush(stderr);
+}
+
+static struct job_reg *reg_for(uint32_t job_id, int create)
+{
+    struct job_reg *free_reg = NULL;
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (g.regs[i].used && g.regs[i].job_id == job_id)
+            return &g.regs[i];
+        if (!g.regs[i].used && !free_reg)
+            free_reg = &g.regs[i];
     }
-    return h;
+    if (!create || !free_reg)
+        return NULL;
+    memset(free_reg, 0, sizeof(*free_reg));
+    free_reg->used = 1;
+    free_reg->job_id = job_id;
+    return free_reg;
 }
 
-/* Open-addressing lookup-or-create. Returns NULL only if the table is
- * completely full (should never happen at benchmark scale; capacity is
- * chosen generously). */
-static slot_t *find_or_create_slot(uint32_t job_id, uint32_t round, uint32_t chunk_id) {
-    uint64_t h = slot_key(job_id, round, chunk_id);
-    for (size_t probe = 0; probe < SLOT_TABLE_CAPACITY; probe++) {
-        size_t idx = (h + probe) & (SLOT_TABLE_CAPACITY - 1);
-        slot_t *s = &g_slots[idx];
-        if (!s->in_use) {
-            memset(s, 0, sizeof(*s));
-            s->in_use = 1;
-            s->job_id = job_id;
-            s->round = round;
-            s->chunk_id = chunk_id;
-            return s;
+static void learn_worker(uint32_t job_id, uint16_t worker_id, const struct sockaddr_in *src)
+{
+    struct job_reg *r = reg_for(job_id, 1);
+    if (!r || worker_id >= NETSUM_MAX_FANIN)
+        return;
+    r->addr[worker_id] = *src;
+    bitmap_set(r->have, worker_id);
+}
+
+/* The result (ACK) carries the sum and contributor bitmap. It goes to the
+ * aggregator first, so it can retire its tombstone, then to every known worker. */
+static void send_result(const struct slot *s)
+{
+    uint8_t out[NETSUM_MAX_PACKET_SIZE];
+    struct grad_hdr *h = (struct grad_hdr *)out;
+    h->job_id = htonl(s->key.job_id);
+    h->round = htonl(s->key.round);
+    h->chunk_id = htonl(s->key.chunk_id);
+    h->worker_id = htons(NETSUM_WORKER_AGGREGATE);
+    h->num_workers = htons(s->fanin);
+    h->chunk_len = htons(s->chunk_len);
+    h->flags = htons((uint16_t)(NETSUM_FLAGS_V2 | NETSUM_F_ACK | (s->overflowed ? NETSUM_F_OVERFLOW : 0)));
+    for (int i = 0; i < s->chunk_len; i++) {
+        uint32_t be = htonl((uint32_t)s->sum[i]);
+        memcpy(out + NETSUM_HDR_SIZE + 4 * i, &be, 4);
+    }
+    memcpy(out + NETSUM_HDR_SIZE + 4 * (size_t)s->chunk_len, s->bitmap, NETSUM_BITMAP_BYTES);
+    size_t len = NETSUM_HDR_SIZE + 4 * (size_t)s->chunk_len + NETSUM_BITMAP_BYTES;
+    if (g.ack_to_set)
+        sendto(g.sock, out, len, 0, (struct sockaddr *)&g.ack_to, sizeof(g.ack_to));
+    struct job_reg *r = reg_for(s->key.job_id, 0);
+    if (!r)
+        return;
+    for (unsigned w = 0; w < s->fanin && w < NETSUM_MAX_FANIN; w++)
+        if (bitmap_test(r->have, w))
+            sendto(g.sock, out, len, 0, (struct sockaddr *)&r->addr[w], sizeof(r->addr[w]));
+}
+
+static void complete(struct slot *s, int64_t now)
+{
+    if (s->overflowed) {
+        g.stats[NS_OVERFLOW]++;
+        fprintf(stderr, "[overflow] job=%u round=%u chunk=%u contributions=%u -- sum not representable in Q16.16\n",
+                s->key.job_id, s->key.round, s->key.chunk_id, s->contributions);
+    } else {
+        g.completed++;
+        if (!g.first_complete_us)
+            g.first_complete_us = now;
+        g.last_complete_us = now;
+        if (!g.quiet)
+            fprintf(stderr, "[complete] job=%u round=%u chunk=%u contributions=%u sum[0]=%.6f latency_us=%lld\n",
+                    s->key.job_id, s->key.round, s->key.chunk_id, s->contributions,
+                    netsum_to_double(s->sum[0]), (long long)(now - s->first_us));
+    }
+    s->state = SLOT_COMPLETED;
+    s->completed_us = now;
+    g.stats[NS_SLOT_COMPLETED]++;
+    send_result(s);
+    g.stats[NS_SLOT_RETIRED_TTL] += (uint64_t)tomb_push(&g.tombs, &g.table, s->key, now);
+}
+
+static void handle(const uint8_t *pkt, const struct netsum_parsed *p, int64_t now,
+                   const struct sockaddr_in *src)
+{
+    int is_agg = p->kind == NETSUM_KIND_AGGREGATE || p->kind == NETSUM_KIND_PARTIAL;
+    if (p->kind == NETSUM_KIND_REGISTER) {
+        g.stats[NS_PASS_CONTROL]++;
+        learn_worker(p->job_id, p->worker_id, src); /* idempotent: re-sent on every worker RTO */
+        return;
+    }
+    if (p->kind != NETSUM_KIND_RAW && !is_agg) {
+        g.stats[NS_REJ_KIND]++;
+        return;
+    }
+    if (p->kind == NETSUM_KIND_RAW && !(p->flags & NETSUM_F_FALLBACK))
+        learn_worker(p->job_id, p->worker_id, src); /* direct sender: results go back to it */
+
+    uint8_t in_bm[NETSUM_BITMAP_BYTES] = {0};
+    if (is_agg) {
+        memcpy(in_bm, netsum_trailer(pkt, p), NETSUM_BITMAP_BYTES);
+        unsigned pc = bitmap_popcount(in_bm);
+        if (pc == 0 || bitmap_span(in_bm) > p->num_workers ||
+            (p->kind == NETSUM_KIND_AGGREGATE && pc != p->num_workers)) {
+            g.stats[NS_REJ_KIND]++;
+            return;
         }
-        if (s->job_id == job_id && s->round == round && s->chunk_id == chunk_id) {
-            return s;
+        if (p->kind == NETSUM_KIND_PARTIAL)
+            g.rx_partial++;
+        else
+            g.rx_aggregate++;
+    } else {
+        bitmap_set(in_bm, p->worker_id);
+        if (p->flags & NETSUM_F_FALLBACK)
+            g.rx_fallback++;
+    }
+
+    struct slot_key key = {p->job_id, p->round, p->chunk_id};
+    struct slot *s = st_find(&g.table, key);
+    if (!s) {
+        s = st_insert(&g.table, key);
+        if (!s) {
+            g.stats[NS_DROP_MAP_FULL]++;
+            if (!g.quiet)
+                fprintf(stderr, "slot table full, dropping job=%u round=%u chunk=%u\n",
+                        p->job_id, p->round, p->chunk_id);
+            return;
+        }
+        s->fanin = p->num_workers;
+        s->chunk_len = p->chunk_len;
+        s->first_us = now;
+        g.stats[NS_SLOT_CREATED]++;
+    }
+
+    if (p->num_workers != s->fanin) {
+        g.stats[NS_NUM_WORKERS_MISMATCH]++;
+        if (!g.quiet)
+            fprintf(stderr, "[num_workers mismatch] job=%u round=%u chunk=%u worker=%u sent num_workers=%u, slot expects %u -- dropping\n",
+                    p->job_id, p->round, p->chunk_id, p->worker_id, p->num_workers, s->fanin);
+        return;
+    }
+    if (p->chunk_len != s->chunk_len) {
+        g.stats[NS_CHUNK_LEN_MISMATCH]++;
+        if (!g.quiet)
+            fprintf(stderr, "[chunk_len mismatch] job=%u round=%u chunk=%u sent chunk_len=%u, slot expects %u -- dropping\n",
+                    p->job_id, p->round, p->chunk_id, p->chunk_len, s->chunk_len);
+        return;
+    }
+    if (s->state == SLOT_COMPLETED) {
+        g.stats[is_agg ? NS_AGGREGATE_CONFLICT : NS_LATE_DUPLICATE]++;
+        /* Someone is still waiting for this key: a resend, or an aggregator
+         * flushing or re-sending. Most likely the result was lost (bug C13). */
+        if (is_agg || (p->flags & (NETSUM_F_RESEND | NETSUM_F_FALLBACK))) {
+            g.stats[NS_TX_RESULT_RESEND]++;
+            send_result(s);
+        }
+        return;
+    }
+    int replace = 0;
+    if (bitmap_overlaps(in_bm, s->bitmap)) {
+        /* Contributor sets decide the merge (docs/DESIGN_NOTES.md §Fallback):
+         * an incoming set we already cover adds nothing; one that covers all
+         * we hold replaces our partial sum; any other overlap cannot be
+         * separated without per-worker values, so it is rejected and the
+         * remaining workers' resends (forwarded as fallbacks) finish the key. */
+        if (!is_agg) {
+            g.stats[NS_DUPLICATE]++;
+            if (!g.quiet)
+                fprintf(stderr, "[dup] job=%u round=%u chunk=%u worker=%u already contributed -- dropping duplicate\n",
+                        p->job_id, p->round, p->chunk_id, p->worker_id);
+            return;
+        }
+        if (bitmap_subset(in_bm, s->bitmap)) {
+            g.stats[NS_OVERLAP_SUBSET]++;
+            return;
+        }
+        if (!bitmap_subset(s->bitmap, in_bm)) {
+            g.stats[NS_OVERLAP_REJECTED]++;
+            if (!g.quiet)
+                fprintf(stderr, "[overlap] job=%u round=%u chunk=%u -- aggregate overlaps contributors already held, dropping\n",
+                        p->job_id, p->round, p->chunk_id);
+            return;
+        }
+        g.stats[NS_OVERLAP_SUPERSET]++;
+        replace = 1;
+    }
+    if (replace) {
+        memset(s->sum, 0, sizeof(s->sum));
+        memset(s->bitmap, 0, sizeof(s->bitmap));
+        s->overflowed = 0;
+    }
+
+    if (is_agg && (p->flags & NETSUM_F_OVERFLOW))
+        s->overflowed = 1;
+    const uint8_t *v = pkt + NETSUM_HDR_SIZE;
+    for (int i = 0; i < p->chunk_len; i++) {
+        uint32_t be;
+        memcpy(&be, v + 4 * i, 4);
+        s->overflowed |= (uint8_t)netsum_add_i32(&s->sum[i], (int32_t)ntohl(be));
+    }
+    for (int i = 0; i < NETSUM_BITMAP_BYTES; i++)
+        s->bitmap[i] |= in_bm[i];
+    s->contributors = (uint16_t)bitmap_popcount(s->bitmap);
+    s->contributions++;
+    s->touched_us = now;
+    g.stats[NS_ACCEPTED]++;
+    if (p->kind == NETSUM_KIND_PARTIAL && !g.quiet)
+        fprintf(stderr, "[partial] job=%u round=%u chunk=%u have=%u/%u\n", p->job_id, p->round, p->chunk_id,
+                s->contributors, s->fanin);
+    if (s->contributors == s->fanin)
+        complete(s, now);
+}
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+            "usage: %s [--quiet] [--slot-capacity-log2 N] [--tombstone-ttl-ms N] [--ack-to IP:PORT]\n"
+            "          <listen_port> <mode: noagg|agg> [max_packets=0 (0=unbounded)]\n"
+            "  mode is informational: behaviour follows each packet's kind.\n"
+            "  --quiet suppresses per-slot lines; a [summary] line is printed on exit.\n"
+            "  Results (ACK) go to every worker that registered or sent directly, and to\n"
+            "  --ack-to (the aggregator) so it can retire its slot. Keep\n"
+            "  --tombstone-ttl-ms (default 10000) above the workers' retry horizon.\n",
+            prog);
+}
+
+int main(int argc, char **argv)
+{
+    unsigned cap_log2 = 16;
+    g.tomb_ttl_ms = 10000;
+    int a = 1;
+    for (; a < argc && strncmp(argv[a], "--", 2) == 0; a++) {
+        if (strcmp(argv[a], "--quiet") == 0) {
+            g.quiet = 1;
+        } else if (strcmp(argv[a], "--slot-capacity-log2") == 0 && a + 1 < argc) {
+            cap_log2 = (unsigned)atoi(argv[++a]);
+            if (cap_log2 < 4 || cap_log2 > 22) {
+                fprintf(stderr, "--slot-capacity-log2 must be in [4, 22]\n");
+                return 1;
+            }
+        } else if (strcmp(argv[a], "--tombstone-ttl-ms") == 0 && a + 1 < argc) {
+            g.tomb_ttl_ms = atol(argv[++a]);
+        } else if (strcmp(argv[a], "--ack-to") == 0 && a + 1 < argc) {
+            char host[64];
+            const char *spec = argv[++a], *colon = strrchr(spec, ':');
+            size_t hl = colon ? (size_t)(colon - spec) : 0;
+            if (!colon || hl >= sizeof(host)) {
+                usage(argv[0]);
+                return 1;
+            }
+            memcpy(host, spec, hl);
+            host[hl] = 0;
+            g.ack_to.sin_family = AF_INET;
+            g.ack_to.sin_port = htons((uint16_t)atoi(colon + 1));
+            if (inet_pton(AF_INET, host, &g.ack_to.sin_addr) != 1) {
+                fprintf(stderr, "bad --ack-to address: %s\n", spec);
+                return 1;
+            }
+            g.ack_to_set = 1;
+        } else {
+            usage(argv[0]);
+            return 1;
         }
     }
-    return NULL;
-}
-
-static long now_micros(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (long)tv.tv_sec * 1000000L + tv.tv_usec;
-}
-
-int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <listen_port> <mode: noagg|agg> [max_packets=0 (0=unbounded)]\n", argv[0]);
+    if (argc - a < 2) {
+        usage(argv[0]);
         return 1;
     }
-    int listen_port = atoi(argv[1]);
-    int agg_mode = strcmp(argv[2], "agg") == 0;
-    long max_packets = argc > 3 ? atol(argv[3]) : 0;
+    int listen_port = atoi(argv[a]);
+    const char *mode = argv[a + 1];
+    long max_packets = argc - a > 2 ? atol(argv[a + 2]) : 0;
+
+    if (st_init(&g.table, cap_log2) != 0 || tomb_init(&g.tombs, g.table.cap) != 0) {
+        fprintf(stderr, "out of memory for slot table\n");
+        return 1;
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal; /* no SA_RESTART: recvfrom returns EINTR */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) { perror("socket"); return 1; }
-
-    int reuse = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
+    g.sock = sock;
+    if (sock < 0) {
+        perror("socket");
+        return 1;
+    }
+    int one = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    int rcvbuf = 4 << 20;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    struct timeval tv = {0, HOUSEKEEPING_MS * 1000};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -121,66 +378,36 @@ int main(int argc, char **argv) {
         perror("bind");
         return 1;
     }
+    fprintf(stderr, "paramserver listening on :%d mode=%s\n", listen_port, mode);
 
-    fprintf(stderr, "paramserver listening on :%d mode=%s\n", listen_port, agg_mode ? "agg" : "noagg");
-
-    uint8_t packet[NETSUM_MAX_PACKET_SIZE];
+    uint8_t pkt[NETSUM_MAX_PACKET_SIZE + 1];
     long packets_seen = 0;
-    long slots_completed = 0;
-
-    while (max_packets == 0 || packets_seen < max_packets) {
-        ssize_t n = recvfrom(sock, packet, sizeof(packet), 0, NULL, NULL);
-        if (n < (ssize_t)NETSUM_HDR_SIZE) continue;  /* truncated/garbage, drop */
-        packets_seen++;
-
-        struct grad_hdr *hdr = (struct grad_hdr *)packet;
-        int32_t *values = (int32_t *)(packet + NETSUM_HDR_SIZE);
-
-        uint32_t job_id = ntohl(hdr->job_id);
-        uint32_t round = ntohl(hdr->round);
-        uint32_t chunk_id = ntohl(hdr->chunk_id);
-        uint16_t worker_id = ntohs(hdr->worker_id);
-        uint16_t num_workers = ntohs(hdr->num_workers);
-        uint16_t chunk_len = ntohs(hdr->chunk_len);
-        (void)worker_id;
-
-        if (chunk_len > NETSUM_MAX_CHUNK_LEN) continue;  /* malformed, drop */
-        if (worker_id >= MAX_TRACKED_WORKERS) continue;  /* out of tracked range, drop */
-
-        slot_t *slot = find_or_create_slot(job_id, round, chunk_id);
-        if (!slot) { fprintf(stderr, "slot table full, dropping\n"); continue; }
-
-        if (slot->contributions_received == 0) {
-            slot->first_seen_micros = now_micros();
-            slot->chunk_len = chunk_len;
-            slot->num_workers_expected = agg_mode ? 1 : num_workers;
+    while (!g_stop && (max_packets == 0 || packets_seen < max_packets)) {
+        g.stats[NS_SLOT_RETIRED_TTL] += (uint64_t)tomb_expire(&g.tombs, &g.table, now_us(),
+                                                             (int64_t)g.tomb_ttl_ms * 1000);
+        if (g_dump_requested) {
+            g_dump_requested = 0;
+            dump_stats();
         }
-
-        if (slot->seen_worker[worker_id]) {
-            fprintf(stderr,
-                "[dup] job=%u round=%u chunk=%u worker=%u already contributed -- dropping duplicate\n",
-                job_id, round, chunk_id, worker_id);
+        struct sockaddr_in src;
+        socklen_t srclen = sizeof(src);
+        ssize_t n = recvfrom(sock, pkt, sizeof(pkt), 0, (struct sockaddr *)&src, &srclen);
+        if (n < 0)
+            continue;
+        packets_seen++;
+        g.stats[NS_RX_TOTAL]++;
+        struct netsum_parsed p;
+        enum netsum_verdict v = netsum_parse(pkt, pkt + n, &p);
+        if (v != NETSUM_OK) {
+            g.stats[NS_FROM_VERDICT(v)]++;
             continue;
         }
-        slot->seen_worker[worker_id] = 1;
-
-        for (int i = 0; i < chunk_len && i < NETSUM_MAX_CHUNK_LEN; i++) {
-            slot->sum[i] += (int32_t)ntohl((uint32_t)values[i]);
-        }
-        slot->contributions_received++;
-
-        if (slot->contributions_received == slot->num_workers_expected && slot->completed_micros == 0) {
-            slot->completed_micros = now_micros();
-            slots_completed++;
-            fprintf(stderr,
-                "[complete] job=%u round=%u chunk=%u contributions=%u sum[0]=%.6f latency_us=%ld\n",
-                job_id, round, chunk_id, slot->contributions_received,
-                netsum_to_double(slot->sum[0]),
-                slot->completed_micros - slot->first_seen_micros);
-        }
+        handle(pkt, &p, now_us(), &src);
     }
-
-    fprintf(stderr, "paramserver: %ld packets seen, %ld slots completed\n", packets_seen, slots_completed);
+    fprintf(stderr, "paramserver: %ld packets seen, %ld slots completed\n", packets_seen, g.completed);
+    fprintf(stderr, "[summary] {\"packets\":%ld,\"completed\":%ld,\"first_complete_us\":%lld,\"last_complete_us\":%lld}\n",
+            packets_seen, g.completed, (long long)g.first_complete_us, (long long)g.last_complete_us);
+    dump_stats();
     close(sock);
     return 0;
 }

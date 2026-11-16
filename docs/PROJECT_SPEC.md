@@ -2,6 +2,17 @@
 
 **A CN + OS + Distributed-Systems Lab Project — Full Specification**
 
+> **Status (2026-11-16).** This is the planning document written before
+> implementation and is kept as a record of intent. What was built and
+> measured is in [`README.md`](../README.md), [`docs/RESULTS.md`](RESULTS.md) and
+> [`docs/DESIGN_NOTES.md`](DESIGN_NOTES.md). The "Implementation status" notes
+> under §5 describe the v1 state and are superseded by those documents. Two
+> factual corrections were made in place: the ATP author list in §1, and the
+> description of ATP's multi-tenancy mechanism (§1, §2.1, §2.3, §5, §9), which
+> is best-effort aggregator sharing with fallback to the parameter server, not
+> an admission quota. `PROJECT_SPEC.html` and `NetSum_Project_Spec.pdf` are
+> rendered copies of this file with the same corrections.
+
 ---
 
 ## 1. Pitch
@@ -9,7 +20,7 @@
 Distributed training synchronizes gradients across workers on every step, and that
 synchronization traffic — not compute — is the bottleneck once you have more than a
 handful of workers. The 2021 NSDI Best Paper **ATP** (*"In-network Aggregation for
-Multi-tenant Learning"*, Lao, Le, Mahajan, Chiang, Vahdat, Zhu — NSDI 2021) and its
+Multi-tenant Learning"*, Lao, Le, Mahajan, Chen, Wu, Akella, Swift — NSDI 2021) and its
 2024 IEEE/ACM Transactions on Networking follow-up (*"Accelerating Distributed
 Training With Collaborative In-Network Aggregation"*) solved this by summing gradient
 chunks **inside a programmable switch**, on the wire, before they ever reach a
@@ -17,8 +28,8 @@ parameter server — cutting aggregator-side traffic and completion time. The ca
 that result needs a Barefoot/Intel Tofino programmable switch, hardware almost no
 student (or most companies) will ever touch.
 
-**NetSum reproduces ATP's actual mechanism — streaming, multi-tenant, fairness-aware
-gradient aggregation — on a commodity Linux box using XDP/eBPF instead of a
+**NetSum adapts ATP's mechanism — streaming, best-effort, multi-tenant gradient
+aggregation with fallback to the parameter server — to a commodity Linux box using XDP/eBPF instead of a
 programmable switch.** No specialized hardware, no P4, no simulator: a real Linux
 kernel fast-path program parses gradient-chunk packets, accumulates partial sums
 in-kernel, and forwards only the fully-aggregated result on to the parameter server —
@@ -56,18 +67,25 @@ slot has arrived, the switch emits **one** aggregated packet onward. This cuts
 aggregator-uplink traffic by roughly the worker fan-in factor and removes the
 aggregation step from the parameter server's CPU entirely.
 
-ATP's headline contribution beyond a bare "sum packets on a switch" idea (already
-explored by its predecessor **SwitchML**, NSDI 2021, same venue) is explicitly
-**multi-tenant fairness**: the switch's aggregation memory (slot table) is a scarce,
-shared resource, and ATP's real contribution is an admission/eviction policy so that
-multiple concurrent training jobs sharing one switch get fair, starvation-free access
-to aggregation slots instead of one greedy job monopolizing them. This is stated
-directly in the paper's own title.
+What ATP adds beyond a bare "sum packets on a switch" idea (explored at the same
+venue by **SwitchML**, which partitions switch memory statically per job) is
+**dynamic, best-effort sharing of aggregators among jobs**. Each gradient fragment
+maps to an aggregator by a hash of its job ID and sequence number; if that
+aggregator is busy with a different fragment, the packet is not dropped but
+forwarded to the parameter server, which aggregates it in software (ATP §3.5-§3.6).
+Parameter packets returning from the PS deallocate aggregators, workers retransmit
+with a resend flag that makes the switch flush partial state to the PS (§3.7), and
+ECN-driven window control shares bandwidth. Jobs therefore degrade gracefully to
+end-host aggregation under contention instead of being denied service. A per-job
+admission quota, which an earlier draft of this spec attributed to ATP, is not
+ATP's mechanism; NetSum offers one as an optional, separate policy.
 
 ### 2.2 The 2024 follow-up (secondary reference, not the primary target)
 
 **Accelerating Distributed Training With Collaborative In-Network Aggregation**
-(IEEE/ACM Transactions on Networking, 2024, DOI 10.1109/TNET.2024.3387948) extends
+Jin Fang, Hongli Xu, Gongming Zhao, Zhuolong Yu, Bingchen Shen, Liguang Xie —
+IEEE/ACM Transactions on Networking 32(4):3437-3452, August 2024, DOI
+10.1109/TNET.2024.3387948. It extends
 ATP/SwitchML-style aggregation to **multiple switches** cooperating, and its actual
 differentiator is handling **asynchronous, out-of-order gradient arrival across
 switches** — a distinct problem from ATP's single-switch fairness question. NetSum
@@ -81,7 +99,7 @@ correction matters and was caught during adversarial review of this spec.
 |---|---|
 | Tofino ASIC, P4 program | Ordinary NIC, XDP/eBPF program (`clang` + `libbpf`) |
 | Switch memory for slot table | `BPF_MAP_TYPE_HASH` keyed by `(job_id, round, chunk_id)` |
-| In-switch admission/eviction policy for fairness | Slot-table admission policy in the XDP program, same fairness goal |
+| Best-effort aggregator sharing: on a hash collision the packet goes to the PS | Array mode (hash-indexed, tag-checked aggregators) with collision fallback to the PS; an optional per-job admission quota is NetSum's own addition |
 | Measured: completion time, fairness, switch memory use | Measured: completion time, Jain's fairness index, **plus** a from-scratch kernel-vs-userspace comparison ATP's own paper never needed (a switch has no "userspace" alternative to compare against) |
 
 The kernel-vs-userspace comparison is NetSum's own genuine addition beyond
@@ -220,7 +238,7 @@ hardware — that remains a stretch goal (§7).
 | End-to-end aggregation-round completion time | Timestamp first-worker-send → parameter-server-receive, vs. worker count (2→16) and chunk size | ATP's own headline metric |
 | Aggregator-uplink traffic reduction | Bytes in vs. bytes out at the aggregator, vs. no-aggregation baseline | ATP's own headline metric |
 | Per-packet processing latency | XDP path vs. userspace-AF_INET path, same host, same algorithm | NetSum's own addition — isolates the kernel-fast-path effect |
-| Multi-tenant fairness | Jain's fairness index across 2–4 concurrent jobs sharing the aggregator's slot table under an admission policy | Reproduces ATP's actual headline contribution |
+| Multi-tenant fairness | Jain's fairness index across 2–4 concurrent jobs sharing the aggregator's slot table under an admission policy | Tests the multi-tenancy question; ATP's answer is fallback to the PS |
 | Quantization error | Q16.16 round-trip error vs. original float gradients, reported honestly | Nobody in the ATP lineage has to report this (switches don't do ML-side quantization) — NetSum's protocol design makes it a real, measurable cost |
 | Correctness under adversarial packet loss/reordering | Drop/reorder a controlled fraction of chunk packets (via `tc netem`) and report how the slot-table times out/handles incomplete aggregation, rather than silently under-counting | The failure mode a rushed implementation would most likely get wrong |
 
@@ -320,8 +338,8 @@ design silently produced wrong sums, and building a controlled benchmark that
 isolates exactly how much the in-kernel fast path buys over the identical algorithm in
 userspace."
 
-**For a research-oriented conversation:** "I reproduced ATP's (NSDI 2021 Best Paper)
-core multi-tenant fairness mechanism on commodity hardware instead of a programmable
+**For a research-oriented conversation:** "I adapted ATP's (NSDI 2021 Best Paper)
+best-effort, multi-tenant aggregation mechanism to commodity hardware instead of a programmable
 switch, which let me answer a question the original paper's ASIC context couldn't:
 how much of the benefit is the in-network-aggregation *idea* versus the switch
 *hardware* specifically."

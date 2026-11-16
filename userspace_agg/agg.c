@@ -1,85 +1,15 @@
-/* NetSum userspace aggregator -- baseline #2, and the fairness anchor for
- * the whole project's central measurement. Implements byte-for-byte the
- * same slot/accumulate/emit algorithm the eventual XDP program will run in
- * the kernel: receive a raw per-worker contribution, accumulate it into a
- * per-(job,round,chunk) slot, and once every expected worker has
- * contributed, emit exactly one summed packet onward -- never forward a
- * partial contribution.
+/* NetSum userspace aggregator: the same slot / accumulate / emit algorithm as
+ * xdp_agg.c, run in an ordinary single-threaded process, so the benchmark can
+ * compare "kernel fast path" against "userspace" for one algorithm.
  *
- * This process is intentionally single-threaded, single-socket: the
- * project's core comparison is "the identical algorithm, in the kernel
- * fast path vs. in an ordinary process," and adding userspace
- * multi-threading here would conflate a threading advantage with the
- * kernel-fast-path question the benchmark exists to isolate.
- *
- * Multi-tenant fairness (optional `max_slots_per_job` CLI argument): a
- * real per-job admission quota on concurrently-incomplete slots, so one
- * greedy job spamming many concurrent rounds cannot starve every other
- * job sharing this aggregator out of the slot table. This reproduces
- * ATP's actual headline contribution -- its paper's own title is
- * literally "...for Multi-tenant Learning" -- not just its bare
- * streaming-aggregation mechanism (which SwitchML, ATP's predecessor,
- * already had). See tests/test_correctness.py's fairness tests for a
- * worked example: a greedy job hitting its quota while a second,
- * well-behaved job's slots are admitted normally.
- *
- * Slot TTL / reaper (optional `slot_ttl_ms` CLI argument): the fairness
- * quota above stops an ABUSIVE job from hoarding slots, but does nothing
- * for the opposite, honest failure mode -- a well-behaved job whose worker
- * legitimately crashes or drops off the network mid-round, after its slot
- * was admitted but before every expected worker ever contributed. That
- * slot would otherwise sit `in_use` forever: one dead entry in
- * `g_slots`, and worse, one permanent tick against that job's
- * `concurrent_slots` fairness allowance, silently shrinking its real quota
- * over the life of the process. xdp_agg.c's own header comment admits
- * this same gap exists there too ("no TTL/eviction anywhere in this
- * program") -- this is the userspace-side fix; porting an equivalent into
- * the kernel program is separate follow-up work (no arbitrary timers in
- * the BPF hot path without `bpf_timer`, which needs real-kernel testing),
- * intentionally out of scope here.
- *
- * `slot_ttl_ms` (0 = disabled, preserving the exact prior behavior for
- * every existing test) bounds how long a slot may sit incomplete before a
- * periodic reaper sweep evicts it via the exact same `free_slot()` path a
- * normal completion uses, so `concurrent_slots` accounting stays correct
- * across an eviction.
- *
- * Design choice -- LAST-TOUCHED, not creation time: each slot's age is
- * measured from its most recent ACCEPTED contribution (`last_touched_micros`),
- * not from when the slot was first created. A slot that's still making
- * genuine progress (contributions trickling in from different workers
- * under ordinary network jitter) shouldn't be evicted out from under it
- * just because it happened to open a while ago; only a slot that has gone
- * fully silent for the whole TTL window -- the actual crashed-worker
- * signature -- should be reclaimed. Rejected contributions (duplicate,
- * chunk_len mismatch) do NOT refresh this timestamp, since those aren't
- * real progress either.
- *
- * Mechanism note: the main loop's `recvfrom()` is normally blocking with
- * no timeout, which would never wake up to run the reaper if a stuck
- * slot's whole socket goes silent (exactly the scenario being fixed). When
- * `slot_ttl_ms > 0`, `SO_RCVTIMEO` is set on the inbound socket so
- * `recvfrom()` periodically returns `EWOULDBLOCK`/`EAGAIN` on its own,
- * which the existing `n < NETSUM_HDR_SIZE` check already treats as a
- * harmless "nothing this iteration" (it doesn't count toward
- * `max_packets` or log anything) -- giving the loop a chance to run the
- * reaper sweep even under total silence. When `slot_ttl_ms == 0` no
- * timeout is ever installed, so recvfrom stays exactly as blocking as
- * before and every existing test's behavior is unchanged.
- */
-/* POSIX.1-2008 feature-test macro, required before ANY system header on
- * glibc/Linux to expose struct sigaction / sigaction() / sigemptyset()
- * under strict `-std=c11` (Makefile's CFLAGS) -- glibc gates POSIX
- * extensions behind this under a strict C standard, unlike macOS's libc,
- * which exposes them regardless. This was invisible in every local build
- * on this project's macOS dev machine and only surfaced as a real build
- * failure the first time `make` ran on a real Linux box (GitHub Actions
- * CI, building this file for the xdp-loadtest workflow) -- a genuine
- * cross-platform portability bug, not a hypothetical one. Must be defined
- * before the first #include, since glibc headers key off it at first
- * inclusion. */
+ * Per (job, round, chunk) slot: EMPTY -> ACCUMULATING -> COMPLETED (tombstone)
+ * -> EMPTY. The first accepted contribution fixes the fan-in and chunk_len;
+ * disagreeing, duplicate and late contributions are counted and dropped.
+ * Design: docs/DESIGN_NOTES.md §Admission, §Slot storage, §Reclamation. */
 #define _POSIX_C_SOURCE 200809L
+
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
@@ -87,268 +17,399 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
-#include "../protocol/grad_proto.h"
+#include "../common/slot_table.h"
+#include "../protocol/grad_parse.h"
+#include "../protocol/netsum_stats.h"
 
-#define SLOT_TABLE_CAPACITY 65536  /* must be a power of 2 */
-#define JOB_TABLE_CAPACITY 256     /* must be a power of 2 -- concurrent distinct job_ids tracked for fairness */
+#define JOB_TABLE_CAPACITY 256
+#define HOUSEKEEPING_MS 50
 
-#define MAX_TRACKED_WORKERS 256
-
-typedef struct {
-    int in_use;
-    uint32_t job_id, round, chunk_id;
-    uint16_t num_workers_expected;
-    uint16_t contributions_received;
-    int32_t sum[NETSUM_MAX_CHUNK_LEN];
-    uint16_t chunk_len;
-    /* See paramserver.c's identical field for why this exists: without it,
-     * a duplicate send from the same worker_id double-counts and closes
-     * the slot with a wrong sum -- the exact failure mode
-     * tests/test_correctness.py's duplicate-worker case checks for. */
-    uint8_t seen_worker[MAX_TRACKED_WORKERS];
-    /* first-contribution-to-last-contribution timing: THIS is where the
-     * real accumulation latency lives in the useragg benchmark
-     * configuration, not at the parameter server -- the parameter server
-     * in "agg" mode receives exactly one already-summed packet per slot,
-     * so its own first-seen-to-complete gap measures nothing meaningful
-     * (an early version of the benchmark harness measured latency there
-     * and got near-zero numbers for every worker count, which was the
-     * tell that something was being measured in the wrong place). */
-    long first_seen_micros;
-    /* Slot-TTL reaper: timestamp of the most recent ACCEPTED contribution
-     * (or slot creation, since creation always immediately processes a
-     * contribution in the same recvfrom() iteration -- see the header
-     * comment's "LAST-TOUCHED, not creation time" note for why this is
-     * "last touched" rather than "first seen"). A slot whose age exceeds
-     * slot_ttl_ms is evicted by reap_expired_slots(). */
-    long last_touched_micros;
-} slot_t;
-
-static slot_t g_slots[SLOT_TABLE_CAPACITY];
-
-/* Multi-tenant fairness -- this is ATP's actual headline contribution
- * (its title is literally "...for Multi-tenant Learning"), reproduced
- * here as a real per-job admission policy rather than left as a "planned"
- * checkbox: the shared slot table is a scarce resource multiple
- * concurrent training jobs can contend for, and without an admission
- * policy, one greedy job spamming many concurrent (round, chunk_id) slots
- * could starve every other job sharing this aggregator. `g_job_quota`, set
- * from the CLI (0 = unlimited, preserving the exact prior behavior for
- * every existing test), caps how many INCOMPLETE slots a single job_id
- * may occupy at once; a job at its quota has its next new-slot attempt
- * rejected outright, the same way a switch with a full slot table would
- * reject it -- it does not touch slots the job already has in flight. */
-static long g_job_quota = 0;  /* 0 = unlimited */
-
-/* Jain's-fairness-index sweep support (scripts/fairness_sweep.py):
- * admitted_count/rejected_count are cumulative, monotonic per-job counters
- * -- unlike concurrent_slots (which drops back down whenever a slot frees),
- * these never decrease, so they always answer "since this job first showed
- * up, how many of its new-slot attempts were let in vs. turned away." Both
- * are bumped at the exact same two call sites concurrent_slots already is
- * (see find_or_create_slot()), so they cost nothing extra on the
- * request path beyond one more integer increment next to one that was
- * already there. */
-typedef struct {
+/* A job entry exists only while the job has ACCUMULATING slots; tombstones
+ * are not charged to the quota, so they do not pin the entry (bug C7). */
+struct job {
     int in_use;
     uint32_t job_id;
-    uint32_t concurrent_slots;
-    uint32_t admitted_count;
-    uint32_t rejected_count;
-} job_entry_t;
+    uint32_t accumulating;
+    uint32_t admitted;
+    uint32_t rejected;
+};
 
-static job_entry_t g_jobs[JOB_TABLE_CAPACITY];
+static struct {
+    struct slot_table table;
+    struct tomb_fifo tombs;
+    struct job jobs[JOB_TABLE_CAPACITY];
+    long quota;
+    long slot_ttl_ms;
+    long tomb_ttl_ms;
+    int quiet;
+    uint64_t stats[NS_STAT__COUNT];
+    int out_sock;
+    struct sockaddr_in downstream;
+    long packets_out;
+    int profile;
+    uint64_t profile_ns, profile_pkts;
+} g;
 
-static uint32_t job_hash(uint32_t job_id) {
-    uint32_t h = job_id;
-    h ^= h >> 16; h *= 0x85ebca6bu; h ^= h >> 13; h *= 0xc2b2ae35u; h ^= h >> 16;
-    return h;
+static volatile sig_atomic_t g_dump_requested, g_stop;
+
+static void on_signal(int sig)
+{
+    if (sig == SIGUSR1)
+        g_dump_requested = 1;
+    else
+        g_stop = 1;
 }
 
-static job_entry_t *find_or_create_job(uint32_t job_id) {
-    uint32_t h = job_hash(job_id);
-    for (size_t probe = 0; probe < JOB_TABLE_CAPACITY; probe++) {
-        size_t idx = (h + probe) & (JOB_TABLE_CAPACITY - 1);
-        job_entry_t *j = &g_jobs[idx];
-        if (!j->in_use) {
-            j->in_use = 1; j->job_id = job_id; j->concurrent_slots = 0;
-            j->admitted_count = 0; j->rejected_count = 0;
-            return j;
-        }
-        if (j->job_id == job_id) return j;
-    }
-    return NULL;  /* more than JOB_TABLE_CAPACITY distinct concurrent job_ids -- not expected at benchmark scale */
+static int64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-static uint64_t slot_key(uint32_t job_id, uint32_t round, uint32_t chunk_id) {
-    uint64_t h = 1469598103934665603ULL;
-    uint32_t fields[3] = {job_id, round, chunk_id};
-    const uint8_t *bytes = (const uint8_t *)fields;
-    for (size_t i = 0; i < sizeof(fields); i++) {
-        h ^= bytes[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-static slot_t *find_or_create_slot(uint32_t job_id, uint32_t round, uint32_t chunk_id) {
-    uint64_t h = slot_key(job_id, round, chunk_id);
-    for (size_t probe = 0; probe < SLOT_TABLE_CAPACITY; probe++) {
-        size_t idx = (h + probe) & (SLOT_TABLE_CAPACITY - 1);
-        slot_t *s = &g_slots[idx];
-        if (!s->in_use) {
-            /* About to CREATE a brand-new slot for this job -- this is the
-             * one place the fairness admission policy applies. An
-             * existing slot this job already holds is never affected by
-             * its own quota; only a NEW one can be rejected. */
-            job_entry_t *job = find_or_create_job(job_id);
-            if (job && g_job_quota > 0 && job->concurrent_slots >= (uint32_t)g_job_quota) {
-                job->rejected_count++;
-                return NULL;
-            }
-            memset(s, 0, sizeof(*s));
-            s->in_use = 1;
-            s->job_id = job_id;
-            s->round = round;
-            s->chunk_id = chunk_id;
-            if (job) { job->concurrent_slots++; job->admitted_count++; }
-            return s;
-        }
-        if (s->job_id == job_id && s->round == round && s->chunk_id == chunk_id) {
-            return s;
-        }
-    }
+static struct job *job_find(uint32_t job_id)
+{
+    for (int i = 0; i < JOB_TABLE_CAPACITY; i++)
+        if (g.jobs[i].in_use && g.jobs[i].job_id == job_id)
+            return &g.jobs[i];
     return NULL;
 }
 
-/* A completed slot is freed immediately after emitting -- unlike the
- * parameter server (which keeps completed slots around for the benchmark
- * harness to inspect), the aggregator's slot table must not grow without
- * bound across a long run, so this frees the entry back to "not in use"
- * once it closes. This mirrors a real constraint the eventual BPF map
- * (fixed-size, no growth) will have too. */
-static void free_slot(slot_t *s) {
-    job_entry_t *job = find_or_create_job(s->job_id);  /* must already exist -- this slot incremented it on creation */
-    if (job && job->concurrent_slots > 0) job->concurrent_slots--;
-    s->in_use = 0;
+static struct job *job_get(uint32_t job_id)
+{
+    struct job *j = job_find(job_id);
+    if (j)
+        return j;
+    for (int i = 0; i < JOB_TABLE_CAPACITY; i++)
+        if (!g.jobs[i].in_use) {
+            g.jobs[i] = (struct job){1, job_id, 0, 0, 0};
+            return &g.jobs[i];
+        }
+    return NULL;
 }
 
-static long now_micros(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (long)tv.tv_sec * 1000000L + tv.tv_usec;
-}
-
-/* Jain's-fairness-index sweep stats emission (scripts/fairness_sweep.py):
- * driven entirely from OUTSIDE this process (a SIGUSR1 sent by the sweep
- * script), not by a new listener socket or a per-packet log line -- this
- * flag is the only thing the signal handler itself touches (async-signal-
- * safe: sig_atomic_t, no I/O in the handler), and the actual dump happens
- * on the main loop's own thread the next time it's checked, exactly like
- * the existing TTL-reaper's periodic sweep. */
-static volatile sig_atomic_t g_dump_stats_requested = 0;
-
-static void handle_sigusr1(int sig) {
-    (void)sig;
-    g_dump_stats_requested = 1;
-}
-
-/* Deliberately no SA_RESTART: when slot_ttl_ms==0 (the original, still-
- * default behavior), in_sock's recvfrom() blocks with no timeout at all --
- * without SA_RESTART, a delivered SIGUSR1 interrupts that blocking call
- * (EINTR) instead of silently resuming it, so the stats dump below runs
- * promptly instead of waiting for a packet that may never come. The main
- * loop's existing `n < NETSUM_HDR_SIZE` check already treats EINTR's -1
- * return as a harmless no-op iteration, the same as the SO_RCVTIMEO
- * EWOULDBLOCK case slot_ttl_ms>0 relies on -- see the header comment's
- * "Mechanism note." */
-static void install_sigusr1_handler(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = handle_sigusr1;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGUSR1, &sa, NULL);
-}
-
-/* Dumps one JSON line per currently-tracked job to stderr: {job_id,
- * concurrent_slots, admitted_count, rejected_count}. concurrent_slots is
- * the live, momentary occupancy (drops back down when a slot frees);
- * admitted_count/rejected_count are the cumulative counters above. A
- * "[stats]" prefix lets a sweep script grep its own signal-request out of
- * whatever else this process is logging, the same convention
- * "[admission-reject]" and "[reaped]" already use. */
-static void dump_job_stats(void) {
-    for (size_t i = 0; i < JOB_TABLE_CAPACITY; i++) {
-        job_entry_t *j = &g_jobs[i];
-        if (!j->in_use) continue;
-        fprintf(stderr,
-            "[stats] {\"job_id\":%u,\"concurrent_slots\":%u,\"admitted_count\":%u,\"rejected_count\":%u}\n",
-            j->job_id, j->concurrent_slots, j->admitted_count, j->rejected_count);
+static void job_release_slot(uint32_t job_id)
+{
+    struct job *j = job_find(job_id);
+    if (!j)
+        return;
+    if (j->accumulating > 0)
+        j->accumulating--;
+    if (j->accumulating == 0) {
+        if (!g.quiet)
+            fprintf(stderr, "[job-retired] {\"job_id\":%u,\"admitted_count\":%u,\"rejected_count\":%u}\n",
+                    j->job_id, j->admitted, j->rejected);
+        j->in_use = 0;
     }
+}
+
+static void dump_stats(void)
+{
+    for (int i = 0; i < JOB_TABLE_CAPACITY; i++) {
+        struct job *j = &g.jobs[i];
+        if (j->in_use)
+            fprintf(stderr,
+                    "[stats] {\"job_id\":%u,\"concurrent_slots\":%u,\"admitted_count\":%u,\"rejected_count\":%u}\n",
+                    j->job_id, j->accumulating, j->admitted, j->rejected);
+    }
+    size_t by_state[4] = {0};
+    for (size_t i = 0; i < g.table.cap; i++)
+        by_state[g.table.slots[i].state & 3]++;
+    fprintf(stderr, "[stats-all] {");
+    for (int i = 0; i < NS_STAT__COUNT; i++)
+        fprintf(stderr, "\"%s\":%llu,", netsum_stat_names[i], (unsigned long long)g.stats[i]);
+    fprintf(stderr, "\"slots_accumulating\":%zu,\"slots_completed\":%zu,\"slots_flushed\":%zu,"
+            "\"profile_ns\":%llu,\"profile_pkts\":%llu}\n",
+            by_state[SLOT_ACCUMULATING], by_state[SLOT_COMPLETED], by_state[SLOT_FLUSHED],
+            (unsigned long long)g.profile_ns, (unsigned long long)g.profile_pkts);
     fflush(stderr);
 }
 
-/* Slot-TTL reaper: a plain linear scan of the fixed-size slot table. This
- * is fine at benchmark scale (SLOT_TABLE_CAPACITY entries, swept only a
- * few times per second -- see the interval computation in main()), the
- * same "fixed-size table, no growth" constraint the eventual BPF map will
- * share. Any slot whose age (now - last_touched_micros) exceeds
- * slot_ttl_ms is evicted via free_slot() -- the exact same path a normal
- * completion uses -- so the owning job's concurrent_slots fairness count
- * decrements correctly instead of leaking. */
-static void reap_expired_slots(long slot_ttl_ms) {
-    long now = now_micros();
-    long ttl_micros = slot_ttl_ms * 1000L;
-    for (size_t i = 0; i < SLOT_TABLE_CAPACITY; i++) {
-        slot_t *s = &g_slots[i];
-        if (!s->in_use) continue;
-        long age_micros = now - s->last_touched_micros;
-        if (age_micros >= ttl_micros) {
-            fprintf(stderr,
-                "[reaped] job=%u round=%u chunk=%u -- incomplete after %ldms, evicting\n",
-                s->job_id, s->round, s->chunk_id, age_micros / 1000);
-            free_slot(s);
+/* Drops ACCUMULATING slots idle for longer than the TTL (crashed workers).
+ * Backward-shift deletion moves a later entry into index i, so i is
+ * re-examined after a delete instead of advancing. */
+static void reap_expired(int64_t now)
+{
+    int64_t ttl = (int64_t)g.slot_ttl_ms * 1000;
+    size_t i = 0;
+    while (i < g.table.cap) {
+        struct slot *s = &g.table.slots[i];
+        if (s->state == SLOT_ACCUMULATING && now - s->touched_us >= ttl) {
+            fprintf(stderr, "[reaped] job=%u round=%u chunk=%u -- incomplete after %lldms, evicting\n",
+                    s->key.job_id, s->key.round, s->key.chunk_id,
+                    (long long)((now - s->touched_us) / 1000));
+            uint32_t job_id = s->key.job_id;
+            st_delete(&g.table, s);
+            job_release_slot(job_id);
+            g.stats[NS_SLOT_REAPED]++;
+            continue;
         }
+        i++;
     }
 }
 
-int main(int argc, char **argv) {
-    if (argc < 4) {
+static void emit_aggregate(const struct slot *s, uint16_t extra_flags)
+{
+    uint8_t out[NETSUM_MAX_PACKET_SIZE];
+    struct grad_hdr *h = (struct grad_hdr *)out;
+    int32_t *vals = (int32_t *)(out + NETSUM_HDR_SIZE);
+    h->job_id = htonl(s->key.job_id);
+    h->round = htonl(s->key.round);
+    h->chunk_id = htonl(s->key.chunk_id);
+    h->worker_id = htons(NETSUM_WORKER_AGGREGATE);
+    h->num_workers = htons(s->fanin);
+    h->chunk_len = htons(s->chunk_len);
+    h->flags = htons((uint16_t)(NETSUM_FLAGS_V2 | extra_flags | (s->overflowed ? NETSUM_F_OVERFLOW : 0)));
+    for (int i = 0; i < s->chunk_len; i++)
+        vals[i] = (int32_t)htonl((uint32_t)s->sum[i]);
+    memcpy(out + NETSUM_HDR_SIZE + (size_t)s->chunk_len * 4, s->bitmap, NETSUM_BITMAP_BYTES);
+    size_t len = NETSUM_HDR_SIZE + (size_t)s->chunk_len * 4 + NETSUM_BITMAP_BYTES;
+    if (sendto(g.out_sock, out, len, 0, (struct sockaddr *)&g.downstream, sizeof(g.downstream)) < 0) {
+        perror("sendto(downstream)");
+        return;
+    }
+    g.packets_out++;
+    g.stats[(extra_flags & NETSUM_F_PARTIAL) ? NS_TX_PARTIAL : NS_TX_AGGREGATE]++;
+}
+
+/* Forwards a raw contribution unchanged except for the FALLBACK flag, so the
+ * parameter server aggregates it itself. */
+static void forward_fallback(const uint8_t *pkt, const struct netsum_parsed *p)
+{
+    uint8_t out[NETSUM_MAX_PACKET_SIZE];
+    size_t len = NETSUM_HDR_SIZE + p->payload_len;
+    memcpy(out, pkt, len);
+    ((struct grad_hdr *)out)->flags = htons((uint16_t)(p->flags | NETSUM_F_FALLBACK));
+    if (sendto(g.out_sock, out, len, 0, (struct sockaddr *)&g.downstream, sizeof(g.downstream)) >= 0)
+        g.stats[NS_TX_FALLBACK]++;
+}
+
+static void retire_state(struct slot *s, int64_t now, uint8_t state)
+{
+    s->state = state;
+    s->completed_us = now;
+    g.stats[NS_SLOT_RETIRED_TTL] += (uint64_t)tomb_push(&g.tombs, &g.table, s->key, now);
+}
+
+/* ACK from the parameter server: the key is finished everywhere, so drop all
+ * state for it. An ACK for a slot still accumulating means the PS completed
+ * the key without us (fallback or partials); our partial sum is stale. */
+static void handle_ack(const struct netsum_parsed *p)
+{
+    g.stats[NS_ACK_SEEN]++;
+    struct slot *s = st_find(&g.table, (struct slot_key){p->job_id, p->round, p->chunk_id});
+    if (!s) {
+        g.stats[NS_ACK_UNEXPECTED]++;
+        return;
+    }
+    if (s->state == SLOT_ACCUMULATING) {
+        g.stats[NS_ACK_UNEXPECTED]++;
+        uint32_t job_id = s->key.job_id;
+        st_delete(&g.table, s);
+        job_release_slot(job_id);
+        return;
+    }
+    st_delete(&g.table, s);
+    g.stats[NS_SLOT_RETIRED_ACK]++;
+}
+
+static void admission_reject(const struct netsum_parsed *p, enum netsum_stat why)
+{
+    g.stats[why]++;
+    if (!g.quiet)
         fprintf(stderr,
-            "usage: %s <listen_port> <downstream_ip> <downstream_port> [max_packets=0] [max_slots_per_job=0] [slot_ttl_ms=0]\n"
-            "  max_slots_per_job: fairness admission quota -- caps how many\n"
-            "  concurrently-incomplete slots a single job_id may occupy (0 =\n"
-            "  unlimited, the original behavior). Reproduces ATP's actual\n"
-            "  headline contribution: a shared aggregator serving multiple\n"
-            "  tenants must not let one greedy job starve the others.\n"
-            "  slot_ttl_ms: eviction timeout for a slot that never completes\n"
-            "  (e.g. a crashed/dropped worker) -- 0 = disabled, the original\n"
-            "  behavior. Without this, an incomplete slot occupies its\n"
-            "  g_slots entry AND its job's fairness-quota allowance forever.\n"
-            "  SIGUSR1 (send from outside, e.g. scripts/fairness_sweep.py):\n"
-            "  dumps one '[stats] {...}' JSON line per tracked job_id to\n"
-            "  stderr -- {job_id, concurrent_slots, admitted_count,\n"
-            "  rejected_count} -- for a formal Jain's-fairness-index sweep.\n",
-            argv[0]);
+                "[admission-reject] job=%u round=%u chunk=%u -- slot table full or job at fairness quota, dropping\n",
+                p->job_id, p->round, p->chunk_id);
+}
+
+static void handle_contribution(const uint8_t *pkt, const struct netsum_parsed *p, int64_t now)
+{
+    struct slot_key key = {p->job_id, p->round, p->chunk_id};
+    struct slot *s = st_find(&g.table, key);
+
+    if (!s) {
+        struct job *j = job_get(p->job_id);
+        if (!j) {
+            admission_reject(p, NS_DROP_JOB_TABLE_FULL); /* fail closed */
+            return;
+        }
+        if (g.quota > 0 && j->accumulating >= (uint32_t)g.quota) {
+            j->rejected++;
+            admission_reject(p, NS_DROP_QUOTA);
+            return;
+        }
+        s = st_insert(&g.table, key);
+        if (!s) {
+            if (j->accumulating == 0)
+                j->in_use = 0;
+            admission_reject(p, NS_DROP_MAP_FULL);
+            return;
+        }
+        s->fanin = p->num_workers;
+        s->chunk_len = p->chunk_len;
+        s->first_us = now;
+        j->accumulating++;
+        j->admitted++;
+        g.stats[NS_SLOT_CREATED]++;
+    }
+
+    if (p->num_workers != s->fanin) {
+        g.stats[NS_NUM_WORKERS_MISMATCH]++;
+        if (!g.quiet)
+            fprintf(stderr, "[num_workers mismatch] job=%u round=%u chunk=%u worker=%u sent num_workers=%u, slot expects %u -- dropping\n",
+                    p->job_id, p->round, p->chunk_id, p->worker_id, p->num_workers, s->fanin);
+        return;
+    }
+    if (p->chunk_len != s->chunk_len) {
+        g.stats[NS_CHUNK_LEN_MISMATCH]++;
+        if (!g.quiet)
+            fprintf(stderr, "[chunk_len mismatch] job=%u round=%u chunk=%u worker=%u sent chunk_len=%u, slot expects %u -- dropping\n",
+                    p->job_id, p->round, p->chunk_id, p->worker_id, p->chunk_len, s->chunk_len);
+        return;
+    }
+    int resend = (p->flags & NETSUM_F_RESEND) != 0;
+    if (s->state == SLOT_COMPLETED) {
+        if (resend) {
+            /* The aggregate or the PS's result was lost: send the stored sum again. */
+            g.stats[NS_TX_RESULT_RESEND]++;
+            emit_aggregate(s, 0);
+            return;
+        }
+        g.stats[NS_LATE_DUPLICATE]++;
+        if (!g.quiet)
+            fprintf(stderr, "[late-dup] job=%u round=%u chunk=%u worker=%u -- round already completed\n",
+                    p->job_id, p->round, p->chunk_id, p->worker_id);
+        return;
+    }
+    if (s->state == SLOT_FLUSHED) {
+        if (bitmap_test(s->bitmap, p->worker_id) && !resend) {
+            g.stats[NS_DUPLICATE]++;
+            return;
+        }
+        forward_fallback(pkt, p); /* the PS owns this key now */
+        return;
+    }
+    if (bitmap_test(s->bitmap, p->worker_id) && resend) {
+        /* A worker resending something we hold: the round is stuck on another
+         * worker's lost packet. Hand the partial sum to the PS (ATP's flush). */
+        g.stats[NS_RESEND_DUPLICATE]++;
+        g.stats[NS_SLOT_FLUSHED_PARTIAL]++;
+        emit_aggregate(s, NETSUM_F_PARTIAL);
+        uint32_t job_id = s->key.job_id;
+        retire_state(s, now, SLOT_FLUSHED);
+        job_release_slot(job_id);
+        return;
+    }
+    if (bitmap_test(s->bitmap, p->worker_id)) {
+        g.stats[NS_DUPLICATE]++;
+        if (!g.quiet)
+            fprintf(stderr, "[dup] job=%u round=%u chunk=%u worker=%u already contributed -- dropping duplicate\n",
+                    p->job_id, p->round, p->chunk_id, p->worker_id);
+        return;
+    }
+
+    const uint8_t *v = pkt + NETSUM_HDR_SIZE;
+    for (int i = 0; i < p->chunk_len; i++) {
+        uint32_t be;
+        memcpy(&be, v + 4 * i, 4);
+        s->overflowed |= (uint8_t)netsum_add_i32(&s->sum[i], (int32_t)ntohl(be));
+    }
+    bitmap_set(s->bitmap, p->worker_id);
+    s->contributions++;
+    s->contributors++;
+    s->touched_us = now;
+    g.stats[NS_ACCEPTED]++;
+    if (s->contributors < s->fanin)
+        return;
+
+    if (s->overflowed) {
+        g.stats[NS_OVERFLOW]++;
+        fprintf(stderr, "[overflow] job=%u round=%u chunk=%u contributions=%u -- sum not representable in Q16.16\n",
+                p->job_id, p->round, p->chunk_id, s->contributions);
+    } else if (!g.quiet) {
+        fprintf(stderr, "[complete] job=%u round=%u chunk=%u contributions=%u sum[0]=%.6f latency_us=%lld\n",
+                p->job_id, p->round, p->chunk_id, s->contributions, netsum_to_double(s->sum[0]),
+                (long long)(now - s->first_us));
+    }
+    emit_aggregate(s, 0);
+    g.stats[NS_SLOT_COMPLETED]++;
+    retire_state(s, now, SLOT_COMPLETED);
+    job_release_slot(p->job_id);
+}
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+            "usage: %s [--slot-capacity-log2 N] [--tombstone-ttl-ms N] [--quiet] [--profile]\n"
+            "          <listen_port> <downstream_ip> <downstream_port>\n"
+            "          [max_packets=0] [max_slots_per_job=0] [slot_ttl_ms=0]\n"
+            "  max_slots_per_job: per-job cap on ACCUMULATING slots (0 = none)\n"
+            "  slot_ttl_ms:       drop ACCUMULATING slots idle this long (0 = never)\n"
+            "  --tombstone-ttl-ms: keep completed rounds this long to absorb late\n"
+            "                     duplicates (default 2000)\n"
+            "  SIGUSR1 prints [stats] per job and one [stats-all] counter line.\n",
+            prog);
+}
+
+int main(int argc, char **argv)
+{
+    unsigned cap_log2 = 16;
+    g.tomb_ttl_ms = 2000;
+    int a = 1;
+    for (; a < argc && strncmp(argv[a], "--", 2) == 0; a++) {
+        if (strcmp(argv[a], "--quiet") == 0) {
+            g.quiet = 1;
+        } else if (strcmp(argv[a], "--profile") == 0) {
+            g.profile = 1;
+        } else if (strcmp(argv[a], "--slot-capacity-log2") == 0 && a + 1 < argc) {
+            cap_log2 = (unsigned)atoi(argv[++a]);
+            if (cap_log2 < 4 || cap_log2 > 22) {
+                fprintf(stderr, "--slot-capacity-log2 must be in [4, 22]\n");
+                return 1;
+            }
+        } else if (strcmp(argv[a], "--tombstone-ttl-ms") == 0 && a + 1 < argc) {
+            g.tomb_ttl_ms = atol(argv[++a]);
+        } else {
+            usage(argv[0]);
+            return 1;
+        }
+    }
+    if (argc - a < 3) {
+        usage(argv[0]);
         return 1;
     }
-    int listen_port = atoi(argv[1]);
-    const char *downstream_ip = argv[2];
-    int downstream_port = atoi(argv[3]);
-    long max_packets = argc > 4 ? atol(argv[4]) : 0;
-    g_job_quota = argc > 5 ? atol(argv[5]) : 0;
-    long slot_ttl_ms = argc > 6 ? atol(argv[6]) : 0;
+    int listen_port = atoi(argv[a]);
+    const char *downstream_ip = argv[a + 1];
+    int downstream_port = atoi(argv[a + 2]);
+    long max_packets = argc - a > 3 ? atol(argv[a + 3]) : 0;
+    g.quota = argc - a > 4 ? atol(argv[a + 4]) : 0;
+    g.slot_ttl_ms = argc - a > 5 ? atol(argv[a + 5]) : 0;
 
-    install_sigusr1_handler();
+    if (st_init(&g.table, cap_log2) != 0 || tomb_init(&g.tombs, g.table.cap) != 0) {
+        fprintf(stderr, "out of memory for slot table\n");
+        return 1;
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal; /* no SA_RESTART: recvfrom returns EINTR */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
 
     int in_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (in_sock < 0) { perror("socket(in)"); return 1; }
-    int reuse = 1;
-    setsockopt(in_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
+    if (in_sock < 0) {
+        perror("socket(in)");
+        return 1;
+    }
+    int one = 1;
+    setsockopt(in_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    int rcvbuf = 4 << 20;
+    setsockopt(in_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     struct sockaddr_in in_addr;
     memset(&in_addr, 0, sizeof(in_addr));
     in_addr.sin_family = AF_INET;
@@ -359,200 +420,78 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Only installed when the TTL reaper is actually enabled -- when
-     * slot_ttl_ms == 0, in_sock stays exactly as blocking-with-no-timeout
-     * as it always was, so every existing test's behavior is byte-for-byte
-     * unchanged. When enabled, the timeout is a quarter of the TTL (floor
-     * 1ms) so the reaper sweeps several times per TTL window -- fine
-     * granularity without spinning -- and a recvfrom() that times out
-     * returns EWOULDBLOCK/EAGAIN, which the main loop's existing
-     * `n < NETSUM_HDR_SIZE` check already treats as a harmless no-op
-     * iteration (see the header comment's "Mechanism note"). */
-    long reap_interval_micros = 0;
-    if (slot_ttl_ms > 0) {
-        long interval_ms = slot_ttl_ms / 4;
-        if (interval_ms < 1) interval_ms = 1;
-        reap_interval_micros = interval_ms * 1000L;
-        struct timeval rcv_timeout;
-        rcv_timeout.tv_sec = interval_ms / 1000;
-        rcv_timeout.tv_usec = (interval_ms % 1000) * 1000;
-        setsockopt(in_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
-    }
+    /* Wake periodically so tombstone expiry and the TTL reaper run when idle. */
+    long tick_ms = HOUSEKEEPING_MS;
+    if (g.slot_ttl_ms > 0 && g.slot_ttl_ms / 4 < tick_ms)
+        tick_ms = g.slot_ttl_ms / 4 > 0 ? g.slot_ttl_ms / 4 : 1;
+    struct timeval tv = {tick_ms / 1000, (tick_ms % 1000) * 1000};
+    setsockopt(in_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    int out_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (out_sock < 0) { perror("socket(out)"); return 1; }
-    struct sockaddr_in downstream;
-    memset(&downstream, 0, sizeof(downstream));
-    downstream.sin_family = AF_INET;
-    downstream.sin_port = htons((uint16_t)downstream_port);
-    if (inet_pton(AF_INET, downstream_ip, &downstream.sin_addr) != 1) {
+    g.out_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g.out_sock < 0) {
+        perror("socket(out)");
+        return 1;
+    }
+    memset(&g.downstream, 0, sizeof(g.downstream));
+    g.downstream.sin_family = AF_INET;
+    g.downstream.sin_port = htons((uint16_t)downstream_port);
+    if (inet_pton(AF_INET, downstream_ip, &g.downstream.sin_addr) != 1) {
         fprintf(stderr, "invalid downstream_ip: %s\n", downstream_ip);
         return 1;
     }
-
     fprintf(stderr, "userspace aggregator listening on :%d, forwarding to %s:%d\n",
             listen_port, downstream_ip, downstream_port);
 
-    uint8_t in_packet[NETSUM_MAX_PACKET_SIZE];
-    uint8_t out_packet[NETSUM_MAX_PACKET_SIZE];
-    long packets_in = 0, packets_out = 0;
-    long last_reap_micros = now_micros();
-
-    while (max_packets == 0 || packets_in < max_packets) {
-        if (slot_ttl_ms > 0) {
-            long now = now_micros();
-            if (now - last_reap_micros >= reap_interval_micros) {
-                reap_expired_slots(slot_ttl_ms);
-                last_reap_micros = now;
-            }
+    uint8_t pkt[NETSUM_MAX_PACKET_SIZE + 1];
+    long packets_in = 0;
+    int64_t last_reap = now_us();
+    while (!g_stop && (max_packets == 0 || packets_in < max_packets)) {
+        int64_t now = now_us();
+        if (g.slot_ttl_ms > 0 && now - last_reap >= (int64_t)tick_ms * 1000) {
+            reap_expired(now);
+            last_reap = now;
+        }
+        g.stats[NS_SLOT_RETIRED_TTL] += (uint64_t)tomb_expire(&g.tombs, &g.table, now,
+                                                             (int64_t)g.tomb_ttl_ms * 1000);
+        if (g_dump_requested) {
+            g_dump_requested = 0;
+            dump_stats();
         }
 
-        if (g_dump_stats_requested) {
-            dump_job_stats();
-            g_dump_stats_requested = 0;
-        }
-
-        ssize_t n = recvfrom(in_sock, in_packet, sizeof(in_packet), 0, NULL, NULL);
-        if (n < (ssize_t)NETSUM_HDR_SIZE) continue;  /* also catches the SO_RCVTIMEO EWOULDBLOCK/EAGAIN wakeup, and now a SIGUSR1-interrupted recvfrom's EINTR too -- none are real errors, none are counted */
+        ssize_t n = recvfrom(in_sock, pkt, sizeof(pkt), 0, NULL, NULL);
+        if (n < 0)
+            continue; /* EINTR (SIGUSR1) or EAGAIN (housekeeping tick) */
         packets_in++;
-
-        struct grad_hdr *hdr = (struct grad_hdr *)in_packet;
-        int32_t *values = (int32_t *)(in_packet + NETSUM_HDR_SIZE);
-
-        uint32_t job_id = ntohl(hdr->job_id);
-        uint32_t round = ntohl(hdr->round);
-        uint32_t chunk_id = ntohl(hdr->chunk_id);
-        uint16_t worker_id = ntohs(hdr->worker_id);
-        uint16_t num_workers = ntohs(hdr->num_workers);
-        uint16_t chunk_len = ntohs(hdr->chunk_len);
-
-        if (chunk_len > NETSUM_MAX_CHUNK_LEN) continue;  /* malformed, drop -- mirrors XDP_DROP for a bad parse */
-        /* CRITICAL FIX (found by an adversarial review that also reviewed
-         * xdp_agg.c, comparing the two): this check was missing entirely.
-         * `in_packet` is a fixed-size buffer reused across every
-         * recvfrom() call and NEVER cleared between them. Without
-         * verifying the actual received length `n` covers
-         * NETSUM_HDR_SIZE + chunk_len*sizeof(int32_t), a truncated/
-         * malformed datagram that merely CLAIMS a large chunk_len (while
-         * actually being short) would read past what this packet really
-         * delivered and silently sum stale leftover bytes from a PRIOR,
-         * larger packet into the running total -- with no crash, no log,
-         * nothing to signal the corruption. The XDP program (xdp_agg.c)
-         * already had the equivalent check against `data_end`; this
-         * brings the two back into the "byte-for-byte the same algorithm"
-         * parity this file's own header comment claims. */
-        if ((size_t)n < NETSUM_HDR_SIZE + (size_t)chunk_len * sizeof(int32_t)) continue;
-        if (worker_id >= MAX_TRACKED_WORKERS) continue;
-        /* Reject a degenerate/out-of-range num_workers before it can ever
-         * create a slot that could never legitimately complete (0) or
-         * that exceeds what MAX_TRACKED_WORKERS' seen_worker[] can even
-         * track -- same fix as xdp_agg.c's slot-creation validation, same
-         * reasoning: a bad value here would otherwise occupy one of the
-         * 65536 slot-table entries forever, with no TTL/eviction. */
-        if (num_workers == 0 || num_workers > MAX_TRACKED_WORKERS) continue;
-
-        slot_t *slot = find_or_create_slot(job_id, round, chunk_id);
-        if (!slot) {
-            /* Two different reasons collapse to the same NULL return from
-             * find_or_create_slot(): the whole 65536-entry table is full
-             * (essentially never at benchmark scale), or -- the
-             * realistic case when g_job_quota > 0 -- this specific job_id
-             * is already at its fairness quota. Logged distinctly so a
-             * fairness benchmark can grep for exactly the rejection it's
-             * testing for. */
-            fprintf(stderr,
-                "[admission-reject] job=%u round=%u chunk=%u -- slot table full or job at fairness quota, dropping\n",
-                job_id, round, chunk_id);
+        g.stats[NS_RX_TOTAL]++;
+        struct netsum_parsed p;
+        enum netsum_verdict v = netsum_parse(pkt, pkt + n, &p);
+        if (v != NETSUM_OK) {
+            g.stats[NS_FROM_VERDICT(v)]++;
             continue;
         }
-
-        if (slot->contributions_received == 0) {
-            slot->chunk_len = chunk_len;
-            slot->num_workers_expected = num_workers;
-            slot->first_seen_micros = now_micros();
-        } else if (slot->chunk_len != chunk_len) {
-            /* Same fix as xdp_agg.c's chunk_len-consistency check: a
-             * contribution that disagrees with the slot's established
-             * chunk_len would otherwise get summed using its OWN chunk_len
-             * as the loop bound below, silently producing a sum
-             * inconsistent with what any single worker actually sent.
-             * Reject the one inconsistent contribution, not the whole
-             * slot. */
-            fprintf(stderr,
-                "[chunk_len mismatch] job=%u round=%u chunk=%u worker=%u sent chunk_len=%u, slot expects %u -- dropping\n",
-                job_id, round, chunk_id, worker_id, chunk_len, slot->chunk_len);
+        if (p.kind == NETSUM_KIND_ACK) {
+            handle_ack(&p);
             continue;
         }
-
-        if (slot->seen_worker[worker_id]) {
-            fprintf(stderr,
-                "[dup] job=%u round=%u chunk=%u worker=%u already contributed -- dropping duplicate\n",
-                job_id, round, chunk_id, worker_id);
+        if (p.kind != NETSUM_KIND_RAW) {
+            g.stats[NS_REJ_KIND]++;
             continue;
         }
-        slot->seen_worker[worker_id] = 1;
-        /* "Last touched," not "first seen": this line is why a slot still
-         * receiving genuine contributions never gets reaped, even if it's
-         * been open a long time -- only one that's gone fully silent for
-         * the whole TTL window does. See the header comment's "LAST-
-         * TOUCHED, not creation time" note. */
-        slot->last_touched_micros = now_micros();
-
-        for (int i = 0; i < chunk_len && i < NETSUM_MAX_CHUNK_LEN; i++) {
-            slot->sum[i] += (int32_t)ntohl((uint32_t)values[i]);
-        }
-        slot->contributions_received++;
-
-        if (slot->contributions_received < slot->num_workers_expected) {
-            /* Partial contribution: fully absorbed, nothing forwarded --
-             * mirrors XDP_DROP in the eventual kernel program. This is the
-             * mechanism that cuts aggregator-uplink traffic: N raw packets
-             * in, exactly one summed packet out. */
-            continue;
-        }
-
-        /* Last contribution just arrived: this is the real "aggregation
-         * completed" event the benchmark harness needs a timestamp for --
-         * logged in the same "[complete] ... latency_us=" shape
-         * paramserver.c uses (same regex parses both), so
-         * scripts/benchmark.py can pull the true accumulation latency from
-         * here instead of the parameter server, which in "agg" mode only
-         * ever sees a single already-summed packet and so measures nothing
-         * meaningful of its own. */
-        long completed_micros = now_micros();
-        fprintf(stderr,
-            "[complete] job=%u round=%u chunk=%u contributions=%u sum[0]=%.6f latency_us=%ld\n",
-            job_id, round, chunk_id, slot->contributions_received,
-            netsum_to_double(slot->sum[0]), completed_micros - slot->first_seen_micros);
-
-        /* Emit exactly one aggregated packet downstream -- mirrors XDP_TX
-         * in the eventual kernel program, and is the only place this
-         * process's slot state crosses back onto the wire. */
-        struct grad_hdr *out_hdr = (struct grad_hdr *)out_packet;
-        int32_t *out_values = (int32_t *)(out_packet + NETSUM_HDR_SIZE);
-        out_hdr->job_id = htonl(job_id);
-        out_hdr->round = htonl(round);
-        out_hdr->chunk_id = htonl(chunk_id);
-        out_hdr->worker_id = htons(0);       /* aggregated: no single worker owns this */
-        out_hdr->num_workers = htons(1);     /* tells the receiver: exactly one contribution closes this slot */
-        out_hdr->chunk_len = htons(slot->chunk_len);
-        out_hdr->flags = htons(0);
-        for (int i = 0; i < slot->chunk_len; i++) {
-            out_values[i] = htonl((uint32_t)slot->sum[i]);
-        }
-        size_t out_len = NETSUM_HDR_SIZE + (size_t)slot->chunk_len * sizeof(int32_t);
-        if (sendto(out_sock, out_packet, out_len, 0,
-                   (struct sockaddr *)&downstream, sizeof(downstream)) < 0) {
-            perror("sendto(downstream)");
+        if (g.profile) { /* algorithm cost only: excludes recvfrom, includes the forward sendto */
+            struct timespec t1, t2;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            handle_contribution(pkt, &p, now_us());
+            clock_gettime(CLOCK_MONOTONIC, &t2);
+            g.profile_ns += (uint64_t)((t2.tv_sec - t1.tv_sec) * 1000000000LL + (t2.tv_nsec - t1.tv_nsec));
+            g.profile_pkts++;
         } else {
-            packets_out++;
+            handle_contribution(pkt, &p, now_us());
         }
-        free_slot(slot);
     }
-
     fprintf(stderr, "userspace aggregator: %ld packets in, %ld aggregated packets out\n",
-            packets_in, packets_out);
+            packets_in, g.packets_out);
+    dump_stats();
     close(in_sock);
-    close(out_sock);
+    close(g.out_sock);
     return 0;
 }

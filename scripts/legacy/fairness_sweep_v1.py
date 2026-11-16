@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""NetSum formal Jain's-fairness-index sweep: quantifies ATP's actual
-headline contribution (its paper's own title is literally "...for
-Multi-tenant Learning") with a real, measured curve instead of the existing
+# HISTORY (v1): measured the quota clipping identity min(demand, quota) with
+# jobs that never complete; superseded by the fairness sweep in
+# scripts/bench_v2.sh. Output: bench/v1-macos-loopback/fairness_results.csv.
+"""NetSum v1 Jain's-fairness-index sweep over the per-job admission quota
+(a NetSum policy; ATP's multi-tenancy mechanism is fallback to the PS), with a real, measured curve instead of the existing
 qualitative-only proof (tests/test_correctness.py's
 test_fairness_quota_isolates_greedy_job: one greedy job's excess request
 gets rejected once). That test proves the mechanism *fires*; this script
@@ -56,7 +58,7 @@ import signal
 import sys
 import time
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(REPO_ROOT, "bin")
 AGG = os.path.join(BIN, "agg")
 PARAMSERVER = os.path.join(BIN, "paramserver")
@@ -170,7 +172,7 @@ def main():
                          help="comma-separated quota values to sweep (0 = unlimited)")
     parser.add_argument("--repeats", type=int, default=3,
                          help="repeats per quota value, to check for variance (default: 3)")
-    parser.add_argument("--out", default=os.path.join(REPO_ROOT, "bench", "fairness_results.csv"))
+    parser.add_argument("--out", default=os.path.join(REPO_ROOT, "bench", "v1-macos-loopback", "fairness_results.csv"))
     args = parser.parse_args()
 
     quotas = [int(q.strip()) for q in args.quotas.split(",") if q.strip() != ""]
