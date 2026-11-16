@@ -50,6 +50,7 @@ test: all unit
 	python3 tests/test_reliability.py
 	python3 tests/test_fallback.py
 	python3 tests/test_python_client.py
+	python3 tests/test_scaled.py
 
 # On Linux with libbpf headers installed, build against the real UAPI and
 # libbpf headers; otherwise use the vendored subset in xdp_agg/bpf_compat.h.

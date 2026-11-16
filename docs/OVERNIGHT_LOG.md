@@ -561,3 +561,32 @@ checks on deb3d6b: all success (see PR body for run IDs)
 - Linux: `sudo scripts/topo.sh up && make bpf all ctl && sudo ./bin/netsum-ctl attach --ifname veth_w0 --ifname veth_p0 --mode auto && …` (README Quick start)
 - CI: workflows on this PR. Artifacts: `xdp-loadtest-evidence`, `netsum-bench-<id>`, `train-demo-<id>`.
 
+
+## 2026-11-16 11:47 IST — Next step: per-chunk shared exponent (wire v3)
+
+Branch `feature/shared-exponent` from `main` (`795339b`), worktree
+`../netsum-scaled`. Chosen because docs/RESULTS.md names it as the top next
+step: Q16.16 rounds gradients below ~1e-5 to zero.
+
+- Design (docs follow with the code): v3 packets carry e (0-63) in flags bits
+  6-11 and values as round(x * 2^e). Every path sums only equal e, keeps e on
+  what it emits, and propagates a worker's own saturation (OVERFLOW on a raw
+  v3 contribution). Workers agree on e with no extra message: each round's
+  summed result is identical at every worker, and an integer-only rule
+  (examples/train_mlp/scale_rule.py) maps the previous int32 sum and e to the
+  next e: put the previous max near 2^26 (4 bits of headroom), +8 after an
+  all-zero sum, -8 after an overflow. Adaptive mode needs synchronous rounds.
+- Offline check of that exact rule before any protocol code (200 steps of the
+  demo MLP, gradients scaled by s and the learning rate by 1/s, so float
+  training is unchanged): s = 1e-4: Q16.16 underflows 99.9% of values and
+  ends at accuracy 0.4361 / loss 1.090; the lagged rule ends at 0.9889 /
+  0.3560 (float 0.9889 / 0.3551), zero overflowing chunks. s = 1e-5: Q16.16
+  does not train (0.3333); the rule 0.9889 / 0.3567.
+- Plan: (1) format + scale consistency at a fixed e on every path,
+  (2) adaptive client + demo, (3) retry under a distinct key after OVERFLOW.
+  Benchmarks stay on v2 so committed results remain comparable.
+- tests/test_scaled.py: 5 tests, XFAIL(S1) on main for the right reason (v3 is
+  an unknown version today).
+
+Next step: stage 1 in protocol/grad_parse.h, agg, paramserver, xdp_agg (with
+bpf-unit cases), worker --frac-bits.
