@@ -18,6 +18,7 @@ runners over veth. **It is not a line-rate system;** see
 [Results](#measured-results).
 
 * Live dashboard: <https://manav0559.github.io/xdp-gradient-aggregation/dashboard/>
+* Interactive demo: <https://manav0559.github.io/xdp-gradient-aggregation/demo/>. A JavaScript simulation of the protocol rules (slot pool, loss recovery, fallback, wire v3 exponents) that runs in the browser; append `?selftest` to run its built-in correctness check.
 * Results: [`docs/RESULTS.md`](docs/RESULTS.md) · Design: [`docs/DESIGN_NOTES.md`](docs/DESIGN_NOTES.md) · History: [`docs/HISTORY.md`](docs/HISTORY.md)
 
 ## Architecture

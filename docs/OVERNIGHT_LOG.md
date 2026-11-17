@@ -727,3 +727,29 @@ Next step: PR, CI, then record S/S2 and the v3 throughput ratios.
   in `bench/v3/`; the comparisons reproduce from the committed CSV.
 
 Next step: merge PR #7; refresh the README's open items.
+
+## 2026-11-17 12:00 IST — Interactive demo page
+
+On the user's request for "something live": option 1 of three offered (a
+browser demo on the existing Pages site; the alternatives were the real
+userspace path on Render, or the real XDP path locally only). The XDP
+program cannot run on a web host, so `demo/index.html` is a JavaScript
+model of the protocol rules from DESIGN_NOTES: array-mode slot pool with
+collision fallback, ACCUMULATING / COMPLETED / FLUSHED with RESEND flush and
+the TTL sweeper, ACK retirement, the PS's merge by contributor set and
+result re-send, worker RTO with backoff, and wire v3 (per-worker bound,
+exponent rule, in-step retry under a new key). The page says it is a
+simulation and links the measured results.
+
+- Correctness: every result a worker receives is compared with the integer
+  sum of all workers' quantized values computed independently.
+  `demo/?selftest` runs five scenarios (loss up to 15%, 2-slot pool, v2
+  with small gradients, v3 spike) for 120 simulated s each with a seeded
+  RNG: all PASS, 0 wrong results, identical output across runs.
+- Tuning (simulation pacing only, not protocol): base RTO 1.6 s capped at
+  3.2 s (an earlier 6 s cap let one lost result stall synchronous rounds
+  for ~20 s), sweeper TTL 1.5 s, default loss 2%. With synchronous rounds
+  one lost result makes the other workers' next-round timers flush their
+  partials, so the in-network share falls fast with loss (about 89% at 0%,
+  44% at 3% in the model); the demo shows that as is.
+- Checked in headless Chrome at 500, 800 and 1280 px: no horizontal scroll.

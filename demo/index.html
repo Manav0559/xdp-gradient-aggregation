@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetSum Live Demo</title>
+<meta name="description" content="Interactive simulation of NetSum's in-network gradient aggregation protocol: aggregator slot pool, loss recovery, fallback to the parameter server, and wire v3's per-chunk exponent.">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #eef2f8; --surface-1: #ffffff; --surface-2: #e7edf6;
+    --text-primary: #0a1330; --text-secondary: #3d4d6b; --text-muted: #74839f;
+    --grid: #dfe5f0; --baseline: #c2cbdc; --border: rgba(10,30,70,0.12);
+    --raw: #1d4ed8; --agg: #15803d; --partial: #c2410c; --fallback: #0891b2; --result: #7c3aed;
+    --good: #15803d; --critical: #b91c1c; --warn: #b45309;
+    --accent: #2563eb; --accent-glow: rgba(37,99,235,0.20);
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #05070f; --surface-1: #0b1220; --surface-2: #101a2e;
+      --text-primary: #e6edf9; --text-secondary: #93a5c9; --text-muted: #5a6f97;
+      --grid: #141f35; --baseline: #27395c; --border: rgba(96,165,250,0.16);
+      --raw: #60a5fa; --agg: #4ade80; --partial: #fb923c; --fallback: #22d3ee; --result: #c084fc;
+      --good: #4ade80; --critical: #f87171; --warn: #fbbf24;
+      --accent: #60a5fa; --accent-glow: rgba(96,165,250,0.28);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #05070f; --surface-1: #0b1220; --surface-2: #101a2e;
+    --text-primary: #e6edf9; --text-secondary: #93a5c9; --text-muted: #5a6f97;
+    --grid: #141f35; --baseline: #27395c; --border: rgba(96,165,250,0.16);
+    --raw: #60a5fa; --agg: #4ade80; --partial: #fb923c; --fallback: #22d3ee; --result: #c084fc;
+    --good: #4ade80; --critical: #f87171; --warn: #fbbf24;
+    --accent: #60a5fa; --accent-glow: rgba(96,165,250,0.28);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--page); color: var(--text-primary); font-family: var(--font-sans); }
+  body { padding: 24px max(16px, env(safe-area-inset-left)) 64px; }
+  .wrap { max-width: 1180px; margin: 0 auto; min-width: 0; }
+  .layout > *, .controls > * { min-width: 0; }
+  h1 { font-family: var(--font-mono); font-size: 20px; font-weight: 600; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .prompt { color: var(--accent); }
+  .tagline { font-size: 14px; margin: 0 0 6px; max-width: 80ch; line-height: 1.5; font-weight: 500; }
+  .sub { color: var(--text-secondary); font-size: 12.5px; margin: 0; max-width: 92ch; line-height: 1.55; }
+  a { color: var(--accent); }
+  code { font-family: var(--font-mono); background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 0.92em; }
+  header.page { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .btn { font-family: var(--font-mono); border: 1px solid var(--border); background: var(--surface-1); color: var(--text-secondary);
+    border-radius: 999px; padding: 6px 14px; font-size: 12px; cursor: pointer; transition: .15s; }
+  .btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+  .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-top: 16px; }
+  .controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px 18px; align-items: end; }
+  .ctl label { display: block; font-family: var(--font-mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); margin-bottom: 5px; }
+  .ctl output { color: var(--text-primary); font-weight: 600; }
+  .ctl input[type=range] { width: 100%; accent-color: var(--accent); }
+  .ctl select { width: 100%; font: inherit; font-size: 13px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-primary); }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; }
+  @media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+  @media (max-width: 600px) { canvas#stage { height: 360px; } .panel { padding: 14px 12px; } }
+  .stage-wrap { position: relative; }
+  canvas#stage { width: 100%; height: 420px; display: block; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--border); }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 12px; color: var(--text-secondary); }
+  .legend span::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: var(--c); vertical-align: -1px; }
+  h2 { font-size: 13px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: .06em; color: var(--text-secondary); margin: 0 0 10px; }
+  .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 6px; }
+  .slot { border: 1px solid var(--border); border-radius: 6px; padding: 5px 6px; font-family: var(--font-mono); font-size: 10.5px; line-height: 1.35; min-height: 46px; background: var(--surface-2); color: var(--text-muted); }
+  .slot b { display: block; font-size: 9.5px; letter-spacing: .05em; }
+  .slot.acc { border-color: var(--raw); color: var(--text-primary); } .slot.acc b { color: var(--raw); }
+  .slot.done { border-color: var(--agg); color: var(--text-primary); } .slot.done b { color: var(--agg); }
+  .slot.flushed { border-color: var(--partial); color: var(--text-primary); } .slot.flushed b { color: var(--partial); }
+  .tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .tile { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+  .tile .k { font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); }
+  .tile .v { font-family: var(--font-mono); font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile .v.good { color: var(--good); } .tile .v.bad { color: var(--critical); }
+  .precision { font-family: var(--font-mono); font-size: 12px; line-height: 1.6; }
+  .precision .row { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px dashed var(--border); padding: 2px 0; }
+  .log { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55; max-height: 220px; overflow: auto; color: var(--text-secondary); }
+  .log div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .log .t { color: var(--text-muted); margin-right: 6px; }
+  .note { font-size: 12px; color: var(--text-muted); line-height: 1.5; margin-top: 8px; }
+  .explain { font-size: 13px; color: var(--text-secondary); line-height: 1.6; }
+  .explain li { margin-bottom: 4px; }
+  #selftest { white-space: pre-wrap; font-family: var(--font-mono); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="page">
+    <div>
+      <h1><span class="prompt">$</span> netsum — live protocol demo</h1>
+      <p class="tagline">Watch workers' gradients get summed inside the network, lose packets, recover, and fall back to the parameter server.</p>
+      <p class="sub">This page runs a <strong>JavaScript simulation</strong> of NetSum's protocol rules (slot state machine, resend flush, TTL sweeper, collision fallback, merge by contributor set, wire v3 exponents) as described in <a href="../docs/DESIGN_NOTES.md">docs/DESIGN_NOTES.md</a>. The real system is C and an XDP program in the Linux kernel, tested in CI; its measured results are on the <a href="../dashboard/">results dashboard</a>.</p>
+    </div>
+    <button class="btn" id="theme" type="button">Toggle theme</button>
+  </header>
+
+  <section class="panel">
+    <div class="controls">
+      <div class="ctl"><label>Workers <output id="o-workers">4</output></label><input id="workers" type="range" min="2" max="8" value="4"></div>
+      <div class="ctl"><label>Packet loss on worker links <output id="o-loss">2%</output></label><input id="loss" type="range" min="0" max="30" value="2"></div>
+      <div class="ctl"><label>Aggregator slots <output id="o-pool">8</output></label><input id="pool" type="range" min="2" max="16" value="8"></div>
+      <div class="ctl"><label>Speed <output id="o-speed">1x</output></label><input id="speed" type="range" min="0" max="4" value="2"></div>
+      <div class="ctl"><label>Wire format</label>
+        <select id="format"><option value="v2">v2: Q16.16 fixed point</option><option value="v3" selected>v3: per-chunk exponent</option></select></div>
+      <div class="ctl"><label>Gradient size</label>
+        <select id="gscale"><option value="1">~1 (large)</option><option value="1e-3">~1e-3</option><option value="1e-4" selected>~1e-4 (small)</option><option value="1e-5">~1e-5 (tiny)</option></select></div>
+    </div>
+    <div class="actions">
+      <button class="btn primary" id="play" type="button">Pause</button>
+      <button class="btn" id="reset" type="button">Reset</button>
+      <button class="btn" id="spike" type="button" title="Multiply the next round's gradients by 1000 so every chunk saturates">Spike next round ×1000</button>
+      <button class="btn" id="burst" type="button" title="Drop every packet on worker links for 1.5 simulated seconds">Drop everything for 1.5 s</button>
+    </div>
+    <p class="note" id="mode-note"></p>
+  </section>
+
+  <div class="layout">
+    <section class="panel">
+      <div class="stage-wrap"><canvas id="stage" aria-label="Animated packets between workers, the aggregator and the parameter server"></canvas></div>
+      <div class="legend">
+        <span style="--c:var(--raw)">contribution</span><span style="--c:var(--agg)">aggregate</span>
+        <span style="--c:var(--partial)">partial (flushed)</span><span style="--c:var(--fallback)">fallback to PS</span>
+        <span style="--c:var(--result)">result / ACK</span><span style="--c:var(--critical)">lost</span>
+      </div>
+      <h2 style="margin-top:16px">Aggregator slot pool</h2>
+      <div class="slots" id="slots"></div>
+      <p class="note">Each key (round, chunk) hashes to one slot. A slot owned by another key sends the contribution on to the parameter server as a fallback. ACCUMULATING → COMPLETED when every worker's bit is set; a RESEND for a held worker flushes the partial sum (FLUSHED); the parameter server's ACK, or the TTL sweeper, frees the slot.</p>
+    </section>
+    <aside>
+      <section class="panel" style="margin-top:16px">
+        <h2>Counters</h2>
+        <div class="tiles" id="tiles"></div>
+      </section>
+      <section class="panel">
+        <h2>Precision (last 20 results)</h2>
+        <div class="precision" id="precision"></div>
+      </section>
+      <section class="panel">
+        <h2>Event log</h2>
+        <div class="log" id="log"></div>
+      </section>
+    </aside>
+  </div>
+
+  <section class="panel explain">
+    <h2>What to try</h2>
+    <ul>
+      <li><strong>Gradient size ~1e-4 with v2:</strong> Q16.16 has a resolution of 2^-16, so most values round to 0 and the received sums are wrong. Switch to v3: each chunk carries its own exponent, chosen from the previous round's result, and the sums become accurate.</li>
+      <li><strong>Raise packet loss:</strong> workers retransmit with RESEND; the aggregator flushes partial sums, the remaining contributions fall back to the parameter server, and it merges them by contributor set. Every result still matches the exact integer sum.</li>
+      <li><strong>Fewer aggregator slots:</strong> keys collide more often and more traffic falls back to the parameter server.</li>
+      <li><strong>Spike (v3):</strong> every chunk saturates, comes back OVERFLOW, and is retried in the same round at exponent − 8 under a new key.</li>
+    </ul>
+    <p class="note">Correctness check: the "exact" counter compares every result a worker receives with the integer sum of all workers' quantized values for that key, computed independently. Simplifications: one job, chunks of 4 values, loss only on worker links, and timings scaled to be watchable.</p>
+  </section>
+  <pre id="selftest" hidden></pre>
+</div>
+
+<script>
+"use strict";
+// ---------- deterministic helpers ----------
+const I32_MAX = 2147483647, I32_MIN = -2147483648;
+function mix(a) { a = Math.imul(a ^ (a >>> 16), 0x7feb352d); a = Math.imul(a ^ (a >>> 15), 0x846ca68b); return (a ^ (a >>> 16)) >>> 0; }
+function rnd01(...k) { let h = 0x9e3779b9; for (const x of k) h = mix(h ^ (x | 0)); return h / 4294967296; }
+function roundAway(s) { return s >= 0 ? Math.floor(s + 0.5) : -Math.floor(-s + 0.5); }
+function bitlen(m) { return 32 - Math.clz32(m); }
+function seeded(seed) { let a = seed >>> 0; return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const LANES = 4, RETRY_SHIFT = 24;
+
+// quantize x at exponent e; v3 bounds |value| by INT32_MAX / N and reports saturation
+function quantize(x, e, fmt, n) {
+  let q = roundAway(x * Math.pow(2, e));
+  if (fmt === "v3") {
+    const lim = Math.floor(I32_MAX / n);
+    if (q > lim) return [lim, true];
+    if (q < -lim) return [-lim, true];
+    return [q, false];
+  }
+  return [Math.max(I32_MIN, Math.min(I32_MAX, q)), false];
+}
+// wire v3 exponent rule (examples/train_mlp/scale_rule.py)
+function nextExponent(ints, e) {
+  const m = Math.max(...ints.map(Math.abs));
+  const ne = m === 0 ? e + 8 : e + (30 - 4 - bitlen(m));
+  return Math.max(0, Math.min(63, ne));
+}
+
+// ---------- simulation ----------
+function makeSim(cfg) {
+  const S = {
+    cfg, rand: seeded(cfg.seed ?? 1), now: 0, q: [], seq: 0, packets: [], log: [], burstUntil: -1, spikeRound: -1,
+    workers: [], pool: [], fallbackKeys: new Set(), ps: new Map(),
+    c: { sent: 0, resent: 0, aggregates: 0, partials: 0, fallbacks: 0, collisions: 0, lost: 0, retries: 0,
+         results: 0, exact: 0, wrong: 0, rounds: 0, overflowFinal: 0 },
+    prec: [],
+  };
+  const N = cfg.workers, K = cfg.chunks, TTL = 1500, RTO0 = 1600, D = { up: 260, mid: 230, down: 300 };
+  for (let i = 0; i < cfg.pool; i++) S.pool.push({ state: "EMPTY", key: null });
+
+  const at = (t, fn) => { S.q.push({ t, s: S.seq++, fn }); };
+  const log = (msg) => { S.log.push({ t: S.now, msg }); if (S.log.length > 60) S.log.shift(); };
+  const keyOf = (r, wc) => r + ":" + wc;
+  const label = (r, wc) => "r" + r + " c" + (wc & 0xffffff) + (wc >>> RETRY_SHIFT ? "·try" + (wc >>> RETRY_SHIFT) : "");
+  const slotOf = (r, wc) => mix(r * 7919 + wc * 104729 + 17) % cfg.pool;
+
+  function grad(w, r, c, lane) {
+    const spike = r === S.spikeRound ? 1000 : 1;
+    return cfg.gscale * spike * (rnd01(w, r, c, lane) * 2 - 1) * (0.35 + 0.65 * rnd01(r, c, lane, 99));
+  }
+  function contribution(w, r, c, e) {
+    const vals = [];
+    let sat = false;
+    for (let l = 0; l < LANES; l++) { const [q, s] = quantize(grad(w, r, c, l), e, cfg.format, N); vals.push(q); sat = sat || s; }
+    return { vals, sat };
+  }
+  function expected(r, c, e) {
+    const sum = new Array(LANES).fill(0);
+    let sat = false;
+    for (let w = 0; w < N; w++) { const k = contribution(w, r, c, e); k.vals.forEach((v, l) => (sum[l] += v)); sat = sat || k.sat; }
+    return { sum, overflow: sat || sum.some((v) => v > I32_MAX || v < I32_MIN) };
+  }
+
+  // network: loss applies to worker links only
+  function send(from, to, kind, pkt, delay, lossy) {
+    const lost = lossy && (S.now < S.burstUntil || S.rand() < cfg.loss);
+    S.packets.push({ from, to, kind, t0: S.now, t1: S.now + delay, lost });
+    if (lost) { S.c.lost++; return; }
+    at(S.now + delay, () => deliver(to, pkt));
+  }
+  function deliver(to, pkt) {
+    if (to === "agg") aggRecv(pkt);
+    else if (to === "ps") psRecv(pkt);
+    else workerRecv(S.workers[to], pkt);
+  }
+
+  // ---- workers ----
+  for (let w = 0; w < N; w++) S.workers.push({ id: w, round: 0, chunks: [], e: new Array(K).fill(cfg.format === "v3" ? 16 : 16) });
+  function startRound(W) {
+    W.chunks = [];
+    for (let c = 0; c < K; c++) W.chunks.push({ attempt: 0, e: W.e[c], done: false, rto: RTO0, deadline: 0 });
+    for (let c = 0; c < K; c++) sendChunk(W, c, false);
+  }
+  function sendChunk(W, c, resend) {
+    const ch = W.chunks[c];
+    const wc = c | (ch.attempt << RETRY_SHIFT);
+    const k = contribution(W.id, W.round, c, ch.e);
+    const pkt = { type: "raw", round: W.round, wc, w: W.id, vals: k.vals, set: [W.id], e: ch.e,
+                  overflow: cfg.format === "v3" && k.sat, resend };
+    S.c.sent++; if (resend) S.c.resent++;
+    ch.deadline = S.now + ch.rto;
+    send(W.id, "agg", "raw", pkt, D.up + S.rand() * 60, true);
+    const dl = ch.deadline, attempt = ch.attempt, round = W.round;
+    at(dl, () => {
+      if (W.round !== round || ch.done || ch.attempt !== attempt || ch.deadline !== dl) return;
+      ch.rto = Math.min(ch.rto * 2, 3200);
+      log(`worker ${W.id}: no result for ${label(round, wc)}, RESEND`);
+      sendChunk(W, c, true);
+    });
+  }
+  function workerRecv(W, pkt) {
+    const c = pkt.wc & 0xffffff, attempt = pkt.wc >>> RETRY_SHIFT;
+    if (pkt.round !== W.round || !W.chunks[c] || W.chunks[c].done || W.chunks[c].attempt !== attempt) return;
+    const ch = W.chunks[c];
+    if (pkt.overflow && cfg.format === "v3" && ch.e > 0) {
+      ch.attempt++; ch.e = Math.max(0, ch.e - 8); ch.rto = RTO0; S.c.retries++;
+      if (W.id === 0) log(`OVERFLOW on ${label(pkt.round, pkt.wc)}: retry at e=${ch.e} as ${label(pkt.round, c | (ch.attempt << RETRY_SHIFT))}`);
+      sendChunk(W, c, false);
+      return;
+    }
+    ch.done = true;
+    S.c.results++;
+    const exp = expected(pkt.round, c, ch.e);
+    const ok = pkt.overflow ? exp.overflow : (!exp.overflow && exp.sum.every((v, l) => v === pkt.vals[l]));
+    if (ok) S.c.exact++; else { S.c.wrong++; log(`worker ${W.id}: result for ${label(pkt.round, pkt.wc)} does not match the exact sum`); }
+    if (pkt.overflow) S.c.overflowFinal++;
+    if (W.id === 0 && !pkt.overflow) {
+      for (let l = 0; l < LANES; l++) {
+        let truth = 0; for (let w = 0; w < N; w++) truth += grad(w, pkt.round, c, l);
+        S.prec.push({ truth, got: pkt.vals[l] / Math.pow(2, ch.e), e: ch.e });
+      }
+      while (S.prec.length > 80) S.prec.shift();
+    }
+    if (cfg.format === "v3") W.e[c] = pkt.overflow ? ch.e : nextExponent(pkt.vals, ch.e);
+    if (W.chunks.every((x) => x.done)) {
+      const r = W.round;
+      W.round++;
+      if (W.id === 0) S.c.rounds = W.round;
+      at(S.now + 250, () => { if (W.round === r + 1) startRound(W); });
+    }
+  }
+
+  // ---- aggregator (array mode with collision fallback) ----
+  function forwardToPS(kind, pkt) { send("agg", "ps", kind, pkt, D.mid, false); }
+  function aggRecv(pkt) {
+    if (pkt.type === "ack") {
+      const s = S.pool[slotOf(pkt.round, pkt.wc)];
+      if (s.state !== "EMPTY" && s.key === keyOf(pkt.round, pkt.wc)) { s.state = "EMPTY"; s.key = null; }
+      S.fallbackKeys.delete(keyOf(pkt.round, pkt.wc));
+      return;
+    }
+    const key = keyOf(pkt.round, pkt.wc);
+    if (S.fallbackKeys.has(key)) { S.c.fallbacks++; forwardToPS("fallback", { ...pkt, type: "fallback" }); return; }
+    const s = S.pool[slotOf(pkt.round, pkt.wc)];
+    if (s.state === "EMPTY") {
+      Object.assign(s, { state: "ACCUMULATING", key, round: pkt.round, wc: pkt.wc, set: new Set(), sum: new Array(LANES).fill(0),
+                         overflow: false, e: pkt.e, touched: S.now });
+    }
+    if (s.key !== key) {
+      S.c.collisions++; S.c.fallbacks++; S.fallbackKeys.add(key);
+      log(`collision: ${label(pkt.round, pkt.wc)} hashes to a slot held by ${label(s.round, s.wc)}; fallback to PS`);
+      forwardToPS("fallback", { ...pkt, type: "fallback" });
+      return;
+    }
+    const held = s.set.has(pkt.w);
+    if (s.state === "COMPLETED") {
+      if (pkt.resend) forwardToPS("agg", aggregateOf(s, "agg"));
+      return;
+    }
+    if (s.state === "FLUSHED") {
+      if (held && !pkt.resend) return;
+      S.c.fallbacks++; forwardToPS("fallback", { ...pkt, type: "fallback" });
+      return;
+    }
+    if (held) {
+      if (pkt.resend) {
+        s.state = "FLUSHED"; s.touched = S.now; S.c.partials++;
+        log(`RESEND from worker ${pkt.w} for ${label(pkt.round, pkt.wc)}: flush partial {${[...s.set].join(",")}} to PS`);
+        forwardToPS("partial", aggregateOf(s, "partial"));
+      }
+      return;
+    }
+    s.set.add(pkt.w); s.touched = S.now;
+    pkt.vals.forEach((v, l) => { s.sum[l] += v; if (s.sum[l] > I32_MAX || s.sum[l] < I32_MIN) s.overflow = true; });
+    if (pkt.overflow) s.overflow = true;
+    if (s.set.size === N) {
+      s.state = "COMPLETED"; S.c.aggregates++;
+      forwardToPS("agg", aggregateOf(s, "agg"));
+    }
+  }
+  function aggregateOf(s, type) {
+    return { type, round: s.round, wc: s.wc, vals: s.sum.slice(), set: [...s.set], e: s.e, overflow: s.overflow };
+  }
+  function sweep() {
+    for (const s of S.pool) {
+      if (s.state === "EMPTY" || S.now - s.touched < TTL) continue;
+      if (s.state === "ACCUMULATING") {
+        s.state = "FLUSHED"; s.touched = S.now; S.c.partials++;
+        log(`TTL sweeper: ${label(s.round, s.wc)} idle, flush partial {${[...s.set].join(",")}} to PS`);
+        forwardToPS("partial", aggregateOf(s, "partial"));
+      } else { s.state = "EMPTY"; s.key = null; }
+    }
+    at(S.now + 500, sweep);
+  }
+  at(500, sweep);
+
+  // ---- parameter server: merge by contributor set ----
+  function psRecv(pkt) {
+    const key = keyOf(pkt.round, pkt.wc);
+    let st = S.ps.get(key);
+    if (!st) { st = { set: new Set(), sum: new Array(LANES).fill(0), overflow: false, done: false }; S.ps.set(key, st); }
+    if (st.done) {
+      const to = pkt.type === "raw" || pkt.type === "fallback" ? [pkt.w] : [...Array(N).keys()];
+      for (const w of to) send("ps", w, "result", { type: "result", round: pkt.round, wc: pkt.wc, vals: st.sum.slice(), overflow: st.overflow }, D.down, true);
+      send("ps", "agg", "result", { type: "ack", round: pkt.round, wc: pkt.wc }, D.mid, false);
+      return;
+    }
+    const inc = new Set(pkt.set);
+    const subset = [...inc].every((w) => st.set.has(w));
+    const superset = [...st.set].every((w) => inc.has(w));
+    const disjoint = [...inc].every((w) => !st.set.has(w));
+    if (subset) return;
+    if (superset) { st.set = inc; st.sum = pkt.vals.slice(); st.overflow = pkt.overflow; }
+    else if (disjoint) { inc.forEach((w) => st.set.add(w)); pkt.vals.forEach((v, l) => (st.sum[l] += v)); st.overflow = st.overflow || pkt.overflow; }
+    else return; // partial overlap: wait for the remaining fallbacks
+    if (st.sum.some((v) => v > I32_MAX || v < I32_MIN)) st.overflow = true;
+    if (st.set.size === N) {
+      st.done = true;
+      for (let w = 0; w < N; w++) send("ps", w, "result", { type: "result", round: pkt.round, wc: pkt.wc, vals: st.sum.slice(), overflow: st.overflow }, D.down, true);
+      send("ps", "agg", "result", { type: "ack", round: pkt.round, wc: pkt.wc }, D.mid, false);
+      if (S.ps.size > 400) for (const k of [...S.ps.keys()].slice(0, 100)) S.ps.delete(k);
+    }
+  }
+
+  for (const W of S.workers) at(50 + W.id * 40, () => startRound(W));
+
+  S.advance = (dt) => {
+    const end = S.now + dt;
+    for (;;) {
+      let best = -1;
+      for (let i = 0; i < S.q.length; i++) if (S.q[i].t <= end && (best < 0 || S.q[i].t < S.q[best].t || (S.q[i].t === S.q[best].t && S.q[i].s < S.q[best].s))) best = i;
+      if (best < 0) break;
+      const ev = S.q.splice(best, 1)[0];
+      S.now = ev.t; ev.fn();
+    }
+    S.now = end;
+    S.packets = S.packets.filter((p) => S.now < p.t1 + 120);
+  };
+  S.spike = () => { S.spikeRound = S.workers[0].round + 1; log(`spike armed: round ${S.spikeRound} gradients ×1000`); };
+  S.burst = () => { S.burstUntil = S.now + 1500; log("every worker-link packet dropped for 1.5 s"); };
+  return S;
+}
+
+// ---------- self-test (?selftest) ----------
+function selftest() {
+  const out = [];
+  const scenarios = [
+    { name: "v2, large gradients, 10% loss", workers: 4, chunks: 4, pool: 8, loss: 0.10, format: "v2", gscale: 1 },
+    { name: "v3, small gradients, 15% loss", workers: 6, chunks: 4, pool: 8, loss: 0.15, format: "v3", gscale: 1e-4 },
+    { name: "v2, small gradients (underflow expected, sums still exact)", workers: 4, chunks: 4, pool: 8, loss: 0.03, format: "v2", gscale: 1e-4 },
+    { name: "v3, 2 slots (many collisions)", workers: 4, chunks: 4, pool: 2, loss: 0.05, format: "v3", gscale: 1e-3 },
+    { name: "v3, spike at round 3", workers: 4, chunks: 4, pool: 8, loss: 0.0, format: "v3", gscale: 1e-4, spike: true },
+  ];
+  let allOk = true;
+  for (const sc of scenarios) {
+    const S = makeSim(sc);
+    if (sc.spike) S.spikeRound = 3;
+    for (let i = 0; i < 1200; i++) S.advance(100);
+    const c = S.c, ok = c.wrong === 0 && c.results > 0 && c.rounds >= 5 && (!sc.spike || c.retries > 0);
+    allOk = allOk && ok;
+    out.push(`${ok ? "PASS" : "FAIL"} ${sc.name}: rounds ${c.rounds}, results ${c.results}, exact ${c.exact}, wrong ${c.wrong}, ` +
+             `resent ${c.resent}, partials ${c.partials}, fallbacks ${c.fallbacks}, retries ${c.retries}, lost ${c.lost}`);
+  }
+  out.push(allOk ? "SELFTEST PASS" : "SELFTEST FAIL");
+  const el = document.getElementById("selftest"); el.hidden = false; el.textContent = out.join("\n");
+}
+
+// ---------- UI ----------
+const $ = (id) => document.getElementById(id);
+const SPEEDS = [0.25, 0.5, 1, 2, 4];
+let sim, running = true, lastTs = 0;
+function readCfg() {
+  return { workers: +$("workers").value, chunks: 4, pool: +$("pool").value, loss: +$("loss").value / 100,
+           format: $("format").value, gscale: +$("gscale").value };
+}
+function reset() {
+  sim = makeSim({ ...readCfg(), seed: (Date.now() & 0x7fffffff) || 1 });
+  $("spike").disabled = sim.cfg.format !== "v3";
+  $("mode-note").textContent = sim.cfg.format === "v3"
+    ? "v3: every chunk starts at exponent 16 and follows the previous round's summed values; watch the exponents in the precision panel."
+    : "v2: values are Q16.16 (exponent fixed at 16). With small gradients most values round to 0.";
+}
+for (const id of ["workers", "pool", "format", "gscale"]) $(id).addEventListener("input", () => { syncLabels(); reset(); panels(); });
+$("loss").addEventListener("input", () => { syncLabels(); sim.cfg.loss = +$("loss").value / 100; });
+$("speed").addEventListener("input", syncLabels);
+function syncLabels() {
+  $("o-workers").textContent = $("workers").value; $("o-loss").textContent = $("loss").value + "%";
+  $("o-pool").textContent = $("pool").value; $("o-speed").textContent = SPEEDS[+$("speed").value] + "x";
+}
+$("play").onclick = () => { running = !running; $("play").textContent = running ? "Pause" : "Play"; };
+$("reset").onclick = () => { reset(); panels(); };
+$("spike").onclick = () => sim.spike();
+$("burst").onclick = () => sim.burst();
+$("theme").onclick = () => {
+  const r = document.documentElement, dark = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  r.dataset.theme = dark ? "light" : "dark";
+};
+
+const canvas = $("stage"), ctx = canvas.getContext("2d");
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function nodeWidth(W, scale) { return Math.min(118 * scale, W * 0.3); }
+function positions(W, H) {
+  const n = sim.cfg.workers, wn = nodeWidth(W, 1) / 2 + 6, wb = nodeWidth(W, 1.5) / 2 + 6;
+  const pos = { agg: [W * 0.5, H * 0.5], ps: [W - wb, H * 0.5] };
+  for (let i = 0; i < n; i++) pos[i] = [Math.max(wn, W * 0.12), H * (0.5 + (i - (n - 1) / 2) * Math.min(0.12, 0.8 / n))];
+  return pos;
+}
+function draw() {
+  const dpr = window.devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
+  if (canvas.width !== W * dpr || canvas.height !== H * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const P = positions(W, H), col = { raw: css("--raw"), agg: css("--agg"), partial: css("--partial"), fallback: css("--fallback"), result: css("--result") };
+  ctx.strokeStyle = css("--baseline"); ctx.lineWidth = 1;
+  for (let i = 0; i < sim.cfg.workers; i++) { line(P[i], P.agg); }
+  line(P.agg, P.ps);
+  ctx.setLineDash([3, 4]); for (let i = 0; i < sim.cfg.workers; i++) line(P.ps, P[i]); ctx.setLineDash([]);
+  for (const p of sim.packets) {
+    const a = P[p.from], b = P[p.to];
+    if (!a || !b) continue;
+    let f = (sim.now - p.t0) / (p.t1 - p.t0);
+    if (p.lost) {
+      if (f > 0.5) { const x = a[0] + (b[0] - a[0]) * 0.5, y = a[1] + (b[1] - a[1]) * 0.5; cross(x, y, css("--critical"), 1 - Math.min(1, (f - 0.5) * 2)); continue; }
+    }
+    f = Math.max(0, Math.min(1, f));
+    if (f >= 1) continue;
+    ctx.fillStyle = col[p.kind] || col.raw;
+    ctx.beginPath(); ctx.arc(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, p.kind === "agg" ? 6 : 4, 0, Math.PI * 2); ctx.fill();
+  }
+  for (let i = 0; i < sim.cfg.workers; i++) node(P[i], "worker " + i, "round " + sim.workers[i].round);
+  const busy = sim.pool.filter((s) => s.state !== "EMPTY").length;
+  node(P.agg, "aggregator", "XDP · " + busy + "/" + sim.pool.length + " slots busy", 1.5);
+  node(P.ps, "parameter server", "merge by contributor set", 1.5);
+  function line(a, b) { ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); }
+  function cross(x, y, c, alpha) { ctx.globalAlpha = alpha; ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x - 5, y - 5); ctx.lineTo(x + 5, y + 5); ctx.moveTo(x + 5, y - 5); ctx.lineTo(x - 5, y + 5); ctx.stroke(); ctx.globalAlpha = 1; ctx.lineWidth = 1; ctx.strokeStyle = css("--baseline"); }
+  function node(p, title, sub, scale = 1) {
+    const w = nodeWidth(W, scale), h = 40, small = w < 110;
+    ctx.fillStyle = css("--surface-1"); ctx.strokeStyle = css("--accent");
+    roundRect(p[0] - w / 2, p[1] - h / 2, w, h, 7); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = css("--text-primary"); ctx.font = `600 ${small ? 10 : 12}px ` + css("--font-mono"); ctx.textAlign = "center";
+    ctx.fillText(small ? title.replace("parameter server", "param server") : title, p[0], p[1] - 3, w - 6);
+    ctx.fillStyle = css("--text-muted"); ctx.font = `${small ? 9 : 10.5}px ` + css("--font-mono"); ctx.fillText(sub, p[0], p[1] + 12, w - 6);
+    ctx.strokeStyle = css("--baseline");
+  }
+  function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+}
+function fmtNum(x) { return x === 0 ? "0" : Math.abs(x) >= 0.01 && Math.abs(x) < 1e4 ? x.toFixed(4) : x.toExponential(3); }
+function panels() {
+  $("slots").innerHTML = sim.pool.map((s, i) => {
+    if (s.state === "EMPTY") return `<div class="slot"><b>#${i} EMPTY</b>&nbsp;</div>`;
+    const cls = s.state === "ACCUMULATING" ? "acc" : s.state === "COMPLETED" ? "done" : "flushed";
+    const c = s.wc & 0xffffff, a = s.wc >>> RETRY_SHIFT;
+    return `<div class="slot ${cls}"><b>#${i} ${s.state}</b>r${s.round} c${c}${a ? "·try" + a : ""}<br>${s.set.size}/${sim.cfg.workers} workers</div>`;
+  }).join("");
+  const c = sim.c, inNet = c.aggregates + c.fallbacks + c.partials ? c.aggregates / (c.aggregates + c.partials + c.fallbacks / sim.cfg.workers) : 0;
+  const tiles = [
+    ["rounds done", c.rounds], ["results exact", `${c.exact}/${c.results}`, c.wrong ? "bad" : "good"],
+    ["sent / resent", `${c.sent}/${c.resent}`], ["packets lost", c.lost],
+    ["aggregates", c.aggregates], ["partials flushed", c.partials],
+    ["fallbacks to PS", c.fallbacks], ["slot collisions", c.collisions],
+    ["overflow retries", c.retries], ["in-network share", (inNet * 100).toFixed(0) + "%"],
+  ];
+  $("tiles").innerHTML = tiles.map(([k, v, cls]) => `<div class="tile"><div class="k">${k}</div><div class="v ${cls || ""}">${v}</div></div>`).join("");
+  const pr = sim.prec.slice(-20);
+  let err = 0, tot = 0, zeros = 0;
+  for (const p of pr) { err += (p.got - p.truth) ** 2; tot += p.truth ** 2; if (p.truth !== 0 && p.got === 0) zeros++; }
+  const last = sim.prec[sim.prec.length - 1];
+  $("precision").innerHTML = pr.length ? [
+    ["format", sim.cfg.format === "v3" ? "v3 (per-chunk exponent)" : "v2 (Q16.16)"],
+    ["chunk exponents (worker 0)", sim.workers[0].e.join(" ")],
+    ["true sum (latest lane)", fmtNum(last.truth)],
+    ["received sum", fmtNum(last.got)],
+    ["relative error (L2)", tot ? fmtNum(Math.sqrt(err / tot)) : "-"],
+    ["values decoded as 0", `${zeros}/${pr.length}`],
+  ].map(([k, v]) => `<div class="row"><span>${k}</span><span>${v}</span></div>`).join("") : '<div class="row">waiting for the first result…</div>';
+  $("log").innerHTML = sim.log.slice(-40).reverse().map((e) => `<div><span class="t">${(e.t / 1000).toFixed(1)}s</span>${e.msg.replace(/</g, "&lt;")}</div>`).join("");
+}
+let panelTick = 0;
+function frame(ts) {
+  const dt = lastTs ? Math.min(100, ts - lastTs) : 16; lastTs = ts;
+  if (running) sim.advance(dt * SPEEDS[+$("speed").value]);
+  draw();
+  if (++panelTick % 6 === 0) panels();
+  requestAnimationFrame(frame);
+}
+syncLabels();
+reset();
+const params = new URLSearchParams(location.search);
+if (params.has("selftest")) selftest();
+if (params.has("warm")) for (let i = 0; i < 10 * Math.min(600, +params.get("warm") || 0); i++) sim.advance(100);
+draw(); panels();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
