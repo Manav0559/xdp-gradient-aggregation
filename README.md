@@ -96,20 +96,20 @@ trial. Full tables, method and threats to validity:
 Ratios of medians with bootstrap 95% CIs; permutation tests, Holm-corrected
 (p_Holm <= 0.033 for every bold entry).
 
-* **Replicated:** four runs, three on the same runner type (Xeon 6975P-C)
-  and one on another (Xeon Platinum 8573C). On the 6975P-C the 4- and
-  8-worker gains reproduced every time (6.7-10.9%), the 2-worker gain was
-  2.0% twice and 0.6% (not significant) once. On the 8573C the gap was much
-  larger, 1.37-1.69x throughput and 21-34% lower round time, because the
-  userspace aggregator was far slower there. The direction held in all four
+* **Replicated:** five runs on three CPU types. On the Xeon 6975P-C (three
+  runs) the 4- and 8-worker gains reproduced every time (6.7-10.9%); the
+  2-worker gain was 2.0% twice and 0.6% (not significant) once. On the Xeon
+  Platinum 8573C and the AMD EPYC 7763 (one run each) the gap was much
+  larger, 1.37-1.69x throughput and 17-34% lower round time, because the
+  userspace aggregator was far slower there. The direction held in all five
   runs; the size depends on the machine.
 * **In-kernel aggregation helps: by 1-11% on one runner type (growing with
   the number of workers; not significant at 2 workers in one of three runs),
-  by 37-69% on another, never by multiples of the work it removes.** A
+  by 37-69% on two others, never by multiples of the work it removes.** A
   pre-registered variant of the userspace aggregator that batches its system
-  calls (`recvmmsg`/`sendmmsg`) did not change its throughput, and XDP stayed
-  7-9% ahead of it at 4-8 workers; the batch sizes it reached were not
-  measured. Per packet, the XDP program body costs 218-275 ns against
+  calls (`recvmmsg`/`sendmmsg`) did not change its throughput in two runs on
+  two CPUs, and XDP stayed ahead of it (7-9% at 4-8 workers on the 6975P-C,
+  44-66% on the EPYC 7763); the batch sizes it reached were not measured. Per packet, the XDP program body costs 218-275 ns against
   540-1,669 ns for the userspace aggregator's processing (generic mode, 8
   down to 2 workers), so up to 2.5-6x less; the userspace figure includes
   its forwarding `sendto`, the XDP figure excludes the transmit after the

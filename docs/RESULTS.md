@@ -171,6 +171,7 @@ analyzer's tables).
 | 43785552861 | Xeon 6975P-C (7.0.0-1016-aws) | 1.020 / 1.078 / 1.102 | 0.923 / 0.938 / 0.927 | slower |
 | 43784240541 | Xeon Platinum 8573C (7.0.0-1019-azure) | 1.685 / 1.420 / 1.369 | 0.705 / 0.663 / 0.787 | slower |
 | 44106226059 (PR #10) | Xeon 6975P-C (7.0.0-1016-aws) | 1.006 (n.s.) / 1.067 / 1.097 | 0.905 / 0.940 / 0.923 | slower |
+| 44108181610 (PR #10) | AMD EPYC 7763 (7.0.0-1019-azure) | 1.667 / 1.542 / 1.371 | 0.691 / 0.754 / 0.828 | slower at 2-4, faster at 8 |
 
 The fourth run (`bench/v2/replication-44106226059/`, PR #10) is the first in
 which a generic-vs-userspace throughput comparison was not significant: at 2
@@ -178,6 +179,13 @@ workers the ratio was 1.006 [0.997, 1.015], p_Holm = 0.14. The 4- and
 8-worker gains (6.7%, 9.7%) and the round-time reductions (5-10%, p_Holm <=
 0.033) reproduced. So on this runner type the throughput gain is 1-11%,
 growing with the number of workers, and not reliably present at 2 workers.
+
+The fifth run (`bench/v2/replication-44108181610/`, PR #10) landed on a third
+CPU type, an AMD EPYC 7763. Like the Xeon Platinum 8573C it showed a large
+gap, 1.37-1.67x throughput and 17-31% lower round time, because the
+userspace aggregator was slow there (1.67M values/s at 2 workers, against
+6.0-6.2M on the 6975P-C). Every throughput comparison was significant
+(p_Holm = 0.003).
 
 In the first three runs every generic-vs-userspace comparison is
 significant after Holm correction (p_Holm <= 0.033); in the fourth, every
@@ -470,6 +478,15 @@ stay as they are.
   native mode (the best attach mode on this runner), and native XDP on veth
   is itself slower than generic (above), so this comparison mixes the slot
   design with the attach mode.
+
+**Replication** (run 44108181610, AMD EPYC 7763; data
+`bench/baseline/replication-44108181610/`; 78/78 trials balanced): batching
+again changed nothing (`useragg-batch` / `useragg` 0.998 / 1.013 / 1.001,
+no comparison significant), and generic XDP led the batched aggregator by
+1.662 / 1.509 / 1.441 (p_Holm <= 0.008), the large-gap pattern of the
+non-6975P-C runners. On this CPU array mode did matter: `xdp-array` /
+`useragg-array` 1.614 / 1.488 / 1.393. No `xdp-generic` / `useragg-batch`
+CI contains 1 in either run, so the pre-registered rule is not triggered.
 
 ## Benchmark-lite: first XDP measurements (open loop, two namespaces, `xdpgeneric`)
 
