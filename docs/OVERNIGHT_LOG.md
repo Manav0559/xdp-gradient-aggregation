@@ -685,3 +685,30 @@ The earlier steps in the same run reproduce their committed results
 
 Remaining open (not started): the C worker has no retry and its v3 mode is
 not exercised on the kernel; benchmarks still send v2; one small model only.
+
+## 2026-11-17 11:19 IST — PR #6 merged; the remaining v3 items
+
+On the user's "merge it ... complete the entire project": PR #6 merged
+(`4595f62`) after all eight checks passed on `a025509`. Branch
+`feature/v3-completion` from main for what was still open:
+
+- C reliable worker: in v3 mode values are bounded by INT32_MAX / N, and a
+  chunk whose result is OVERFLOW is re-sent at e - 8 under
+  `chunk | attempt << 24` (NETSUM_RETRY_SHIFT, NETSUM_OVERFLOW_STEP in
+  grad_proto.h); late results of an earlier attempt count as duplicates;
+  `--fixed` sums are verified at the exponent that succeeded; the summary
+  gains `retried_chunks`. The old test expected every result to stay
+  OVERFLOW; it now expects one retry per chunk and exact sums. New test:
+  the retry through the userspace aggregator with lost contributions and
+  results.
+- Kernel: xdp-loadtest Scenario S (3 C workers, 3e-6 at e=40, 20% loss)
+  and S2 (1.0 at e=31 > INT32_MAX/3: OVERFLOW from the kernel, retry at 23).
+- Throughput: a second bench.yml pass with configs useragg, useragg-v3,
+  xdp-generic, xdp-generic-v3 (v3 at e=16 carries the same integers as
+  Q16.16, so a difference is the format's cost); bench_analyze.py writes
+  them to v3_comparisons.csv, separate from the v2 comparisons. A dry run of
+  the analyzer on synthetic rows found that it crashed when a run has no
+  latency trials; fixed (the table is skipped). The committed v2 summary
+  reproduces byte for byte.
+
+Next step: PR, CI, then record S/S2 and the v3 throughput ratios.

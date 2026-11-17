@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from netsum_stats import (RNG_SEED, bootstrap_ci, holm, median, percentile,  # noqa: E402
                           permutation_test, ratio_of_medians_ci)
 
-CONFIG_ORDER = ["noagg", "useragg", "xdp-generic", "xdp-native", "xdp-array"]
+CONFIG_ORDER = ["noagg", "useragg", "useragg-v3", "xdp-generic", "xdp-generic-v3", "xdp-native", "xdp-array"]
 
 
 def read(path):
@@ -173,6 +173,29 @@ def main():
             for c in comps:
                 w.writerow({k: (f"{v:.6g}" if isinstance(v, float) else v) for k, v in c.items()})
 
+    # ---- wire v3 at exponent 16 (the same integers) against v2 on the same path ----
+    v3comps = []
+    for n in sorted({int(k[1]) for k in cells}):
+        for cfg, base in (("useragg-v3", "useragg"), ("xdp-generic-v3", "xdp-generic")):
+            a = [f(r["values_per_s"]) for r in cells.get((cfg, str(n)), [])]
+            b = [f(r["values_per_s"]) for r in cells.get((base, str(n)), [])]
+            if len(a) < 2 or len(b) < 2:
+                continue
+            delta, p = permutation_test(a, b, rng)
+            lo, hi = ratio_of_medians_ci(a, b, rng)
+            v3comps.append({"workers": n, "config": cfg, "baseline": base, "metric": "values_per_s",
+                            "config_median": median(a), "baseline_median": median(b),
+                            "ratio": median(a) / median(b) if median(b) else None, "ratio_ci_lo": lo,
+                            "ratio_ci_hi": hi, "cliffs_delta": delta, "p": p, "n": f"{len(a)} vs {len(b)}"})
+    for c, adj in zip(v3comps, holm([c["p"] for c in v3comps])):
+        c["p_holm"] = adj
+    if v3comps:
+        with open(os.path.join(out, "v3_comparisons.csv"), "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(v3comps[0].keys()))
+            w.writeheader()
+            for c in v3comps:
+                w.writerow({k: (f"{v:.6g}" if isinstance(v, float) else v) for k, v in c.items()})
+
     # ---- fairness ----
     fsum = []
     by_policy = defaultdict(lambda: defaultdict(list))
@@ -217,10 +240,11 @@ def main():
                   f"{fmt(s['ps_cpu_ns_per_chunk_median'])} | "
                   f"{inn} | "
                   f"{s['resent_total']} |")
-    md += ["\n### Round completion time (synchronous rounds, measured at the worker)\n",
-           "| config | workers | samples | p50 us [95% CI] | p95 us | p99 us [95% CI] | p99.9 us | agg algorithm ns/pkt | XDP ns/run |",
-           "|---|---:|---:|---|---:|---|---:|---:|---:|"]
-    for s in lat_summary:
+    if "workers" in lat_summary[0]:  # absent when the run had no latency trials
+        md += ["\n### Round completion time (synchronous rounds, measured at the worker)\n",
+               "| config | workers | samples | p50 us [95% CI] | p95 us | p99 us [95% CI] | p99.9 us | agg algorithm ns/pkt | XDP ns/run |",
+               "|---|---:|---:|---|---:|---|---:|---:|---:|"]
+    for s in (lat_summary if "workers" in lat_summary[0] else []):
         md.append(f"| {s['config']} | {s['workers']} | {s['samples']} | {fmt(s['p50_us'])} [{fmt(s['p50_ci_lo'])}, "
                   f"{fmt(s['p50_ci_hi'])}] | {fmt(s['p95_us'])} | {fmt(s['p99_us'])} [{fmt(s['p99_ci_lo'])}, "
                   f"{fmt(s['p99_ci_hi'])}] | {fmt(s['p999_us'])} | {fmt(s['agg_profile_ns_per_pkt'])} | "
@@ -232,6 +256,14 @@ def main():
         for c in comps:
             md.append(f"| {c['family']} | {c['workers']} | {c['config']} | {fmt(c['config_median'])} | "
                       f"{fmt(c['useragg_median'])} | {fmt(c['ratio'], 3)} [{fmt(c['ratio_ci_lo'], 3)}, "
+                      f"{fmt(c['ratio_ci_hi'], 3)}] | {c['cliffs_delta']:.3f} | {c['p']:.4f} | {c['p_holm']:.4f} | {c['n']} |")
+    if v3comps:
+        md += ["\n### Wire v3 (exponent 16) against v2 on the same path: throughput\n",
+               "| workers | config | baseline | config median | baseline median | ratio [95% CI] | Cliff's delta | p | p (Holm) | n |",
+               "|---:|---|---|---:|---:|---|---:|---:|---:|---|"]
+        for c in v3comps:
+            md.append(f"| {c['workers']} | {c['config']} | {c['baseline']} | {fmt(c['config_median'])} | "
+                      f"{fmt(c['baseline_median'])} | {fmt(c['ratio'], 3)} [{fmt(c['ratio_ci_lo'], 3)}, "
                       f"{fmt(c['ratio_ci_hi'], 3)}] | {c['cliffs_delta']:.3f} | {c['p']:.4f} | {c['p_holm']:.4f} | {c['n']} |")
     if fsum:
         md += ["\n### Fairness: three jobs with demand 4:2:1 sharing one XDP aggregator\n",

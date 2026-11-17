@@ -307,6 +307,45 @@ jobs:
           assert resent > 0, "20% loss but no retransmissions?"
           PY
 
+      - name: "Scenario S (wire v3): reliable workers at exponent 40 sum 3e-6 exactly through XDP under 20% loss"
+        run: |
+          set -euo pipefail
+          source ci/lib.sh
+          stats_to /tmp/s-before.json
+          in_ns1 tc qdisc add dev veth1 root netem loss 20%
+          for w in 0 1 2; do reliable_bg 990 "$w" 3 8 256 --rto-ms 50 --window 16 --fixed 3e-6 --frac-bits 40; done
+          wait
+          in_ns1 tc qdisc del dev veth1 root
+          check_reliable 990 3 32
+          stats_to /tmp/s-after.json
+          python3 - <<'PY'
+          import json
+          b, a = json.load(open("/tmp/s-before.json")), json.load(open("/tmp/s-after.json"))
+          d = {k: a.get(k, 0) - b.get(k, 0) for k in a if isinstance(a[k], int)}
+          assert d["scale_mismatch"] == 0 and d["accepted"] > 0, d
+          print("PASS: v3 at e=40 through the kernel:", {k: v for k, v in d.items() if v})
+          PY
+
+      - name: "Scenario S2 (wire v3): a saturated chunk is retried at a lower exponent through XDP"
+        run: |
+          set -euo pipefail
+          source ci/lib.sh
+          stats_to /tmp/s2-before.json
+          for w in 0 1 2; do reliable_bg 991 "$w" 3 4 256 --rto-ms 50 --window 16 --fixed 1.0 --frac-bits 31; done
+          wait
+          check_reliable 991 3 16
+          stats_to /tmp/s2-after.json
+          python3 - <<'PY'
+          import json
+          for w in range(3):
+              r = json.loads(open(f"/tmp/rw-991-{w}.json").read().strip().splitlines()[-1])
+              assert r["retried_chunks"] == 16 and r["overflow_results"] == 16, r
+          b, a = json.load(open("/tmp/s2-before.json")), json.load(open("/tmp/s2-after.json"))
+          d = {k: a.get(k, 0) - b.get(k, 0) for k in a if isinstance(a[k], int)}
+          assert d["overflow"] >= 16 and d["scale_mismatch"] == 0, d
+          print("PASS: every saturated chunk came back OVERFLOW from the kernel and was retried at e=23:", {k: v for k, v in d.items() if v})
+          PY
+
       - name: "Scenario I2 (G2): reliable workers complete every round under delay and reordering"
         run: |
           set -euo pipefail

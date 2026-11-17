@@ -194,8 +194,11 @@ match the retry; the failed attempt's slots retire by ACK like any other. Up
 to 9 attempts reach exponent 0; overflow there stops the job. Because the
 decision depends only on each worker's own values, the local reference
 (`adapt`) makes exactly the same retries, and the network path must match it
-bit for bit at every attempt. The C worker uses a fixed exponent and does not
-retry.
+bit for bit at every attempt. The C reliable worker (`--frac-bits E`)
+starts every chunk at the fixed exponent E, bounds its values the same way,
+and retries the same way: on an `OVERFLOW` result it re-sends that chunk at
+`e - 8` under the next attempt's key, ignores any late result of an earlier
+attempt, and verifies a `--fixed` sum at the exponent that succeeded.
 
 ## 3. Admission and validation
 
@@ -634,6 +637,6 @@ are unicast, not multicast; the userspace aggregator has no array mode; the
 parameter server cannot separate partially overlapping aggregates (it waits
 for the remaining workers' fallbacks instead of subtracting per-worker values);
 Q16.16 loses gradients below ~1e-5 (see `docs/RESULTS.md` §Quantization);
-wire v3's per-chunk exponent addresses that for synchronous training (the
-Python client retries an overflowed chunk in the same step, §2; the
-pipelined C worker uses a fixed exponent and does not).
+wire v3's per-chunk exponent addresses that for synchronous training (§2);
+the pipelined C worker uses a fixed starting exponent and only lowers it by
+retrying after `OVERFLOW`.

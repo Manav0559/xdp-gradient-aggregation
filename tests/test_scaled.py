@@ -124,8 +124,10 @@ def test_reliable_v3_workers_through_useragg_with_loss():
     assert ast.get("slots_accumulating") == 0, ast
 
 
-def test_reliable_v3_saturation_is_flagged_not_summed():
-    # 1.0 at e=31 does not fit in int32: every result must carry OVERFLOW
+def test_reliable_v3_saturation_is_retried_at_a_lower_exponent():
+    # 1.0 at e=31 exceeds INT32_MAX / 2: every chunk comes back OVERFLOW once,
+    # is retried at e=23 under a new key, and then sums exactly (checked by
+    # the worker against 2 x round(1.0 * 2^23))
     ps_port = free_port()
     ps = Server([PARAMSERVER, "--quiet", str(ps_port), "noagg"])
     try:
@@ -133,7 +135,24 @@ def test_reliable_v3_saturation_is_flagged_not_summed():
     finally:
         ps.stop()
     for r in res:
-        assert r["results"] == 2 * 2 and r["overflow_results"] == r["results"], r
+        assert r["results"] == 2 * 2 and r["result_mismatches"] == 0, r
+        assert r["overflow_results"] == 2 * 2 and r["retried_chunks"] == 2 * 2, r
+
+
+def test_reliable_v3_retry_through_useragg_with_loss():
+    ps_port = free_port()
+    agg, agg_port = start_agg(ps_port, "--quiet")
+    ps = Server([PARAMSERVER, "--quiet", "--ack-to", f"127.0.0.1:{agg_port}", str(ps_port), "agg"])
+    try:
+        res = run_reliable(agg_port, ps_port, 912, 3, 4, 256,
+                           ("--fixed", "1.0", "--frac-bits", "31", "--drop-every", "5", "--drop-result-every", "7"))
+        ast = stats_all(agg)
+    finally:
+        agg.stop()
+        ps.stop()
+    for r in res:
+        assert r["results"] == 4 * 4 and r["result_mismatches"] == 0 and r["retried_chunks"] == 4 * 4, r
+    assert ast.get("slots_accumulating") == 0 and ast.get("scale_mismatch") == 0, ast
 
 
 def run_train_spike(train_dir):

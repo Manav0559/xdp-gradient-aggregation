@@ -353,11 +353,16 @@ fallbacks instead) and no `scale_mismatch`. Each worker's v3 values are now boun
 `INT32_MAX / N`; re-running the local S = 1e-4 paths after that change gives
 the same final loss to six digits, so the table above stands.
 
+**The C worker on the kernel.** The XDP load test runs the reliable C
+worker in v3 mode through the kernel program: Scenario S (three workers,
+3e-6 at exponent 40, 20% loss) and Scenario S2 (1.0 at exponent 31, which
+exceeds `INT32_MAX / 3`: every chunk comes back `OVERFLOW` from the kernel and
+is retried at exponent 23). Run IDs in `docs/OVERNIGHT_LOG.md`.
+
 **Scope.** One small model, synchronous rounds, one exponent per 64-value
-chunk. On the kernel, v3 was exercised by the Python client; the C worker's
-`--frac-bits` mode is tested only through the userspace aggregator and PS,
-and it does not retry. Not shown: gradients that change scale by more than
-16x per step other than the forced spike, and any effect on throughput.
+chunk. Not shown: gradients that change scale by more than 16x per step
+other than the forced spike. Throughput of v3 against v2 is measured in the
+next section.
 
 ## Benchmark-lite: first XDP measurements (open loop, two namespaces, `xdpgeneric`)
 
