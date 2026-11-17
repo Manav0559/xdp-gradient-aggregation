@@ -391,7 +391,12 @@ and if that worker then receives the result anyway (the PS re-sends it to
 every registered worker when another worker recovers), no second RESEND
 arrives to flush it, so only the sweeper reclaims the slot. Kernel
 deployments therefore need the sweeper running for slot hygiene, not only
-for crashed workers (Scenarios R and R2 assert this).
+for crashed workers (Scenarios R and R2 assert this). The userspace aggregator
+behaves the same in hash and array mode; its equivalent is the reaper
+(`slot_ttl_ms`), which drops such a slot (the PS already holds the result).
+`tests/test_reliability.py` runs it wherever a test asserts that no slot is
+left: without it, the tiny-pool test left one or two re-opened aggregators in
+2 of 12 runs on a slow (emulated) Linux host.
 
 ## 9. Reliability
 
