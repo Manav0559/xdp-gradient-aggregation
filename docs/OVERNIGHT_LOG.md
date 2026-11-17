@@ -782,7 +782,12 @@ Branch `feature/finish-open-items` from main (`92ddd73`). On the owner's
   the same order, so all three lost the same 10 results, re-sent together,
   and XDP re-aggregated each key in full (42 completions for 32 keys) with
   every result exact. That never exercised a lone RESEND, hence the uneven
-  drop rates.
+  drop rates. The second run then showed a real (already documented, J2)
+  behaviour: a lone RESEND that arrives after the ACK re-opens the key, and
+  if that worker then receives the result anyway (the PS re-sends it to all
+  registered workers when another worker recovers), the re-opened slot stays
+  ACCUMULATING with one contributor until the TTL sweeper flushes it. R and
+  R2 therefore run the sweeper before asserting that no slot is left.
 - **Docs.** README: wire v2 -> v2 and v3, 79 BPF unit cases (was "69"), 24
   kernel scenarios (was "20"), userspace array mode, overflow handling moved
   from "not reproduced" to "adapted" (v3 retries in the same step).

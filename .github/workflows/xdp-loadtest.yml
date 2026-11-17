@@ -402,6 +402,15 @@ jobs:
           reliable_bg 998 2 3 8 256 --rto-ms 50 --window 16
           wait
           sleep 0.5
+          # A lone RESEND that arrives after the ACK re-opens the key; if that
+          # worker then gets the result anyway (the PS re-sends it to every
+          # registered worker when another worker recovers), nobody flushes
+          # the re-opened slot. The TTL sweeper is what reclaims it (as in J2).
+          slots_to /tmp/slots_r_before_sweep.json
+          echo "job 998 slots before sweeping:"; python3 -c "import json; print([s for s in json.load(open('/tmp/slots_r_before_sweep.json')) if s['job_id'] == 998])"
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 300
+          sleep 0.5
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 300
           stats_to /tmp/r1.json; slots_to /tmp/slots_r.json
           check_reliable 998 3 32
           python3 ci/check_slot_present.py /tmp/slots_r.json 998 no-accumulating
@@ -431,6 +440,9 @@ jobs:
           reliable_bg 999 2 3 8 256 --rto-ms 50 --window 16
           wait
           sleep 0.5
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 300   # re-opened keys, as in R
+          sleep 0.5
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 300
           stats_to /tmp/r2b.json; ctl_json slots > /tmp/slots_r2.json
           ctl_json config $CFG
           check_reliable 999 3 32
