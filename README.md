@@ -71,9 +71,9 @@ make bpf-unit                                                    # BPF_PROG_TEST
 
 | Component | What it does | Verified by |
 |---|---|---|
-| `protocol/` | wire format v2, one shared parser (`grad_parse.h`) for every path, counters, map layouts | unit tests, libFuzzer differential fuzzing, kernel corpus replay |
-| `xdp_agg/xdp_agg.c` | in-kernel aggregation: admission checks, tombstones, overflow detection, quota with fallback, ACK retirement, RESEND flush, FALLBACK, array-mode aggregators, source rewrite, redirect; `netsum_sweep` for TTL | `bpf-unit.yml` (69 cases), `xdp-loadtest.yml` (real kernel, real UDP) |
-| `userspace_agg/agg.c` | the same algorithm in a process (hash mode) | `tests/`, benchmark |
+| `protocol/` | wire formats v2 and v3 (per-chunk exponent), one shared parser (`grad_parse.h`) for every path, counters, map layouts | unit tests, libFuzzer differential fuzzing, kernel corpus replay |
+| `xdp_agg/xdp_agg.c` | in-kernel aggregation: admission checks, tombstones, overflow detection, quota with fallback, ACK retirement, RESEND flush, FALLBACK, array-mode aggregators, source rewrite, redirect; `netsum_sweep` for TTL | `bpf-unit.yml` (79 cases), `xdp-loadtest.yml` (real kernel, real UDP) |
+| `userspace_agg/agg.c` | the same algorithm in a process: hash mode, or ATP's aggregator pool with collision fallback (`--array-slots-log2 N`) | `tests/test_reliability.py`, benchmark |
 | `paramserver/` | final summing node, merges raw/fallback/partial/aggregate packets by contributor set, sends results | `tests/test_fallback.py`, `tests/test_reliability.py` |
 | `worker/` | one-shot sender and a reliable windowed worker with retransmission | `tests/test_reliability.py`, Scenarios H2/I2/J2 |
 | `ctl/netsum_ctl.c` | libbpf control plane: attach (reports the real mode), config, stats, slots, jobs, sweep, verify | `ci/test_netsum_ctl.sh` |
@@ -137,12 +137,12 @@ line rate. The environment is a shared VM and veth is a software device.
   copies (C11), tests that could not fail (C12), unrecoverable lost results
   (C13), and a livelock between partial flushes and retransmissions found by
   a kernel scenario (C14).
-* **Kernel unit tests:** 69 `BPF_PROG_TEST_RUN` cases on the loaded program,
+* **Kernel unit tests:** 79 `BPF_PROG_TEST_RUN` cases on the loaded program,
   covering every verdict and state transition, plus the fuzz corpus and
   5,000 mutations replayed against the userspace parser, on two builds whose
   disassembly is identical.
-* **Kernel end to end:** 20 scenarios over real UDP and veth, including 20%
-  loss, reordering, a permanently lost packet recovered through a sweeper
+* **Kernel end to end:** 24 scenarios over real UDP and veth, including 20%
+  loss, lost results recovered through the XDP path (hash and array mode), reordering, a permanently lost packet recovered through a sweeper
   flush, retransmission and fallback, and the sweeper leaving no slot behind;
   assertions on exact counter deltas.
 * **Fuzzing:** the shipped parser against a reference parser under ASan.
@@ -165,10 +165,11 @@ fragments in programmable top-of-rack switches.
   BPF hash map or a BPF array instead of switch registers; a userspace sweeper
   driving an in-kernel program instead of the switch's timestamp check;
   results unicast to workers instead of IGMP multicast; an optional per-job
-  admission quota as an extra policy (it is not ATP's mechanism).
+  admission quota as an extra policy (it is not ATP's mechanism); on overflow,
+  instead of ATP's floating-point re-request, wire v3 workers retry the chunk
+  in the same step at a lower shared exponent.
 * **Not reproduced:** the two-level (rack) hierarchy, ECN-based AIMD
-  congestion control, the floating-point re-request on overflow (NetSum only
-  flags it), dynamic re-hashing of colliding indexes, and Tofino line rate.
+  congestion control, dynamic re-hashing of colliding indexes, and Tofino line rate.
 
 ## Repository layout
 

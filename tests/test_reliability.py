@@ -243,6 +243,112 @@ def test_g2_reliable_workers_useragg_with_lost_contributions_and_results():
     assert ast.get("slots_accumulating") == 0, f"stuck slots at the aggregator: {ast}"
 
 
+# ---- array mode (ATP aggregator pool) in the userspace aggregator ------------
+
+def test_array_mode_collision_falls_back_and_ack_frees_the_aggregator():
+    # One aggregator: key A claims it, key B collides and lives at the PS for
+    # all of its contributions (sticky), the ACK for A frees the aggregator,
+    # and key C then aggregates in-network. Every sum is exact.
+    ps_port = free_port()
+    agg, agg_port = start_agg(ps_port, "--array-slots-log2", "0")
+    ps = Server([PARAMSERVER, "--ack-to", f"127.0.0.1:{agg_port}", str(ps_port), "agg"])
+    e = Endpoint()
+    try:
+        e.send(agg_port, 710, 0, 0, 3, 1.0)        # A claims the only aggregator
+        agg.drain_for(0.05)
+        e.send(agg_port, 711, 0, 0, 3, 10.0)       # B collides: fallback
+        agg.drain_for(0.05)
+        for w in (1, 2):
+            e.send(agg_port, 710, 0, w, 3, 1.0)    # A completes in-network
+        agg.drain_for(0.1)
+        for w in (1, 2):
+            e.send(agg_port, 711, 0, w, 3, 10.0)   # B stays at the PS
+        agg.drain_for(0.3)
+        ps.drain_for(0.1)
+        for w in range(3):
+            e.send(agg_port, 712, 0, w, 3, 100.0)  # C: aggregator free again after A's ACK
+        agg.drain_for(0.3)
+        ps.drain_for(0.2)
+        st, pst = stats_all(agg), stats_all(ps)
+    finally:
+        agg.stop()
+        ps.stop()
+        e.close()
+    assert "array mode" in agg.text(), agg.text()
+    assert st.get("fallback_collision") == 1 and st.get("tx_fallback") == 3, st
+    assert st.get("tx_aggregate") == 2 and st.get("slot_completed") == 2, st
+    assert st.get("slot_retired_ack") == 2 and st.get("slots_completed") == 0, st
+    assert pst.get("rx_fallback") == 3, pst
+    done = {(int(j), int(r)): float(v) for j, r, _c, _n, v, _l in extract_complete_lines(ps.text())}
+    assert done == {(710, 0): 3.0, (711, 0): 30.0, (712, 0): 300.0}, ps.text()
+
+
+def test_array_mode_late_contribution_for_a_fallen_back_key_never_steals_an_aggregator():
+    # B falls back on a collision with A; once A's aggregator is freed, a
+    # retransmission for B must still go to the PS (the key lives there), or
+    # B would be split between the aggregator and the PS.
+    ps_port = free_port()
+    # No --ack-to: A's aggregator is freed by its 50 ms tombstone instead, so
+    # it is EMPTY when B's second contribution arrives. Without the sticky
+    # fallback set, B would claim it and never complete (1 of 2 workers).
+    agg, agg_port = start_agg(ps_port, "--array-slots-log2", "0", "--tombstone-ttl-ms", "50")
+    ps = Server([PARAMSERVER, str(ps_port), "agg"])
+    e = Endpoint()
+    try:
+        e.send(agg_port, 720, 0, 0, 2, 1.0)
+        e.send(agg_port, 721, 0, 0, 2, 5.0)        # collision: B -> PS
+        e.send(agg_port, 720, 0, 1, 2, 1.0)        # A completes, aggregator COMPLETED
+        agg.drain_for(0.4)                         # ... and its tombstone expires
+        e.send(agg_port, 721, 0, 1, 2, 5.0)        # B's second worker: still the PS
+        agg.drain_for(0.2)
+        ps.drain_for(0.2)
+        st = stats_all(agg)
+    finally:
+        agg.stop()
+        ps.stop()
+        e.close()
+    assert st.get("fallback_collision") == 1 and st.get("tx_fallback") == 2, st
+    assert st.get("slot_retired_ttl") == 1 and st.get("slots_accumulating") == 0, st
+    done = {(int(j), int(r)): float(v) for j, r, _c, _n, v, _l in extract_complete_lines(ps.text())}
+    assert done == {(720, 0): 2.0, (721, 0): 10.0}, ps.text()
+
+
+def test_array_mode_reliable_workers_share_a_tiny_pool_under_loss():
+    # Two jobs, 16 chunks per round, 4 aggregators: most keys collide. Lost
+    # contributions and lost results on top. Every result must be exact and
+    # no aggregator may stay ACCUMULATING.
+    ps_port = free_port()
+    agg, agg_port = start_agg(ps_port, "--quiet", "--array-slots-log2", "2")
+    ps = Server([PARAMSERVER, "--quiet", "--ack-to", f"127.0.0.1:{agg_port}", str(ps_port), "agg"])
+    procs, res = [], []
+    try:
+        for job in (730, 731):
+            for wid in range(3):
+                argv = [WORKER, "--mode", "reliable", "--to", f"127.0.0.1:{agg_port}",
+                        "--ps", f"127.0.0.1:{ps_port}", "--job", str(job), "--worker", str(wid),
+                        "--workers", "3", "--rounds", "6", "--vector-len", "1024", "--chunk-len", "64",
+                        "--window", "16", "--rto-ms", "40", "--fixed", "0.25",
+                        "--drop-every", "5", "--drop-result-every", "7"]
+                procs.append(subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        for p in procs:
+            o, err = p.communicate(timeout=60)
+            assert p.returncode == 0, f"worker failed ({p.returncode}): {err}"
+            res.append(json.loads(o.strip().splitlines()[-1]))
+        agg.drain_for(0.3)
+        ast = stats_all(agg)
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+        agg.stop()
+        ps.stop()
+    for r in res:
+        assert r["results"] == 6 * 16 and r["result_mismatches"] == 0, r
+    assert sum(r["dropped_rx"] for r in res) > 0, res
+    assert ast.get("fallback_collision", 0) > 0 and ast.get("tx_aggregate", 0) > 0, ast
+    assert ast.get("slots_accumulating") == 0, f"stuck aggregators: {ast}"
+
+
 def main():
     tests = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]
     bad = 0

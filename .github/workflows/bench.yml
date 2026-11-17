@@ -1,8 +1,8 @@
 # NetSum v2 benchmark: closed-loop noagg vs userspace vs XDP (generic,
 # native when veth supports it, array mode) on three namespaces, plus the
 # multi-tenant fairness sweep. Performance is reported, never gated; the run
-# fails only on a functional error (a worker that did not finish, or a wrong
-# sum). Artifact: netsum-bench-<run id>. Method: docs/DESIGN_NOTES.md §15.
+# fails only on a functional error (a worker that did not finish, a wrong
+# sum, or an XDP packet-accounting imbalance). Artifact: netsum-bench-<run id>. Method: docs/DESIGN_NOTES.md §15.
 name: Benchmark v2 (closed loop, three namespaces)
 
 on:
@@ -61,7 +61,9 @@ jobs:
       - name: Analyse
         if: always()
         run: |
-          set -o pipefail
+          # -e as well as pipefail: without -e a failing v2 analysis is masked
+          # by a successful v3 one (the step's status is the last command's).
+          set -euo pipefail
           sudo chown -R "$(id -u):$(id -g)" bench-out || true
           python3 scripts/bench_analyze.py bench-out/v2 bench-out/v2/summary | tee -a "$GITHUB_STEP_SUMMARY"
           if [ -d bench-out/v3 ]; then python3 scripts/bench_analyze.py bench-out/v3 bench-out/v3/summary | tee -a "$GITHUB_STEP_SUMMARY"; fi

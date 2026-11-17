@@ -753,3 +753,36 @@ simulation and links the measured results.
   partials, so the in-network share falls fast with loss (about 89% at 0%,
   44% at 3% in the model); the demo shows that as is.
 - Checked in headless Chrome at 500, 800 and 1280 px: no horizontal scroll.
+
+## 2026-11-17 18:50 IST — Closing the feasible open items
+
+Branch `feature/finish-open-items` from main (`92ddd73`). On the owner's
+"complete this project", the open items that need no hardware:
+
+- **Userspace array mode.** `agg --array-slots-log2 N` mirrors the kernel's
+  aggregator pool (same index hash, claim on EMPTY, collision -> FALLBACK,
+  sticky fallback keys, ACK frees, no quota). Three tests: a one-aggregator
+  collision with exact sums and ACK reuse; a fallen-back key whose aggregator
+  is freed must still go to the PS; two jobs of reliable workers sharing four
+  aggregators with lost contributions and results. Red-first check: with the
+  fallback set disabled, the first two fail (B stays 1-of-2 forever).
+- **The benchmark fails on an accounting imbalance.** `bench_analyze.py`
+  exits 1 and names the trial. The Analyse step had `pipefail` but not `-e`,
+  so a failing v2 analysis would have been masked by a passing v3 one; now
+  `set -euo pipefail`. Checked: the committed v2 (117/117) and v3 data exit
+  0 with byte-identical output to the old analyzer; one corrupted row exits 1.
+- **Lost results on the kernel path.** Scenario R (hash mode, job 998) and
+  R2 (array mode, job 999): reliable workers discard every 4th result they
+  receive, so only results are lost; every result must still be exact, each
+  key complete exactly once at the PS, the recovery must pass through the XDP
+  program (`tx_result_resend` or `slot_flushed_partial`), and no slot may be
+  left ACCUMULATING.
+- **Docs.** README: wire v2 -> v2 and v3, 79 BPF unit cases (was "69"), 24
+  kernel scenarios (was "20"), userspace array mode, overflow handling moved
+  from "not reproduced" to "adapted" (v3 retries in the same step).
+  DESIGN_NOTES: scenario list gains S/S2/R/R2; the open-limitations list
+  drops "no userspace array mode" and gains the 64-value packet limit, the
+  two-namespace correctness topology and no physical NIC.
+
+Still open (structural): 64 values per packet; two-namespace correctness
+scenarios; no hardware NIC, native XDP on hardware or multi-host run.

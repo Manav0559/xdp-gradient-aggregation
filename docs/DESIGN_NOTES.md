@@ -341,6 +341,18 @@ are printed as a `[job-retired]` line. When all 256 entries are in use, new
 slots are refused (`drop_job_table_full`): the table **fails closed**, so
 rotating job ids can no longer escape the quota (bug C7).
 
+Array mode in userspace (`agg --array-slots-log2 N`) mirrors the kernel's
+`agg_array`: a pool of `2^N` aggregators indexed by `netsum_slot_hash(key) &
+mask` (the function the kernel uses), each tagged with its owner. An EMPTY
+aggregator is claimed; one owned by another key sends the contribution to the
+PS with FALLBACK and records the key in a fallback set, so the key's later
+contributions follow it even after the aggregator is freed (no key is split
+between the aggregator and the PS). The ACK frees the aggregator and clears
+the key from the set; tombstones expire as in hash mode; the per-job quota
+does not apply, as in the kernel; v1 contributions that would fall back are
+dropped, since v1 has no FALLBACK flag. Tests: `tests/test_reliability.py`
+(`test_array_mode_*`).
+
 ## 8. Reclamation
 
 Slot life cycle: `EMPTY -> ACCUMULATING -> COMPLETED -> EMPTY`, plus
@@ -535,11 +547,11 @@ MAC/IP, so no `accept_local` relaxation is needed.
 | Wire format | Python packer == C header bytes | `tests/test_python_client.py` | `make test`, CI |
 | Userspace behaviour | the real binaries over UDP: sums, duplicates, truncation, quota, reaper | `tests/test_correctness.py` | `make test`, CI |
 | Confirmed bugs | one regression test per bug C1-C7 | `tests/test_protocol_v2.py` | `make test`, CI |
-| Reliability | results, ACK retirement, lost results (C13), RESEND table, reliable workers under loss | `tests/test_reliability.py` | `make test`, CI |
+| Reliability | results, ACK retirement, lost results (C13), RESEND table, reliable workers under loss, userspace array mode (collision fallback, sticky fallback keys, a 4-aggregator pool shared by two jobs under loss) | `tests/test_reliability.py` | `make test`, CI |
 | PS merge rules | partial/fallback/aggregate set rules (C14) | `tests/test_fallback.py` | `make test`, CI |
 | Parser fuzzing | `netsum_parse()` vs a reference parser, ASan | `fuzz/` | `fuzz.yml` |
 | Kernel unit | the loaded program via `BPF_PROG_TEST_RUN`: every verdict, the state x event table, ACK/RESEND/FLUSHED rows, the sweep program, array mode and fallback, quota, overflow edges, TTL, redirect, corpus replay + 5,000 mutations vs the userspace parser; on the system-libbpf and vendored-header builds, whose disassembly must match | `tests/bpf/run_xdp_tests.c` | `bpf-unit.yml` |
-| Kernel end to end | real UDP over veth: Scenarios A-G (sums, adversarial input, config, quota), Q (ACK retirement), J2 (sweeper flush + retransmission + fallback), K-N (bugs C1-C4), H2/I2 (reliable workers under loss and reordering), G2 (fallback policy), P (array mode), O (the sweeper leaves nothing behind); exact counter deltas via `netsum-ctl --json` | `xdp-loadtest.yml`, `ci/` | CI |
+| Kernel end to end | real UDP over veth: Scenarios A-G (sums, adversarial input, config, quota), Q (ACK retirement), J2 (sweeper flush + retransmission + fallback), K-N (bugs C1-C4), H2/I2 (reliable workers under loss and reordering), S/S2 (wire v3 exponent and in-step overflow retry), G2 (fallback policy), P (array mode), R/R2 (lost results recovered through the XDP path, hash and array mode), O (the sweeper leaves nothing behind); exact counter deltas via `netsum-ctl --json` | `xdp-loadtest.yml`, `ci/` | CI |
 | Control plane | attach, config, stats, sweep, detach on a veth | `ci/test_netsum_ctl.sh` | `xdp-loadtest.yml` |
 | Training | SGD through noagg / userspace / XDP / XDP with loss must be bit-identical to the local quantized all-reduce | `examples/train_mlp/` | `train-demo.yml` |
 
@@ -633,10 +645,13 @@ correctness topology:
 
 Open limitations (not bugs): no authentication of workers (§4); one level of
 aggregation (no ATP rack hierarchy); no ECN/AIMD congestion control; results
-are unicast, not multicast; the userspace aggregator has no array mode; the
+are unicast, not multicast; the
 parameter server cannot separate partially overlapping aggregates (it waits
 for the remaining workers' fallbacks instead of subtracting per-worker values);
 Q16.16 loses gradients below ~1e-5 (see `docs/RESULTS.md` §Quantization);
 wire v3's per-chunk exponent addresses that for synchronous training (§2);
 the pipelined C worker uses a fixed starting exponent and only lowers it by
-retrying after `OVERFLOW`.
+retrying after `OVERFLOW`; a packet carries at most 64 values
+(128 verifies, 256 exceeds the verifier's instruction limit, §6); the
+kernel correctness scenarios run on two namespaces (only the benchmark uses
+three); nothing has run on a physical NIC or across hosts.
