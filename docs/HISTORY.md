@@ -27,7 +27,7 @@ tombstones and per-CPU counters, a `BPF_PROG_TEST_RUN` unit harness, the
 result/ACK path, resend semantics, best-effort fallback, array-mode
 aggregators, a reliable worker, `netsum-ctl`, a closed-loop three-namespace
 benchmark, a training demo and a quantization study.
-`docs/OVERNIGHT_LOG.md` is the step-by-step record, including what went
+`docs/WORKLOG.md` is the step-by-step record, including what went
 wrong.
 
 ## Four engineering stories

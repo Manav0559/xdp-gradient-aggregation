@@ -50,8 +50,8 @@ ps_start() { # extra args
 }
 ps_stop() { kill -TERM "$PS_PID" 2>/dev/null || true; wait "$PS_PID" 2>/dev/null || true; }
 
-agg_start() { # --profile only in latency trials, so throughput carries no timing overhead
-    $PIN_AGG ./bin/agg --quiet ${AGG_PROFILE:-} 9876 10.10.2.2 9000 > "$OUT/raw/agg.log" 2>&1 &
+agg_start() { # [agg flags...]; --profile only in latency trials, so throughput carries no timing overhead
+    $PIN_AGG ./bin/agg --quiet ${AGG_PROFILE:-} "$@" 9876 10.10.2.2 9000 > "$OUT/raw/agg.log" 2>&1 &
     AGG_PID=$!
     for _ in $(seq 1 100); do grep -q listening "$OUT/raw/agg.log" && return 0; sleep 0.05; done
     echo "agg did not start" >&2; return 1
@@ -68,6 +68,10 @@ setup_config() { # config -> sets TARGET and starts the aggregator
         noagg) TARGET=10.10.2.2:9000 ;;
         useragg) agg_start ;;
         useragg-v3) agg_start; WORKER_EXTRA=(--frac-bits 16) ;; # same integers as Q16.16, wire v3
+        # Stronger userspace baselines (pre-registered in docs/RESULTS.md before
+        # the first run): batch size fixed at 64 = the workers' window, never tuned.
+        useragg-batch) agg_start --batch 64 ;;
+        useragg-array) agg_start --array-slots-log2 16 ;; # same pool size as xdp-array
         xdp-generic) xdp_up generic hash 16 ;;
         xdp-generic-v3) xdp_up generic hash 16; WORKER_EXTRA=(--frac-bits 16) ;;
         xdp-native) xdp_up native hash 16 ;;

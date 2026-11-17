@@ -1,0 +1,13 @@
+family,workers,config,metric,config_median,useragg_median,ratio,ratio_ci_lo,ratio_ci_hi,cliffs_delta,p,n,p_holm
+T_throughput,2,xdp-generic,values_per_s,2.79197e+06,1.67435e+06,1.66749,1.65562,1.68074,1,0.00049975,8 vs 8,0.0029985
+T_throughput,2,xdp-native,values_per_s,2.68201e+06,1.67435e+06,1.60182,1.581,1.61361,1,0.00049975,8 vs 8,0.0029985
+T_throughput,4,xdp-generic,values_per_s,1.47704e+06,957797,1.54212,1.53134,1.55596,1,0.00049975,8 vs 8,0.0029985
+T_throughput,4,xdp-native,values_per_s,1.43148e+06,957797,1.49455,1.47931,1.50535,1,0.00049975,8 vs 8,0.0029985
+T_throughput,8,xdp-generic,values_per_s,704411,513784,1.37103,1.31255,1.40797,1,0.00049975,8 vs 8,0.0029985
+T_throughput,8,xdp-native,values_per_s,728812,513784,1.41852,1.36491,1.4288,1,0.00049975,8 vs 8,0.0029985
+L_round_p50,2,xdp-generic,round_p50_us,403,583,0.691252,0.684838,0.696028,-1,0.00849575,5 vs 5,0.0324838
+L_round_p50,2,xdp-native,round_p50_us,424,583,0.727273,0.721465,0.732297,-1,0.0089955,5 vs 5,0.0324838
+L_round_p50,4,xdp-generic,round_p50_us,797,1057,0.754021,0.733207,0.75947,-1,0.0069965,5 vs 5,0.0324838
+L_round_p50,4,xdp-native,round_p50_us,823,1057,0.778619,0.752129,0.781576,-1,0.00849575,5 vs 5,0.0324838
+L_round_p50,8,xdp-generic,round_p50_us,1584,1913,0.828019,0.820686,0.830979,-1,0.0049975,5 vs 5,0.029985
+L_round_p50,8,xdp-native,round_p50_us,1613,1913,0.843178,0.836279,0.8472,-1,0.00649675,5 vs 5,0.0324838

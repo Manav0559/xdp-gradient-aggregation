@@ -348,6 +348,21 @@ static int cmp_i64(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
+/* Frees what reliable_main allocates; every exit after the allocations
+ * goes through here (LeakSanitizer in the sanitizers CI job). */
+static int rel_finish(struct rel *r, unsigned *inflight, int64_t *rt, int rc)
+{
+    free(r->c);
+    free(r->round_start);
+    free(r->round_end);
+    free(r->round_left);
+    free(inflight);
+    free(rt);
+    if (r->sock >= 0)
+        close(r->sock);
+    return rc;
+}
+
 static int reliable_main(int argc, char **argv)
 {
     struct rel r;
@@ -408,16 +423,17 @@ static int reliable_main(int argc, char **argv)
     r.round_end = calloc(r.rounds, sizeof(int64_t));
     r.round_left = calloc(r.rounds, sizeof(uint32_t));
     unsigned *inflight = calloc(r.window, sizeof(unsigned));
+    r.sock = -1;
     if (!r.c || !r.round_start || !r.round_end || !r.round_left || !inflight) {
         fprintf(stderr, "out of memory\n");
-        return 1;
+        return rel_finish(&r, inflight, NULL, 1);
     }
     for (uint32_t i = 0; i < r.rounds; i++)
         r.round_left[i] = r.chunks_per_round;
     r.sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (r.sock < 0) {
         perror("socket");
-        return 1;
+        return rel_finish(&r, inflight, NULL, 1);
     }
     fcntl(r.sock, F_SETFL, fcntl(r.sock, F_GETFL) | O_NONBLOCK);
     int buf = 4 << 20;
@@ -428,7 +444,7 @@ static int reliable_main(int argc, char **argv)
     any.sin_family = AF_INET;
     if (bind(r.sock, (struct sockaddr *)&any, sizeof(any)) < 0) {
         perror("bind");
-        return 1;
+        return rel_finish(&r, inflight, NULL, 1);
     }
 
     rel_register(&r);
@@ -478,7 +494,7 @@ static int reliable_main(int argc, char **argv)
             if (c->deadline_us <= now) {
                 if (++c->retries > r.max_retries) {
                     fprintf(stderr, "worker %u: chunk %u gave up after %u retries\n", r.worker, inflight[i], r.max_retries);
-                    return 2;
+                    return rel_finish(&r, inflight, NULL, 2);
                 }
                 c->rto_us = c->rto_us * 2 > 1000000 ? 1000000 : c->rto_us * 2;
                 c->deadline_us = now + c->rto_us;
@@ -516,7 +532,7 @@ static int reliable_main(int argc, char **argv)
            (unsigned long long)r.overflow_results, (unsigned long long)r.retried, (unsigned long long)r.dropped_tx, (unsigned long long)r.dropped_rx,
            r.has_fixed ? "true" : "false", (long long)elapsed, (long long)PCT(0.50), (long long)PCT(0.95),
            (long long)PCT(0.99), (long long)rt[r.rounds - 1]);
-    return 0;
+    return rel_finish(&r, inflight, rt, 0);
 }
 
 int main(int argc, char **argv)

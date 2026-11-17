@@ -1,0 +1,25 @@
+family,workers,config,baseline,metric,config_median,baseline_median,ratio,ratio_ci_lo,ratio_ci_hi,cliffs_delta,p,n,p_holm
+B_throughput,2,useragg-batch,useragg,values_per_s,2.32006e+06,2.32935e+06,0.996013,0.991214,0.999673,-0.625,0.0344828,8 vs 8,0.206897
+B_throughput,2,xdp-generic,useragg-batch,values_per_s,3.20947e+06,2.32006e+06,1.38336,1.37733,1.4112,1,0.0009995,8 vs 8,0.007996
+B_throughput,2,useragg-array,useragg,values_per_s,2.32699e+06,2.32935e+06,0.998987,0.99381,1.00268,-0.1875,0.571214,8 vs 8,1
+B_throughput,2,xdp-array,useragg-array,values_per_s,3.18036e+06,2.32699e+06,1.36673,1.35601,1.37716,1,0.00049975,8 vs 8,0.005997
+B_throughput,4,useragg-batch,useragg,values_per_s,1.38526e+06,1.34841e+06,1.02733,0.980794,1.07184,0.3125,0.33983,8 vs 8,1
+B_throughput,4,xdp-generic,useragg-batch,values_per_s,1.8489e+06,1.38526e+06,1.33469,1.28319,1.39567,1,0.00049975,8 vs 8,0.005997
+B_throughput,4,useragg-array,useragg,values_per_s,1.37268e+06,1.34841e+06,1.018,0.97472,1.05474,0.09375,0.775612,8 vs 8,1
+B_throughput,4,xdp-array,useragg-array,values_per_s,1.75711e+06,1.37268e+06,1.28006,1.24653,1.33082,1,0.00049975,8 vs 8,0.005997
+B_throughput,8,useragg-batch,useragg,values_per_s,729115,724877,1.00585,0.995266,1.02248,0.40625,0.195902,8 vs 8,0.97951
+B_throughput,8,xdp-generic,useragg-batch,values_per_s,937910,729115,1.28637,1.26452,1.29335,1,0.0009995,8 vs 8,0.007996
+B_throughput,8,useragg-array,useragg,values_per_s,721922,724877,0.995924,0.984921,1.01135,-0.21875,0.512744,8 vs 8,1
+B_throughput,8,xdp-array,useragg-array,values_per_s,901504,721922,1.24875,1.23022,1.2578,1,0.00049975,8 vs 8,0.005997
+B_round_p50,2,useragg-batch,useragg,round_p50_us,429,424,1.01179,0.974057,1.02128,0.2,0.612694,5 vs 5,1
+B_round_p50,2,xdp-generic,useragg-batch,round_p50_us,323,429,0.752914,0.724537,0.782082,-1,0.0109945,5 vs 5,0.0854573
+B_round_p50,2,useragg-array,useragg,round_p50_us,423,424,0.997642,0.971698,1.01179,-0.24,0.589205,5 vs 5,1
+B_round_p50,2,xdp-array,useragg-array,round_p50_us,332,423,0.78487,0.773893,0.805825,-1,0.00949525,5 vs 5,0.0854573
+B_round_p50,4,useragg-batch,useragg,round_p50_us,773,784,0.985969,0.968112,1.01662,-0.2,0.664668,5 vs 5,1
+B_round_p50,4,xdp-generic,useragg-batch,round_p50_us,614,773,0.794308,0.765228,0.822309,-1,0.00849575,5 vs 5,0.0849575
+B_round_p50,4,useragg-array,useragg,round_p50_us,772,784,0.984694,0.959184,1.01151,-0.28,0.509245,5 vs 5,1
+B_round_p50,4,xdp-array,useragg-array,round_p50_us,645,772,0.835492,0.814767,0.857713,-1,0.00949525,5 vs 5,0.0854573
+B_round_p50,8,useragg-batch,useragg,round_p50_us,1452,1453,0.999312,0.970406,1.01538,-0.36,0.412794,5 vs 5,1
+B_round_p50,8,xdp-generic,useragg-batch,round_p50_us,1241,1452,0.854683,0.851166,0.880142,-1,0.00749625,5 vs 5,0.0824588
+B_round_p50,8,useragg-array,useragg,round_p50_us,1453,1453,1,0.972471,1.01608,-0.16,0.742629,5 vs 5,1
+B_round_p50,8,xdp-array,useragg-array,round_p50_us,1272,1453,0.87543,0.865306,0.900212,-1,0.00649675,5 vs 5,0.077961

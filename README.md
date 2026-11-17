@@ -73,7 +73,7 @@ make bpf-unit                                                    # BPF_PROG_TEST
 |---|---|---|
 | `protocol/` | wire formats v2 and v3 (per-chunk exponent), one shared parser (`grad_parse.h`) for every path, counters, map layouts | unit tests, libFuzzer differential fuzzing, kernel corpus replay |
 | `xdp_agg/xdp_agg.c` | in-kernel aggregation: admission checks, tombstones, overflow detection, quota with fallback, ACK retirement, RESEND flush, FALLBACK, array-mode aggregators, source rewrite, redirect; `netsum_sweep` for TTL | `bpf-unit.yml` (79 cases), `xdp-loadtest.yml` (real kernel, real UDP) |
-| `userspace_agg/agg.c` | the same algorithm in a process: hash mode, or ATP's aggregator pool with collision fallback (`--array-slots-log2 N`) | `tests/test_reliability.py`, benchmark |
+| `userspace_agg/agg.c` | the same algorithm in a process: hash mode, or ATP's aggregator pool with collision fallback (`--array-slots-log2 N`); optional `recvmmsg`/`sendmmsg` batching on Linux (`--batch N`) | `tests/test_reliability.py`, sanitizer CI job, benchmark (including a batched and an array-mode baseline) |
 | `paramserver/` | final summing node, merges raw/fallback/partial/aggregate packets by contributor set, sends results | `tests/test_fallback.py`, `tests/test_reliability.py` |
 | `worker/` | one-shot sender and a reliable windowed worker with retransmission | `tests/test_reliability.py`, Scenarios H2/I2/J2 |
 | `ctl/netsum_ctl.c` | libbpf control plane: attach (reports the real mode), config, stats, slots, jobs, sweep, verify | `ci/test_netsum_ctl.sh` |
@@ -96,15 +96,26 @@ trial. Full tables, method and threats to validity:
 Ratios of medians with bootstrap 95% CIs; permutation tests, Holm-corrected
 (p_Holm <= 0.033 for every bold entry).
 
-* **Replicated:** a second run on the same runner type reproduced these
-  ratios to about one percentage point; a run on a different runner CPU
-  (Xeon Platinum 8573C) showed a much larger gap, 1.37-1.69x throughput and
-  21-34% lower round time, because the userspace aggregator was far slower
-  there. The direction held in all three runs; the size depends on the machine.
-* **In-kernel aggregation helps: by 2-11% on one runner type, by 37-69% on
-  another, never by multiples of the work it removes.** The XDP
-  program costs 191-316 ns per packet; the userspace aggregator spends
-  2.0-2.3 us of CPU per packet. On veth the XDP work runs on the sending CPU.
+* **Replicated:** seven runs on four CPU types. On the Xeon 6975P-C (three
+  runs) the 4- and 8-worker gains reproduced every time (6.7-10.9%); the
+  2-worker gain was 2.0% twice and 0.6% (not significant) once. On the Xeon
+  Platinum 8573C, the AMD EPYC 7763 (two runs) and the AMD EPYC 9V74 the gap
+  was much larger, 1.31-1.69x throughput and 15-34% lower round time,
+  because the userspace aggregator was far slower there. The direction held
+  in all seven runs; the size depends on the machine.
+* **In-kernel aggregation helps: by 1-11% on one runner type (growing with
+  the number of workers; not significant at 2 workers in one of three runs),
+  by 31-69% on three others, never by multiples of the work it removes.** A
+  pre-registered variant of the userspace aggregator that batches its system
+  calls (`recvmmsg`/`sendmmsg`) did not change its throughput in four runs on
+  three CPU types, and XDP stayed ahead of it (7-9% at 4-8 workers on the
+  6975P-C, 29-69% elsewhere); the batch sizes it reached were not measured. Per packet, the XDP program body costs 218-275 ns against
+  540-1,669 ns for the userspace aggregator's processing (generic mode, 8
+  down to 2 workers), so up to 2.5-6x less; the userspace figure includes
+  its forwarding `sendto`, the XDP figure excludes the transmit after the
+  redirect, and neither includes the receive path (generic XDP still
+  allocates an skb; the userspace process spends 2.0-2.3 us of CPU per packet
+  with all its system calls). On veth the XDP work runs on the sending CPU.
 * **Native XDP on veth is slower than generic** (veth's native path adds a
   ring and NAPI hop); native numbers on veth say nothing about hardware NICs.
 * **Multi-tenancy:** a drop-based per-job quota starves greedy jobs (Jain's
@@ -197,7 +208,7 @@ v1 had the protocol, the components and a real-kernel CI test, but its
 benchmark measured process start-up on macOS loopback and never the XDP
 path. v2 fixed the bugs above, added the reliability and fallback machinery,
 and measured the XDP path. See [`docs/HISTORY.md`](docs/HISTORY.md) and the
-step-by-step [`docs/OVERNIGHT_LOG.md`](docs/OVERNIGHT_LOG.md).
+step-by-step [`docs/WORKLOG.md`](docs/WORKLOG.md).
 
 ## Research grounding
 

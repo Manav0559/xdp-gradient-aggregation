@@ -5,7 +5,7 @@ permutation tests of useragg vs xdp. Plain Python.
 
 Usage: bench_lite_analyze.py <raw.csv> <out_dir>
 Writes <out_dir>/summary.csv, comparisons.csv, accounting.csv, results.md.
-Comparisons are pre-registered in docs/OVERNIGHT_LOG.md (Phase 3.5)."""
+Comparisons are pre-registered in docs/WORKLOG.md (Phase 3.5)."""
 import csv
 import os
 import random
@@ -106,7 +106,7 @@ def main():
         for s in summary:
             w.writerow({k: (f"{v:.6g}" if isinstance(v, float) else v) for k, v in s.items()})
 
-    # Pre-registered (docs/OVERNIGHT_LOG.md, Phase 3.5), per worker count,
+    # Pre-registered (docs/WORKLOG.md, Phase 3.5), per worker count,
     # useragg vs xdp with the sender unpaced: F1 goodput (rounds/s), F2
     # completion ratio. Holm-corrected within each family. Paced cells are
     # descriptive only: in an open loop their goodput equals the offered rate.
