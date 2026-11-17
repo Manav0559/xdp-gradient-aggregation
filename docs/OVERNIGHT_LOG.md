@@ -712,3 +712,18 @@ On the user's "merge it ... complete the entire project": PR #6 merged
   reproduces byte for byte.
 
 Next step: PR, CI, then record S/S2 and the v3 throughput ratios.
+
+## 2026-11-17 11:43 IST — PR #7 results
+
+- First CI run failed in xdp-loadtest: my Scenario S reused job 990, which
+  Scenario P (array mode) uses later; the PS still held completed results
+  for those keys, so P's workers timed out (run 44026794863). S and S2 had
+  passed in that run. Fixed by moving S/S2 to jobs 996/997 (`ff27165`).
+- CI on `ff27165`: everything green. xdp-loadtest 44027074508: S 32
+  correct results per worker under 20% loss, no scale_mismatch; S2 16 kernel
+  overflows (first attempts) then 16 exact results per worker at e=23.
+- bench 44027074656 (AMD EPYC 7763): v3 at e=16 / v2 throughput 0.998-1.004,
+  every 95% CI contains 1, p_holm = 1; XDP ns/run unchanged. Data committed
+  in `bench/v3/`; the comparisons reproduce from the committed CSV.
+
+Next step: merge PR #7; refresh the README's open items.

@@ -1,0 +1,7 @@
+workers,config,baseline,metric,config_median,baseline_median,ratio,ratio_ci_lo,ratio_ci_hi,cliffs_delta,p,n,p_holm
+2,useragg-v3,useragg,values_per_s,1.66447e+06,1.66283e+06,1.00098,0.994615,1.00282,-0.03125,0.963018,8 vs 8,1
+2,xdp-generic-v3,xdp-generic,values_per_s,2.73035e+06,2.73689e+06,0.997612,0.989048,1.00756,-0.15625,0.649175,8 vs 8,1
+4,useragg-v3,useragg,values_per_s,971796,968373,1.00353,0.993757,1.01263,0.25,0.448776,8 vs 8,1
+4,xdp-generic-v3,xdp-generic,values_per_s,1.45088e+06,1.45011e+06,1.00053,0.994042,1.00922,0.21875,0.511244,8 vs 8,1
+8,useragg-v3,useragg,values_per_s,523037,522555,1.00092,0.982334,1.00746,-0.21875,0.505247,8 vs 8,1
+8,xdp-generic-v3,xdp-generic,values_per_s,729918,730726,0.998893,0.984301,1.01267,-0.09375,0.807096,8 vs 8,1
