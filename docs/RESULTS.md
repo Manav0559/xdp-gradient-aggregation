@@ -172,6 +172,8 @@ analyzer's tables).
 | 43784240541 | Xeon Platinum 8573C (7.0.0-1019-azure) | 1.685 / 1.420 / 1.369 | 0.705 / 0.663 / 0.787 | slower |
 | 44106226059 (PR #10) | Xeon 6975P-C (7.0.0-1016-aws) | 1.006 (n.s.) / 1.067 / 1.097 | 0.905 / 0.940 / 0.923 | slower |
 | 44108181610 (PR #10) | AMD EPYC 7763 (7.0.0-1019-azure) | 1.667 / 1.542 / 1.371 | 0.691 / 0.754 / 0.828 | slower at 2-4, faster at 8 |
+| 44109572937 (PR #10) | AMD EPYC 7763 (7.0.0-1019-azure) | 1.682 / 1.508 / 1.406 | 0.694 / 0.756 / 0.831 | slower |
+| 44111499501 (PR #10) | AMD EPYC 9V74 (7.0.0-1019-azure) | 1.377 / 1.365 / 1.306 | 0.771 / 0.803 / 0.848 | slower |
 
 The fourth run (`bench/v2/replication-44106226059/`, PR #10) is the first in
 which a generic-vs-userspace throughput comparison was not significant: at 2
@@ -185,7 +187,12 @@ CPU type, an AMD EPYC 7763. Like the Xeon Platinum 8573C it showed a large
 gap, 1.37-1.67x throughput and 17-31% lower round time, because the
 userspace aggregator was slow there (1.67M values/s at 2 workers, against
 6.0-6.2M on the 6975P-C). Every throughput comparison was significant
-(p_Holm = 0.003).
+(p_Holm = 0.003). Two further runs on PR #10 commits reproduced this on the
+EPYC 7763 (1.682 / 1.508 / 1.406) and added a fourth CPU type, the AMD EPYC
+9V74 (1.377 / 1.365 / 1.306). Across the four runs on the three CPU types
+other than the 6975P-C, generic XDP was 31-69% ahead; every throughput
+comparison in all seven runs is significant except 2 workers in run
+44106226059, and packet accounting balanced in every trial.
 
 In the first three runs every generic-vs-userspace comparison is
 significant after Holm correction (p_Holm <= 0.033); in the fourth, every
@@ -487,6 +494,11 @@ no comparison significant), and generic XDP led the batched aggregator by
 non-6975P-C runners. On this CPU array mode did matter: `xdp-array` /
 `useragg-array` 1.614 / 1.488 / 1.393. No `xdp-generic` / `useragg-batch`
 CI contains 1 in either run, so the pre-registered rule is not triggered.
+Two more baseline runs (`bench/baseline/replication-44109572937/`, EPYC 7763;
+`bench/baseline/replication-44111499501/`, EPYC 9V74) agree: batching not
+significant anywhere, `xdp-generic` / `useragg-batch` 1.690 / 1.492 / 1.451
+and 1.383 / 1.335 / 1.286, every one significant. Four baseline runs on three CPU types,
+and no CI containing 1.
 
 ## Benchmark-lite: first XDP measurements (open loop, two namespaces, `xdpgeneric`)
 
