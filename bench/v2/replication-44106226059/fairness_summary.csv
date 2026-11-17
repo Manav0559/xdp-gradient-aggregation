@@ -1,0 +1,5 @@
+policy,trials,goodput_job1_demand64,goodput_job2_demand32,goodput_job3_demand16,jain_raw,jain_demand_normalised,retransmissions,in_network_fraction
+none,3,3051.64,1518.17,768.39,0.777761,0.999887,0,1
+quota-drop,3,12.97,12.97,5189.41,0.33667,0.334584,498,0.999219
+quota-fallback,3,3033.68,1532.01,769.06,0.785622,0.999675,0,0.995313
+array-small,3,2935.76,1477.86,733.94,0.779244,0.99995,0,0.494896

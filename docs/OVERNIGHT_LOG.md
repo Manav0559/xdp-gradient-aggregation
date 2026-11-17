@@ -797,3 +797,29 @@ Branch `feature/finish-open-items` from main (`92ddd73`). On the owner's
 
 Still open (structural): 64 values per packet; two-namespace correctness
 scenarios; no hardware NIC, native XDP on hardware or multi-host run.
+
+## 2026-11-17 20:30 IST — Independent review and its follow-ups (PR #10)
+
+On the owner's request, an independent review of the whole project. Its
+points, and what came of them:
+
+- **The per-packet claim compared unlike things** (XDP program body vs the
+  whole userspace process). README and deck now compare the program body
+  with the userspace algorithm at the same worker counts: 2.5-6x, not ~10x.
+- **The userspace baseline was the weakest part of the headline.** Added
+  `agg --batch N` (recvmmsg/sendmmsg, Linux) and a pre-registered bench pass
+  with `useragg-batch` (N = 64, fixed before the run) and `useragg-array`.
+  Run 44106226059: batching changes nothing (every CI contains 1); XDP stays
+  7.1% / 8.6% ahead of the batched aggregator at 4 / 8 workers; 1.3% (n.s.)
+  at 2. Array mode vs its userspace twin is a wash. The round-time family
+  could not reach significance by design (5 vs 5 trials, Holm over 12);
+  recorded as a flaw of the registration. The run's v2 pass is a fourth
+  replication: 1.006 (n.s.) / 1.067 / 1.097, the first non-significant
+  2-worker result, so the README now says 1-11%.
+- **Sanitizers in CI.** New `sanitizers` job in ci.yml (ASan + UBSan + LSan,
+  reports to files). Its first run found real leaks in the reliable worker
+  (six buffers never freed); fixed, and verified on native Linux arm64.
+- **A flaky test** (found while testing on an emulated Linux host): the
+  tiny-pool array test asserted no stuck slot without the reaper; a late
+  lone RESEND after the ACK re-opens a key (same as the kernel, §8). Fixed
+  in PR #9's branch; 24/24 emulated runs then passed.

@@ -170,6 +170,14 @@ analyzer's tables).
 | 43765091283 (primary) | Xeon 6975P-C (7.0.0-1016-aws) | 1.020 / 1.081 / 1.109 | 0.919 / 0.950 / 0.929 | slower |
 | 43785552861 | Xeon 6975P-C (7.0.0-1016-aws) | 1.020 / 1.078 / 1.102 | 0.923 / 0.938 / 0.927 | slower |
 | 43784240541 | Xeon Platinum 8573C (7.0.0-1019-azure) | 1.685 / 1.420 / 1.369 | 0.705 / 0.663 / 0.787 | slower |
+| 44106226059 (PR #10) | Xeon 6975P-C (7.0.0-1016-aws) | 1.006 (n.s.) / 1.067 / 1.097 | 0.905 / 0.940 / 0.923 | slower |
+
+The fourth run (`bench/v2/replication-44106226059/`, PR #10) is the first in
+which a generic-vs-userspace throughput comparison was not significant: at 2
+workers the ratio was 1.006 [0.997, 1.015], p_Holm = 0.14. The 4- and
+8-worker gains (6.7%, 9.7%) and the round-time reductions (5-10%, p_Holm <=
+0.033) reproduced. So on this runner type the throughput gain is 1-11%,
+growing with the number of workers, and not reliably present at 2 workers.
 
 Every generic-vs-userspace comparison is significant after Holm correction in
 all three runs (p_Holm <= 0.033). On the same runner type the effect
@@ -428,7 +436,38 @@ stay as they are.
   containing 1, the 2-11% advantage is a system-call artefact and the
   headline changes to say so.
 
-Results: pending the first `bench.yml` run with this pass.
+**Results** (run 44106226059, Xeon 6975P-C, commit `9fd699e`; data
+`bench/baseline/`; 78/78 trials with balanced XDP accounting):
+
+| comparison | throughput ratio at 2 / 4 / 8 workers [95% CI] | p_Holm | median round time ratio at 2 / 4 / 8 | p_Holm |
+|---|---|---|---|---|
+| useragg-batch / useragg | 0.998 [0.991, 1.011] / 0.998 [0.993, 1.008] / 1.001 [0.994, 1.005] | 1 / 1 / 1 | 0.994 / 1.006 / 0.997 | 1 / 0.20 / 0.34 |
+| xdp-generic / useragg-batch | 1.013 [1.003, 1.018] / 1.071 [1.063, 1.076] / 1.086 [1.081, 1.096] | 0.18 / 0.006 / 0.009 | 0.911 / 0.934 / 0.927 | 0.09 / 0.09 / 0.08 |
+| useragg-array / useragg | 1.002 / 1.000 / 0.999 | 1 / 1 / 1 | 0.983 / 1.003 / 0.998 | 1 / 1 / 1 |
+| xdp-array (native) / useragg-array | 0.955 [0.949, 0.963] / 1.003 [1.000, 1.010] / 1.024 [1.019, 1.034] | 0.006 / 0.75 / 0.006 | 1.000 / 1.038 / 1.024 | 1 / 0.09 / 0.08 |
+
+* **Batching does not help the userspace aggregator here:** every
+  `useragg-batch` / `useragg` CI contains 1. In this closed loop the
+  aggregator is not where the time goes (the PS is the bottleneck at 4-8
+  workers, see above), and `MSG_WAITFORONE` returns as soon as one packet is
+  there, so batches are small whenever the aggregator keeps up. The batch
+  sizes actually reached were not recorded.
+* **The headline survives the stronger baseline:** generic XDP beats the
+  batched aggregator by 7.1% and 8.6% at 4 and 8 workers (significant), and
+  by 1.3% at 2 workers (not significant after Holm), the same pattern as
+  against the unbatched one in this run. The pre-registered decision rule
+  (a CI containing 1 changes the headline) is not triggered: no CI for
+  `xdp-generic` / `useragg-batch` contains 1.
+* **Round time** is 7-9% lower with XDP in all three cells, but no
+  round-time comparison in this pass is significant after correction. That
+  is a flaw of this pre-registration, not a finding: with 5 trials against 5
+  the smallest attainable permutation p is about 0.008, and Holm over 12
+  comparisons in one family cannot bring that below 0.05.
+* **Array mode against its userspace twin is a wash:** -4.5% at 2 workers,
+  no difference at 4, +2.4% at 8, and rounds no faster. `xdp-array` ran in
+  native mode (the best attach mode on this runner), and native XDP on veth
+  is itself slower than generic (above), so this comparison mixes the slot
+  design with the attach mode.
 
 ## Benchmark-lite: first XDP measurements (open loop, two namespaces, `xdpgeneric`)
 

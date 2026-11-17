@@ -101,8 +101,12 @@ Ratios of medians with bootstrap 95% CIs; permutation tests, Holm-corrected
   (Xeon Platinum 8573C) showed a much larger gap, 1.37-1.69x throughput and
   21-34% lower round time, because the userspace aggregator was far slower
   there. The direction held in all three runs; the size depends on the machine.
-* **In-kernel aggregation helps: by 2-11% on one runner type, by 37-69% on
-  another, never by multiples of the work it removes.** Like for like, the
+* **In-kernel aggregation helps: by 1-11% on one runner type (growing with
+  the number of workers; not significant at 2 workers in one of three runs),
+  by 37-69% on another, never by multiples of the work it removes.** The
+  gain holds against a userspace aggregator that batches its system calls
+  (`recvmmsg`/`sendmmsg`, pre-registered): batching did not change its
+  throughput, and XDP stayed 7-9% ahead at 4-8 workers. Like for like, the
   XDP program body costs 218-275 ns per packet against 540-1,669 ns for the
   userspace aggregator's algorithm (2.5-6x, generic mode, 8 down to 2
   workers); neither figure includes receive-path overhead (generic XDP still
