@@ -179,16 +179,17 @@ workers the ratio was 1.006 [0.997, 1.015], p_Holm = 0.14. The 4- and
 0.033) reproduced. So on this runner type the throughput gain is 1-11%,
 growing with the number of workers, and not reliably present at 2 workers.
 
-Every generic-vs-userspace comparison is significant after Holm correction in
-all three runs (p_Holm <= 0.033). On the same runner type the effect
-reproduces to within about one percentage point. On a different runner type
+In the first three runs every generic-vs-userspace comparison is
+significant after Holm correction (p_Holm <= 0.033); in the fourth, every
+one except throughput at 2 workers. On the 6975P-C the 4- and 8-worker
+effects reproduce to within about one and a half percentage points. On a different runner type
 the userspace aggregator was much slower (2.8M vs 6.0M values/s at 2 workers)
 while the XDP path lost less, so XDP's advantage grew to 37-69% throughput and
 21-34% round time; native XDP was also faster than userspace there. The
 direction (generic XDP ahead of the userspace aggregator; native XDP on veth
 behind generic XDP) held everywhere; the size depends on the machine, which is
 why no single speed-up figure is quoted without its environment. Fairness
-results were the same in all three runs (quota-drop Jain 0.34; fallback
+results were the same in all four runs (quota-drop Jain 0.34; fallback
 1.000).
 
 ### Threats to validity
@@ -446,12 +447,13 @@ stay as they are.
 | useragg-array / useragg | 1.002 / 1.000 / 0.999 | 1 / 1 / 1 | 0.983 / 1.003 / 0.998 | 1 / 1 / 1 |
 | xdp-array (native) / useragg-array | 0.955 [0.949, 0.963] / 1.003 [1.000, 1.010] / 1.024 [1.019, 1.034] | 0.006 / 0.75 / 0.006 | 1.000 / 1.038 / 1.024 | 1 / 0.09 / 0.08 |
 
-* **Batching does not help the userspace aggregator here:** every
-  `useragg-batch` / `useragg` CI contains 1. In this closed loop the
-  aggregator is not where the time goes (the PS is the bottleneck at 4-8
-  workers, see above), and `MSG_WAITFORONE` returns as soon as one packet is
-  there, so batches are small whenever the aggregator keeps up. The batch
-  sizes actually reached were not recorded.
+* **This batching did not help the userspace aggregator:** every
+  `useragg-batch` / `useragg` CI contains 1. The batch sizes reached were
+  not recorded, and `MSG_WAITFORONE` returns as soon as one packet is
+  there, so in this closed loop many calls may have returned a single
+  packet; the run shows that this implementation did not close the gap, not
+  that system calls cost nothing. (`agg` now reports `rx_batches` next to
+  `rx_total`, so later runs record the mean batch size.)
 * **The headline survives the stronger baseline:** generic XDP beats the
   batched aggregator by 7.1% and 8.6% at 4 and 8 workers (significant), and
   by 1.3% at 2 workers (not significant after Holm), the same pattern as

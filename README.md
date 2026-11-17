@@ -96,22 +96,26 @@ trial. Full tables, method and threats to validity:
 Ratios of medians with bootstrap 95% CIs; permutation tests, Holm-corrected
 (p_Holm <= 0.033 for every bold entry).
 
-* **Replicated:** a second run on the same runner type reproduced these
-  ratios to about one percentage point; a run on a different runner CPU
-  (Xeon Platinum 8573C) showed a much larger gap, 1.37-1.69x throughput and
-  21-34% lower round time, because the userspace aggregator was far slower
-  there. The direction held in all three runs; the size depends on the machine.
+* **Replicated:** four runs, three on the same runner type (Xeon 6975P-C)
+  and one on another (Xeon Platinum 8573C). On the 6975P-C the 4- and
+  8-worker gains reproduced every time (6.7-10.9%), the 2-worker gain was
+  2.0% twice and 0.6% (not significant) once. On the 8573C the gap was much
+  larger, 1.37-1.69x throughput and 21-34% lower round time, because the
+  userspace aggregator was far slower there. The direction held in all four
+  runs; the size depends on the machine.
 * **In-kernel aggregation helps: by 1-11% on one runner type (growing with
   the number of workers; not significant at 2 workers in one of three runs),
-  by 37-69% on another, never by multiples of the work it removes.** The
-  gain holds against a userspace aggregator that batches its system calls
-  (`recvmmsg`/`sendmmsg`, pre-registered): batching did not change its
-  throughput, and XDP stayed 7-9% ahead at 4-8 workers. Like for like, the
-  XDP program body costs 218-275 ns per packet against 540-1,669 ns for the
-  userspace aggregator's algorithm (2.5-6x, generic mode, 8 down to 2
-  workers); neither figure includes receive-path overhead (generic XDP still
+  by 37-69% on another, never by multiples of the work it removes.** A
+  pre-registered variant of the userspace aggregator that batches its system
+  calls (`recvmmsg`/`sendmmsg`) did not change its throughput, and XDP stayed
+  7-9% ahead of it at 4-8 workers; the batch sizes it reached were not
+  measured. Per packet, the XDP program body costs 218-275 ns against
+  540-1,669 ns for the userspace aggregator's processing (generic mode, 8
+  down to 2 workers), so up to 2.5-6x less; the userspace figure includes
+  its forwarding `sendto`, the XDP figure excludes the transmit after the
+  redirect, and neither includes the receive path (generic XDP still
   allocates an skb; the userspace process spends 2.0-2.3 us of CPU per packet
-  including its system calls). On veth the XDP work runs on the sending CPU.
+  with all its system calls). On veth the XDP work runs on the sending CPU.
 * **Native XDP on veth is slower than generic** (veth's native path adds a
   ring and NAPI hop); native numbers on veth say nothing about hardware NICs.
 * **Multi-tenancy:** a drop-based per-job quota starves greedy jobs (Jain's

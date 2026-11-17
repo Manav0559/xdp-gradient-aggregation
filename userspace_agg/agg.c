@@ -72,6 +72,7 @@ static struct {
     /* --batch N (Linux): recvmmsg up to N packets, then one sendmmsg for
      * everything they produced. Each input produces at most one output. */
     int batch;
+    uint64_t rx_batches; /* receive calls that returned data: rx_total / rx_batches = mean batch */
     int outq_len;
     size_t outq_size[MAX_BATCH];
     uint8_t outq[MAX_BATCH][NETSUM_MAX_PACKET_SIZE];
@@ -250,9 +251,9 @@ static void dump_stats(void)
     for (int i = 0; i < NS_STAT__COUNT; i++)
         fprintf(stderr, "\"%s\":%llu,", netsum_stat_names[i], (unsigned long long)g.stats[i]);
     fprintf(stderr, "\"slots_accumulating\":%zu,\"slots_completed\":%zu,\"slots_flushed\":%zu,"
-            "\"profile_ns\":%llu,\"profile_pkts\":%llu}\n",
+            "\"profile_ns\":%llu,\"profile_pkts\":%llu,\"rx_batches\":%llu}\n",
             by_state[SLOT_ACCUMULATING], by_state[SLOT_COMPLETED], by_state[SLOT_FLUSHED],
-            (unsigned long long)g.profile_ns, (unsigned long long)g.profile_pkts);
+            (unsigned long long)g.profile_ns, (unsigned long long)g.profile_pkts, (unsigned long long)g.rx_batches);
     fflush(stderr);
 }
 
@@ -753,6 +754,7 @@ int main(int argc, char **argv)
             int got = recvmmsg(in_sock, m, (unsigned)want, MSG_WAITFORONE, NULL);
             if (got <= 0)
                 continue; /* EINTR or EAGAIN */
+            g.rx_batches++;
             for (int i = 0; i < got; i++)
                 process_packet(rxbuf[i], (ssize_t)m[i].msg_len);
             packets_in += got;
@@ -771,6 +773,7 @@ int main(int argc, char **argv)
         ssize_t n = recvfrom(in_sock, pkt, sizeof(pkt), 0, NULL, NULL);
         if (n < 0)
             continue; /* EINTR (SIGUSR1) or EAGAIN (housekeeping tick) */
+        g.rx_batches++;
         packets_in++;
         process_packet(pkt, n);
     }

@@ -383,6 +383,7 @@ def test_batched_aggregator_matches_under_loss():
         for r in res:
             assert r["results"] == 8 * 16 and r["result_mismatches"] == 0, (mode, r)
         assert ast.get("tx_aggregate", 0) > 0 and ast.get("slots_accumulating") == 0, (mode, ast)
+        assert 0 < ast.get("rx_batches", 0) <= ast.get("rx_total", 0), (mode, ast)  # mean batch = rx_total / rx_batches
 
 
 def main():
