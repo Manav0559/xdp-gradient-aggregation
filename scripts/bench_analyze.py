@@ -6,7 +6,7 @@ Usage: bench_analyze.py <bench-out dir> <output dir>
 Reads throughput.csv, latency.csv, latency_rounds.csv, fairness.csv.
 Writes summary_throughput.csv, summary_latency.csv, comparisons.csv,
 fairness_summary.csv, accounting.csv and results.md. The comparisons are the
-ones pre-registered in docs/OVERNIGHT_LOG.md (Phase 6) before the run."""
+ones pre-registered in docs/WORKLOG.md (Phase 6) before the run."""
 import csv
 import os
 import random

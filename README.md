@@ -208,7 +208,7 @@ v1 had the protocol, the components and a real-kernel CI test, but its
 benchmark measured process start-up on macOS loopback and never the XDP
 path. v2 fixed the bugs above, added the reliability and fallback machinery,
 and measured the XDP path. See [`docs/HISTORY.md`](docs/HISTORY.md) and the
-step-by-step [`docs/OVERNIGHT_LOG.md`](docs/OVERNIGHT_LOG.md).
+step-by-step [`docs/WORKLOG.md`](docs/WORKLOG.md).
 
 ## Research grounding
 

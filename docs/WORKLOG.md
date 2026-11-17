@@ -1,6 +1,6 @@
 # NetSum v2 work log
 
-Timestamped, factual record of the v2 upgrade on branch `overnight/netsum-v2`
+Timestamped, factual record of the v2 upgrade on branch `overnight/netsum-v2` (the branch name is historical)
 (base `origin/polish/honest-results`, `f7ea415`). Deviations from the plan and
 the reason for each are recorded here at the time they happen.
 
@@ -35,7 +35,7 @@ the reason for each are recorded here at the time they happen.
   (v7.3.0) loads the Mac-compiled `xdp_agg.o` through the real verifier on
   kernel 7.0.11 (aarch64): `processed 111099 insns`, `stack depth 352`. Gives a
   fast local verifier loop; VM disk has ~250 MB free, so containers are
-  ephemeral and nothing of the owner's is pruned. CI stays the source of truth.
+  ephemeral and no existing images are pruned. CI stays the source of truth.
 
 ## 2026-11-16 01:42 IST — Phase 1 (red tests)
 
@@ -479,7 +479,7 @@ report in the PR body and here, then the verdict page.
 
 ```
 $ git status --porcelain
- M docs/OVERNIGHT_LOG.md
+ M docs/WORKLOG.md
 (empty before this log entry)
 $ (attribution grep from the plan, run over git diff origin/polish/honest-results...HEAD)
 attribution: clean
@@ -498,11 +498,11 @@ isDraft=true base=polish/honest-results head=overnight/netsum-v2
 checks on deb3d6b: all success (see PR body for run IDs)
 ```
 
-### Overnight summary
+### Summary of the v2 upgrade
 
 **State:** Phases 0-9 complete, CI green on every workflow. Two items are scoped down: chunk size stays at 64 values, and the userspace aggregator has no array mode. Both are listed below.
 
-**Merge order for the owner:** merge #3 → merge #4 → retarget this PR to `main` → review → merge. The Pages dashboard keeps showing v1 until then (Pages deploys `main`).
+**Merge order:** merge #3 → merge #4 → retarget this PR to `main` → review → merge. The Pages dashboard keeps showing v1 until then (Pages deploys `main`).
 
 ### What changed
 - **Phase 0-1:** work log, design notes, then red tests for every confirmed bug (13 userspace tests and kernel Scenarios K-O, each asserting the bug's symptom). `3d4c1d0`
@@ -547,14 +547,14 @@ checks on deb3d6b: all success (see PR body for run IDs)
 - The benchmark reports accounting but does not fail the run on an imbalance (none occurred).
 - Correctness scenarios still run on the two-namespace topology; only the benchmark uses three.
 - Lost results are injected only in userspace tests, not on the kernel path (netem loses gradients and ACKs there).
-- The 2024 ToN paper is cited without the system name "GOAT", which I could not re-verify.
+- The 2024 ToN paper is cited without the system name "GOAT", which could not be re-verified.
 - Not built: ECN congestion control, rack hierarchy, float re-request on overflow, shared-exponent wire format.
 
-### Things the owner should know
+### Behaviour changes worth knowing
 - Default behaviour changes: workers send v2 packets, and the PS sends results/ACKs (`--ack-to`). Quota policy defaults to none; `fallback` and `drop` are opt-in through `netsum-ctl config`. ACKs go to port 9876 with the ACK flag.
 - The README now says plainly that the XDP advantage is 2-11% on one runner type and 37-69% on another.
 - The spec PDF was regenerated (headless Chrome) after fixing the ATP author list and the fairness attribution.
-- `docs/OVERNIGHT_LOG.md` has every step, including the mistakes and their fixes.
+- `docs/WORKLOG.md` has every step, including the mistakes and their fixes.
 
 ### How to reproduce
 - macOS: `make && make test && scripts/demo_local.sh`
@@ -645,8 +645,6 @@ verifier at 64 values 425,243 insns (stack 224) with the fix, up from
 
 ## 2026-11-16 (afternoon; time per commit) — Stage 3: in-step retry after OVERFLOW
 
-On the user's "continue on xdp project".
-
 - Order-independence first: with N workers each v3 value is now bounded by
   INT32_MAX // N (`scale_rule.worker_limit`), so no order of adding N
   values overflows an int32 accumulator. Overflow is therefore decided only
@@ -688,7 +686,7 @@ not exercised on the kernel; benchmarks still send v2; one small model only.
 
 ## 2026-11-17 11:19 IST — PR #6 merged; the remaining v3 items
 
-On the user's "merge it ... complete the entire project": PR #6 merged
+PR #6 merged
 (`4595f62`) after all eight checks passed on `a025509`. Branch
 `feature/v3-completion` from main for what was still open:
 
@@ -730,8 +728,7 @@ Next step: merge PR #7; refresh the README's open items.
 
 ## 2026-11-17 12:00 IST — Interactive demo page
 
-On the user's request for "something live": option 1 of three offered (a
-browser demo on the existing Pages site; the alternatives were the real
+A browser demo on the existing Pages site (the alternatives were the real
 userspace path on Render, or the real XDP path locally only). The XDP
 program cannot run on a web host, so `demo/index.html` is a JavaScript
 model of the protocol rules from DESIGN_NOTES: array-mode slot pool with
@@ -756,8 +753,8 @@ simulation and links the measured results.
 
 ## 2026-11-17 18:50 IST — Closing the feasible open items
 
-Branch `feature/finish-open-items` from main (`92ddd73`). On the owner's
-"complete this project", the open items that need no hardware:
+Branch `feature/finish-open-items` from main (`92ddd73`). Closing the open items that
+need no hardware:
 
 - **Userspace array mode.** `agg --array-slots-log2 N` mirrors the kernel's
   aggregator pool (same index hash, claim on EMPTY, collision -> FALLBACK,
@@ -800,8 +797,8 @@ scenarios; no hardware NIC, native XDP on hardware or multi-host run.
 
 ## 2026-11-17 20:30 IST — Independent review and its follow-ups (PR #10)
 
-On the owner's request, an independent review of the whole project. Its
-points, and what came of them:
+An independent review of the whole project; its points, and what came
+of them:
 
 - **The per-packet claim compared unlike things** (XDP program body vs the
   whole userspace process). README and deck now compare the program body
