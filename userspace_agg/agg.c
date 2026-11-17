@@ -15,6 +15,9 @@
  *    tombstone expiry free the aggregator; the per-job quota does not apply.
  * Design: docs/DESIGN_NOTES.md §Admission, §Slot storage, §Reclamation. */
 #define _POSIX_C_SOURCE 200809L
+#ifdef __linux__
+#define _GNU_SOURCE /* recvmmsg / sendmmsg for --batch */
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -35,6 +38,7 @@
 
 #define JOB_TABLE_CAPACITY 256
 #define HOUSEKEEPING_MS 50
+#define MAX_BATCH 256
 
 /* A job entry exists only while the job has ACCUMULATING slots; tombstones
  * are not charged to the quota, so they do not pin the entry (bug C7). */
@@ -65,7 +69,57 @@ static struct {
     struct slot *pool;
     uint32_t pool_mask;
     struct slot_table fallback_keys; /* presence set: keys that live at the PS */
+    /* --batch N (Linux): recvmmsg up to N packets, then one sendmmsg for
+     * everything they produced. Each input produces at most one output. */
+    int batch;
+    int outq_len;
+    size_t outq_size[MAX_BATCH];
+    uint8_t outq[MAX_BATCH][NETSUM_MAX_PACKET_SIZE];
 } g;
+
+static void outq_flush(void);
+
+/* Every packet the aggregator emits goes through here: sent at once, or
+ * queued until the end of the current receive batch. */
+static int out_send(const uint8_t *buf, size_t len)
+{
+    if (g.batch > 0) {
+        if (g.outq_len == MAX_BATCH)
+            outq_flush();
+        memcpy(g.outq[g.outq_len], buf, len);
+        g.outq_size[g.outq_len++] = len;
+        return 0;
+    }
+    return sendto(g.out_sock, buf, len, 0, (struct sockaddr *)&g.downstream, sizeof(g.downstream)) < 0 ? -1 : 0;
+}
+
+static void outq_flush(void)
+{
+#ifdef __linux__
+    struct mmsghdr m[MAX_BATCH];
+    struct iovec iov[MAX_BATCH];
+    int done = 0;
+    for (int i = 0; i < g.outq_len; i++) {
+        iov[i] = (struct iovec){g.outq[i], g.outq_size[i]};
+        memset(&m[i], 0, sizeof(m[i]));
+        m[i].msg_hdr.msg_name = &g.downstream;
+        m[i].msg_hdr.msg_namelen = sizeof(g.downstream);
+        m[i].msg_hdr.msg_iov = &iov[i];
+        m[i].msg_hdr.msg_iovlen = 1;
+    }
+    while (done < g.outq_len) {
+        int r = sendmmsg(g.out_sock, m + done, (unsigned)(g.outq_len - done), 0);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR)
+                continue;
+            perror("sendmmsg(downstream)");
+            break;
+        }
+        done += r;
+    }
+#endif
+    g.outq_len = 0;
+}
 
 /* ---- array mode (ATP aggregator pool) ---------------------------------- */
 
@@ -255,7 +309,7 @@ static void emit_aggregate(const struct slot *s, uint16_t extra_flags)
         vals[i] = (int32_t)htonl((uint32_t)s->sum[i]);
     memcpy(out + NETSUM_HDR_SIZE + (size_t)s->chunk_len * 4, s->bitmap, NETSUM_BITMAP_BYTES);
     size_t len = NETSUM_HDR_SIZE + (size_t)s->chunk_len * 4 + NETSUM_BITMAP_BYTES;
-    if (sendto(g.out_sock, out, len, 0, (struct sockaddr *)&g.downstream, sizeof(g.downstream)) < 0) {
+    if (out_send(out, len) < 0) {
         perror("sendto(downstream)");
         return;
     }
@@ -271,7 +325,7 @@ static void forward_fallback(const uint8_t *pkt, const struct netsum_parsed *p)
     size_t len = NETSUM_HDR_SIZE + p->payload_len;
     memcpy(out, pkt, len);
     ((struct grad_hdr *)out)->flags = htons((uint16_t)(p->flags | NETSUM_F_FALLBACK));
-    if (sendto(g.out_sock, out, len, 0, (struct sockaddr *)&g.downstream, sizeof(g.downstream)) >= 0)
+    if (out_send(out, len) == 0)
         g.stats[NS_TX_FALLBACK]++;
 }
 
@@ -497,16 +551,48 @@ static void handle_contribution(const uint8_t *pkt, const struct netsum_parsed *
     job_release_slot(p->job_id);
 }
 
+/* One received datagram: parse, then ACK / contribution handling. */
+static void process_packet(const uint8_t *pkt, ssize_t n)
+{
+    g.stats[NS_RX_TOTAL]++;
+    struct netsum_parsed p;
+    enum netsum_verdict v = netsum_parse(pkt, pkt + n, &p);
+    if (v != NETSUM_OK) {
+        g.stats[NS_FROM_VERDICT(v)]++;
+        return;
+    }
+    if (p.kind == NETSUM_KIND_ACK) {
+        handle_ack(&p);
+        return;
+    }
+    if (p.kind != NETSUM_KIND_RAW) {
+        g.stats[NS_REJ_KIND]++;
+        return;
+    }
+    if (g.profile) { /* algorithm cost: excludes recvfrom, includes the forward sendto (or queueing it) */
+        struct timespec t1, t2;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        handle_contribution(pkt, &p, now_us());
+        clock_gettime(CLOCK_MONOTONIC, &t2);
+        g.profile_ns += (uint64_t)((t2.tv_sec - t1.tv_sec) * 1000000000LL + (t2.tv_nsec - t1.tv_nsec));
+        g.profile_pkts++;
+    } else {
+        handle_contribution(pkt, &p, now_us());
+    }
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s [--slot-capacity-log2 N | --array-slots-log2 N] [--tombstone-ttl-ms N] [--quiet] [--profile]\n"
+            "usage: %s [--slot-capacity-log2 N | --array-slots-log2 N] [--batch N] [--tombstone-ttl-ms N] [--quiet] [--profile]\n"
             "          <listen_port> <downstream_ip> <downstream_port>\n"
             "          [max_packets=0] [max_slots_per_job=0] [slot_ttl_ms=0]\n"
             "  max_slots_per_job: per-job cap on ACCUMULATING slots (0 = none)\n"
             "  slot_ttl_ms:       drop ACCUMULATING slots idle this long (0 = never)\n"
             "  --array-slots-log2: ATP-style pool of 2^N aggregators (N in [0, 16]);\n"
             "                     a key whose aggregator is busy falls back to the PS\n"
+            "  --batch N:         (Linux) receive up to N packets per recvmmsg and send\n"
+            "                     their outputs with one sendmmsg (N in [1, 256])\n"
             "  --tombstone-ttl-ms: keep completed rounds this long to absorb late\n"
             "                     duplicates (default 2000)\n"
             "  SIGUSR1 prints [stats] per job and one [stats-all] counter line.\n",
@@ -537,6 +623,16 @@ int main(int argc, char **argv)
             }
             g.array_mode = 1;
             g.pool_mask = (1u << n) - 1;
+        } else if (strcmp(argv[a], "--batch") == 0 && a + 1 < argc) {
+            g.batch = atoi(argv[++a]);
+#ifndef __linux__
+            fprintf(stderr, "--batch needs recvmmsg/sendmmsg (Linux only)\n");
+            return 1;
+#endif
+            if (g.batch < 1 || g.batch > MAX_BATCH) {
+                fprintf(stderr, "--batch must be in [1, %d]\n", MAX_BATCH);
+                return 1;
+            }
         } else if (strcmp(argv[a], "--tombstone-ttl-ms") == 0 && a + 1 < argc) {
             g.tomb_ttl_ms = atol(argv[++a]);
         } else {
@@ -616,8 +712,13 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "userspace aggregator listening on :%d, forwarding to %s:%d (%s)\n",
             listen_port, downstream_ip, downstream_port, g.array_mode ? "array mode" : "hash mode");
+    if (g.batch)
+        fprintf(stderr, "batching: up to %d packets per recvmmsg/sendmmsg\n", g.batch);
 
     uint8_t pkt[NETSUM_MAX_PACKET_SIZE + 1];
+#ifdef __linux__
+    static uint8_t rxbuf[MAX_BATCH][NETSUM_MAX_PACKET_SIZE + 1];
+#endif
     long packets_in = 0;
     int64_t last_reap = now_us();
     while (!g_stop && (max_packets == 0 || packets_in < max_packets)) {
@@ -634,35 +735,44 @@ int main(int argc, char **argv)
             dump_stats();
         }
 
+#ifdef __linux__
+        if (g.batch > 0) {
+            struct mmsghdr m[MAX_BATCH];
+            struct iovec iov[MAX_BATCH];
+            int want = g.batch;
+            if (max_packets > 0 && max_packets - packets_in < want)
+                want = (int)(max_packets - packets_in);
+            for (int i = 0; i < want; i++) {
+                iov[i] = (struct iovec){rxbuf[i], sizeof(rxbuf[i])};
+                memset(&m[i], 0, sizeof(m[i]));
+                m[i].msg_hdr.msg_iov = &iov[i];
+                m[i].msg_hdr.msg_iovlen = 1;
+            }
+            /* Blocks (up to SO_RCVTIMEO) for the first packet only, then takes
+             * whatever is already queued: no added latency in a closed loop. */
+            int got = recvmmsg(in_sock, m, (unsigned)want, MSG_WAITFORONE, NULL);
+            if (got <= 0)
+                continue; /* EINTR or EAGAIN */
+            for (int i = 0; i < got; i++)
+                process_packet(rxbuf[i], (ssize_t)m[i].msg_len);
+            packets_in += got;
+            if (g.profile) { /* the batch's send is part of the per-packet cost */
+                struct timespec t1, t2;
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                outq_flush();
+                clock_gettime(CLOCK_MONOTONIC, &t2);
+                g.profile_ns += (uint64_t)((t2.tv_sec - t1.tv_sec) * 1000000000LL + (t2.tv_nsec - t1.tv_nsec));
+            } else {
+                outq_flush();
+            }
+            continue;
+        }
+#endif
         ssize_t n = recvfrom(in_sock, pkt, sizeof(pkt), 0, NULL, NULL);
         if (n < 0)
             continue; /* EINTR (SIGUSR1) or EAGAIN (housekeeping tick) */
         packets_in++;
-        g.stats[NS_RX_TOTAL]++;
-        struct netsum_parsed p;
-        enum netsum_verdict v = netsum_parse(pkt, pkt + n, &p);
-        if (v != NETSUM_OK) {
-            g.stats[NS_FROM_VERDICT(v)]++;
-            continue;
-        }
-        if (p.kind == NETSUM_KIND_ACK) {
-            handle_ack(&p);
-            continue;
-        }
-        if (p.kind != NETSUM_KIND_RAW) {
-            g.stats[NS_REJ_KIND]++;
-            continue;
-        }
-        if (g.profile) { /* algorithm cost only: excludes recvfrom, includes the forward sendto */
-            struct timespec t1, t2;
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            handle_contribution(pkt, &p, now_us());
-            clock_gettime(CLOCK_MONOTONIC, &t2);
-            g.profile_ns += (uint64_t)((t2.tv_sec - t1.tv_sec) * 1000000000LL + (t2.tv_nsec - t1.tv_nsec));
-            g.profile_pkts++;
-        } else {
-            handle_contribution(pkt, &p, now_us());
-        }
+        process_packet(pkt, n);
     }
     fprintf(stderr, "userspace aggregator: %ld packets in, %ld aggregated packets out\n",
             packets_in, g.packets_out);

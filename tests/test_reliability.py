@@ -80,9 +80,18 @@ def start_ps(*flags):
     return Server([PARAMSERVER, *flags, str(port), "noagg"]), port
 
 
-def start_agg(ps_port, *flags):
+def start_agg(ps_port, *flags, tail=()):
     port = free_port()
-    return Server([AGG, *flags, str(port), "127.0.0.1", str(ps_port)]), port
+    return Server([AGG, *flags, str(port), "127.0.0.1", str(ps_port), *tail]), port
+
+
+# A lone RESEND that arrives after the PS's ACK re-opens the key; if that
+# worker then gets the result anyway (the PS re-sends it to every registered
+# worker when another worker recovers), nothing flushes the re-opened slot.
+# The reaper (slot_ttl_ms) reclaims it, as the TTL sweeper does in the kernel
+# (DESIGN_NOTES §8). Tests that assert "no slot left" run with it on.
+REAPER = ("0", "0", "300")   # max_packets, max_slots_per_job, slot_ttl_ms
+REAP_WAIT = 0.8
 
 
 # ---- 4a: results and ACK retirement ----------------------------------------
@@ -228,11 +237,12 @@ def test_g2_reliable_workers_noagg_with_drops():
 
 def test_g2_reliable_workers_useragg_with_lost_contributions_and_results():
     ps_port = free_port()
-    agg, agg_port = start_agg(ps_port, "--quiet")
+    agg, agg_port = start_agg(ps_port, "--quiet", tail=REAPER)
     ps = Server([PARAMSERVER, "--quiet", "--ack-to", f"127.0.0.1:{agg_port}", str(ps_port), "agg"])
     try:
         res = run_reliable(agg_port, ps_port, 601, 3, 8, 1024,
                            ("--drop-every", "5", "--drop-result-every", "7"))
+        agg.drain_for(REAP_WAIT)
         ast, pst = stats_all(agg), stats_all(ps)
     finally:
         agg.stop()
@@ -318,7 +328,7 @@ def test_array_mode_reliable_workers_share_a_tiny_pool_under_loss():
     # contributions and lost results on top. Every result must be exact and
     # no aggregator may stay ACCUMULATING.
     ps_port = free_port()
-    agg, agg_port = start_agg(ps_port, "--quiet", "--array-slots-log2", "2")
+    agg, agg_port = start_agg(ps_port, "--quiet", "--array-slots-log2", "2", tail=REAPER)
     ps = Server([PARAMSERVER, "--quiet", "--ack-to", f"127.0.0.1:{agg_port}", str(ps_port), "agg"])
     procs, res = [], []
     try:
@@ -334,7 +344,7 @@ def test_array_mode_reliable_workers_share_a_tiny_pool_under_loss():
             o, err = p.communicate(timeout=60)
             assert p.returncode == 0, f"worker failed ({p.returncode}): {err}"
             res.append(json.loads(o.strip().splitlines()[-1]))
-        agg.drain_for(0.3)
+        agg.drain_for(REAP_WAIT)
         ast = stats_all(agg)
     finally:
         for p in procs:
@@ -347,6 +357,32 @@ def test_array_mode_reliable_workers_share_a_tiny_pool_under_loss():
     assert sum(r["dropped_rx"] for r in res) > 0, res
     assert ast.get("fallback_collision", 0) > 0 and ast.get("tx_aggregate", 0) > 0, ast
     assert ast.get("slots_accumulating") == 0, f"stuck aggregators: {ast}"
+
+
+def test_batched_aggregator_matches_under_loss():
+    # --batch (recvmmsg/sendmmsg) is Linux-only; elsewhere it must refuse to start.
+    ps_port = free_port()
+    if not sys.platform.startswith("linux"):
+        r = subprocess.run([AGG, "--batch", "64", str(free_port()), "127.0.0.1", str(ps_port)],
+                           capture_output=True, text=True, timeout=10)
+        assert r.returncode != 0 and "Linux only" in r.stderr, (r.returncode, r.stderr)
+        return
+    for mode in ((), ("--array-slots-log2", "2")):
+        ps_port = free_port()
+        agg, agg_port = start_agg(ps_port, "--quiet", "--batch", "64", *mode, tail=REAPER)
+        ps = Server([PARAMSERVER, "--quiet", "--ack-to", f"127.0.0.1:{agg_port}", str(ps_port), "agg"])
+        try:
+            res = run_reliable(agg_port, ps_port, 740 + len(mode), 3, 8, 1024,
+                               ("--drop-every", "5", "--drop-result-every", "7"))
+            agg.drain_for(REAP_WAIT)
+            ast = stats_all(agg)
+        finally:
+            agg.stop()
+            ps.stop()
+        assert "batching: up to 64" in agg.text(), agg.text()
+        for r in res:
+            assert r["results"] == 8 * 16 and r["result_mismatches"] == 0, (mode, r)
+        assert ast.get("tx_aggregate", 0) > 0 and ast.get("slots_accumulating") == 0, (mode, ast)
 
 
 def main():
