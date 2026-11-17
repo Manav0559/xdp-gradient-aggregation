@@ -339,9 +339,17 @@ exponent. Each chunk comes back `OVERFLOW` and is retried in the same step at
 `e - 8` under a new key (`docs/DESIGN_NOTES.md` §2). Locally through the
 userspace aggregator and PS (200 steps): 3 chunks retried, final 0.3560 /
 0.989, bit-identical to local `adapt`; both servers counted 3 overflows and
-no `scale_mismatch`. `tests/test_scaled.py` runs a 40-step version. The
-training workflow runs it on the kernel ("Retry after OVERFLOW"; run ID in
-`docs/OVERNIGHT_LOG.md`). Each worker's v3 values are now bounded by
+no `scale_mismatch`. `tests/test_scaled.py` runs a 40-step version.
+
+On the kernel (workflow `train-demo.yml`, run 43825247951, PR head
+`15a9bcd`, step "Retry after OVERFLOW"; data
+`examples/train_mlp/results/curves_spike.csv`): noagg, userspace, XDP and XDP
+with 5% loss on one worker link (520 retransmissions) each retried exactly the
+3 chunks that overflowed at step 50 and ended at 0.356033 / 0.9889,
+bit-identical to local `adapt` at every step (float: 0.355124 / 0.9889). The
+XDP program counted 5 overflowed completions across its two runs (3 without
+loss; under loss some overflowed contributions reached the PS as partials or
+fallbacks instead) and no `scale_mismatch`. Each worker's v3 values are now bounded by
 `INT32_MAX / N`; re-running the local S = 1e-4 paths after that change gives
 the same final loss to six digits, so the table above stands.
 

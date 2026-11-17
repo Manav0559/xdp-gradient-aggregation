@@ -673,3 +673,15 @@ On the user's "continue on xdp project".
   every step bit-identical to local adapt, kernel overflow >= 3.
 
 Next step: push, read the new step's numbers into RESULTS, then stop.
+
+Pushed as `15a9bcd` (the push waited on a permission check that kept
+erroring). CI on it: all eight workflows green. train-demo run 43825247951,
+"Retry after OVERFLOW": every path (noagg, userspace, XDP, XDP + 5% loss
+with 520 retransmissions) retried exactly 3 chunks and ended 0.356033 /
+0.9889, bit-identical to local adapt; kernel overflow 5, scale_mismatch 0.
+The earlier steps in the same run reproduce their committed results
+(v2 0.355125; v3 at S = 1e-4 0.356032). Curves committed as
+`examples/train_mlp/results/curves_spike.csv`.
+
+Remaining open (not started): the C worker has no retry and its v3 mode is
+not exercised on the kernel; benchmarks still send v2; one small model only.
