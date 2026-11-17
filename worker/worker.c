@@ -145,6 +145,8 @@ static int oneshot_main(int argc, char **argv) {
 struct rel_chunk {
     uint8_t state; /* 0 unsent, 1 in flight, 2 done */
     uint8_t retries;
+    uint8_t attempt; /* v3: OVERFLOW retries so far; wire chunk_id = chunk | attempt << 24 */
+    uint8_t e;       /* v3: exponent of the current attempt */
     int64_t deadline_us;
     int64_t rto_us;
 };
@@ -165,7 +167,7 @@ struct rel {
     struct rel_chunk *c;
     int64_t *round_start, *round_end;
     uint32_t *round_left;
-    uint64_t sent, resent, results, dup_results, mismatches, overflow_results, dropped_tx, dropped_rx;
+    uint64_t sent, resent, results, dup_results, mismatches, overflow_results, retried, dropped_tx, dropped_rx;
     uint64_t first_tx, results_seen;
 };
 
@@ -195,22 +197,33 @@ static uint16_t rel_len(const struct rel *r, uint32_t chunk)
     return chunk + 1 == r->chunks_per_round ? r->last_len : r->chunk_len;
 }
 
-static int rel_e(const struct rel *r)
+/* v3: |value| <= INT32_MAX / N, so no order of adding N values overflows
+ * an int32 accumulator and only a worker's own saturation can make a chunk
+ * overflow (docs/DESIGN_NOTES.md §2). */
+static int32_t rel_quantize(const struct rel *r, double x, int e, int *sat)
 {
-    return r->frac_bits < 0 ? NETSUM_Q_FRAC_BITS : r->frac_bits;
+    int32_t v = netsum_to_scaled(x, e, sat);
+    if (r->frac_bits >= 0) {
+        int32_t lim = (int32_t)(2147483647 / r->workers);
+        if (v > lim || v < -lim) {
+            v = v > 0 ? lim : -lim;
+            *sat = 1;
+        }
+    }
+    return v;
 }
 
 /* Deterministic value for (seed, worker, round, chunk, lane), quantized at
- * the worker's exponent; *sat is set if it saturated. */
-static int32_t rel_value(const struct rel *r, uint32_t round, uint32_t chunk, unsigned lane, int *sat)
+ * exponent e; *sat is set if it saturated. */
+static int32_t rel_value(const struct rel *r, uint32_t round, uint32_t chunk, unsigned lane, int e, int *sat)
 {
     if (r->has_fixed)
-        return netsum_to_scaled(r->fixed, rel_e(r), sat);
+        return rel_quantize(r, r->fixed, e, sat);
     uint64_t x = r->seed ^ ((uint64_t)r->worker << 48) ^ ((uint64_t)round << 24) ^ ((uint64_t)chunk << 8) ^ lane;
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33;
-    return netsum_to_scaled(((double)(x % 2000001) / 1000000.0) - 1.0, rel_e(r), sat);
+    return rel_quantize(r, ((double)(x % 2000001) / 1000000.0) - 1.0, e, sat);
 }
 
 static void rel_send(struct rel *r, uint32_t idx, int resend)
@@ -218,24 +231,25 @@ static void rel_send(struct rel *r, uint32_t idx, int resend)
     uint8_t pkt[NETSUM_MAX_PACKET_SIZE];
     uint32_t round = idx / r->chunks_per_round, chunk = idx % r->chunks_per_round;
     uint16_t len = rel_len(r, chunk);
+    const struct rel_chunk *c = &r->c[idx];
     struct grad_hdr *h = (struct grad_hdr *)pkt;
     h->job_id = htonl(r->job);
     h->round = htonl(round);
-    h->chunk_id = htonl(chunk);
+    h->chunk_id = htonl(chunk | ((uint32_t)c->attempt << NETSUM_RETRY_SHIFT));
     h->worker_id = htons(r->worker);
     h->num_workers = htons(r->workers);
     h->chunk_len = htons(len);
     int saturated = 0;
     for (unsigned i = 0; i < len; i++) {
         int sat;
-        uint32_t be = htonl((uint32_t)rel_value(r, round, chunk, i, &sat));
+        uint32_t be = htonl((uint32_t)rel_value(r, round, chunk, i, c->e, &sat));
         saturated |= sat;
         memcpy(pkt + NETSUM_HDR_SIZE + 4 * i, &be, 4);
     }
     uint16_t bits = (uint16_t)(resend ? NETSUM_F_RESEND : 0);
     if (r->frac_bits >= 0 && saturated)
         bits |= NETSUM_F_OVERFLOW; /* v3: report it rather than send a clipped value */
-    h->flags = htons(r->frac_bits >= 0 ? netsum_wire_flags(NETSUM_VERSION_V3, (uint8_t)r->frac_bits, bits)
+    h->flags = htons(r->frac_bits >= 0 ? netsum_wire_flags(NETSUM_VERSION_V3, c->e, bits)
                                        : (uint16_t)(NETSUM_FLAGS_V2 | bits));
     uint8_t *bm = pkt + NETSUM_HDR_SIZE + 4 * (size_t)len;
     memset(bm, 0, NETSUM_BITMAP_BYTES);
@@ -272,7 +286,8 @@ static void rel_on_result(struct rel *r, const uint8_t *pkt, ssize_t n, int64_t 
     uint16_t flags = ntohs(h->flags);
     if (!(flags & NETSUM_F_ACK) || ntohl(h->job_id) != r->job)
         return;
-    uint32_t round = ntohl(h->round), chunk = ntohl(h->chunk_id);
+    uint32_t round = ntohl(h->round), wire_chunk = ntohl(h->chunk_id);
+    uint32_t chunk = wire_chunk & ((1u << NETSUM_RETRY_SHIFT) - 1), attempt = wire_chunk >> NETSUM_RETRY_SHIFT;
     if (round >= r->rounds || chunk >= r->chunks_per_round)
         return;
     uint16_t len = ntohs(h->chunk_len);
@@ -280,24 +295,40 @@ static void rel_on_result(struct rel *r, const uint8_t *pkt, ssize_t n, int64_t 
         return;
     uint32_t idx = round * r->chunks_per_round + chunk;
     struct rel_chunk *c = &r->c[idx];
-    if (c->state != 1) {
-        r->dup_results++;
+    if (c->state != 1 || attempt != c->attempt) {
+        r->dup_results++; /* already done, or the result of an earlier attempt */
         return;
     }
     if (r->drop_result_every && ++r->results_seen % r->drop_result_every == 0) {
         r->dropped_rx++; /* simulated loss of a result */
         return;
     }
-    c->state = 2;
-    r->results++;
     unsigned version = flags >> NETSUM_VERSION_SHIFT;
     unsigned e = version == NETSUM_VERSION_V3 ? (flags & NETSUM_FRAC_MASK) >> NETSUM_FRAC_SHIFT : NETSUM_Q_FRAC_BITS;
-    if ((r->frac_bits >= 0) != (version == NETSUM_VERSION_V3) || e != (unsigned)rel_e(r)) {
+    int scale_ok = (r->frac_bits >= 0) == (version == NETSUM_VERSION_V3) && e == c->e;
+    if (scale_ok && (flags & NETSUM_F_OVERFLOW) && r->frac_bits >= 0 && c->e > 0) {
+        /* every worker sees this same result and retries the same way:
+         * same step, exponent - 8, a fresh key */
+        r->overflow_results++;
+        r->retried++;
+        c->attempt++;
+        c->e = c->e > NETSUM_OVERFLOW_STEP ? (uint8_t)(c->e - NETSUM_OVERFLOW_STEP) : 0;
+        c->retries = 0;
+        c->rto_us = r->rto_us;
+        c->deadline_us = now + r->rto_us;
+        rel_send(r, idx, 0);
+        r->sent++;
+        return;
+    }
+    c->state = 2;
+    r->results++;
+    if (!scale_ok) {
         r->mismatches++; /* a result at another scale cannot be decoded */
     } else if (flags & NETSUM_F_OVERFLOW) {
         r->overflow_results++;
     } else if (r->has_fixed) {
-        int32_t want = (int32_t)((int64_t)netsum_to_scaled(r->fixed, rel_e(r), 0) * r->workers);
+        int sat;
+        int32_t want = (int32_t)((int64_t)rel_quantize(r, r->fixed, c->e, &sat) * r->workers);
         for (unsigned i = 0; i < len; i++) {
             uint32_t be;
             memcpy(&be, pkt + NETSUM_HDR_SIZE + 4 * i, 4);
@@ -362,7 +393,8 @@ static int reliable_main(int argc, char **argv)
                 "         [--rounds R] [--vector-len V] [--chunk-len C<=64] [--window W] [--rto-ms MS]\n"
                 "         [--max-retries K] [--fixed X | --seed S] [--sync] [--drop-every K] [--drop-result-every K]\n"
                 "         [--emit-rounds] [--frac-bits E]\n"
-                "  --frac-bits: send wire v3 with values round(x * 2^E), 0 <= E <= 63\n"
+                "  --frac-bits: send wire v3 with values round(x * 2^E), 0 <= E <= 63; a chunk whose\n"
+                "               result is OVERFLOW is retried at E - 8 under chunk_id | attempt << 24\n"
                 "  --emit-rounds: also print each round's duration and CLOCK_MONOTONIC end time (us)\n");
         return 1;
     }
@@ -416,6 +448,7 @@ static int reliable_main(int argc, char **argv)
             if (!r.round_start[round])
                 r.round_start[round] = now;
             r.c[next].state = 1;
+            r.c[next].e = (uint8_t)(r.frac_bits < 0 ? NETSUM_Q_FRAC_BITS : r.frac_bits);
             r.c[next].rto_us = r.rto_us;
             r.c[next].deadline_us = now + r.rto_us;
             rel_send(&r, (uint32_t)next, 0);
@@ -475,12 +508,12 @@ static int reliable_main(int argc, char **argv)
     r.rounds = rounds_done ? rounds_done : 1;
 #define PCT(p) rt[(size_t)((double)(r.rounds - 1) * (p))]
     printf("{\"worker_id\":%u,\"rounds\":%u,\"chunks\":%llu,\"sent\":%llu,\"resent\":%llu,\"results\":%llu,"
-           "\"dup_results\":%llu,\"result_mismatches\":%llu,\"overflow_results\":%llu,\"dropped_tx\":%llu,"
+           "\"dup_results\":%llu,\"result_mismatches\":%llu,\"overflow_results\":%llu,\"retried_chunks\":%llu,\"dropped_tx\":%llu,"
            "\"dropped_rx\":%llu,\"verified\":%s,\"elapsed_us\":%lld,\"round_us_p50\":%lld,\"round_us_p95\":%lld,"
            "\"round_us_p99\":%lld,\"round_us_max\":%lld}\n",
            r.worker, rounds_done, (unsigned long long)total, (unsigned long long)r.sent, (unsigned long long)r.resent,
            (unsigned long long)r.results, (unsigned long long)r.dup_results, (unsigned long long)r.mismatches,
-           (unsigned long long)r.overflow_results, (unsigned long long)r.dropped_tx, (unsigned long long)r.dropped_rx,
+           (unsigned long long)r.overflow_results, (unsigned long long)r.retried, (unsigned long long)r.dropped_tx, (unsigned long long)r.dropped_rx,
            r.has_fixed ? "true" : "false", (long long)elapsed, (long long)PCT(0.50), (long long)PCT(0.95),
            (long long)PCT(0.99), (long long)rt[r.rounds - 1]);
     return 0;

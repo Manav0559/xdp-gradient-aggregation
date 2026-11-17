@@ -63,11 +63,13 @@ net_rx() { awk '/NET_RX/ {for (i = 2; i <= NF; i++) printf "%s%s", (i > 2 ? ";" 
 
 setup_config() { # config -> sets TARGET and starts the aggregator
     local cfg=$1
-    TARGET=10.10.1.1:9876; AGG_PID=""; ATTACHED=""
+    TARGET=10.10.1.1:9876; AGG_PID=""; ATTACHED=""; WORKER_EXTRA=()
     case $cfg in
         noagg) TARGET=10.10.2.2:9000 ;;
         useragg) agg_start ;;
+        useragg-v3) agg_start; WORKER_EXTRA=(--frac-bits 16) ;; # same integers as Q16.16, wire v3
         xdp-generic) xdp_up generic hash 16 ;;
+        xdp-generic-v3) xdp_up generic hash 16; WORKER_EXTRA=(--frac-bits 16) ;;
         xdp-native) xdp_up native hash 16 ;;
         xdp-array) xdp_up "${BEST_MODE:-generic}" array 16 ;;
     esac
@@ -81,7 +83,7 @@ run_job() { # prefix job n rounds window [--sync] [extra...]
     for w in $(seq 0 $((n - 1))); do
         ip netns exec ns_w $PIN_W ./bin/worker --mode reliable --to "$TARGET" --ps 10.10.2.2:9000 --job "$job" \
             --worker "$w" --workers "$n" --rounds "$rounds" --vector-len "$VECTOR" --chunk-len "$CHUNK" \
-            --window "$window" --rto-ms 200 --fixed 0.25 "$@" > "$prefix-w$w.json" 2> "$prefix-w$w.err" &
+            --window "$window" --rto-ms 200 --fixed 0.25 "$@" "${WORKER_EXTRA[@]}" > "$prefix-w$w.json" 2> "$prefix-w$w.err" &
         pids+=($!)
     done
     local rc=0

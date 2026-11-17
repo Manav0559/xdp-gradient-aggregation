@@ -43,6 +43,8 @@ struct grad_hdr {
 #define NETSUM_FLAGS_V2 ((uint16_t)(NETSUM_VERSION_V2 << NETSUM_VERSION_SHIFT))
 #define NETSUM_FRAC_SHIFT 6
 #define NETSUM_FRAC_MASK 0x0FC0u /* v3: values are round(x * 2^e), e = 0..63 */
+#define NETSUM_RETRY_SHIFT 24    /* v3 retry after OVERFLOW: chunk_id | attempt << 24 */
+#define NETSUM_OVERFLOW_STEP 8   /* ...at exponent e - 8 */
 #define NETSUM_F_RESEND   0x0001u /* worker retransmission */
 #define NETSUM_F_ACK      0x0002u /* PS result/ACK toward aggregator and workers */
 #define NETSUM_F_OVERFLOW 0x0004u /* aggregate whose accumulation overflowed */

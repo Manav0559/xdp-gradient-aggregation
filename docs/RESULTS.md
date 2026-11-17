@@ -353,11 +353,53 @@ fallbacks instead) and no `scale_mismatch`. Each worker's v3 values are now boun
 `INT32_MAX / N`; re-running the local S = 1e-4 paths after that change gives
 the same final loss to six digits, so the table above stands.
 
+**The C worker on the kernel.** The XDP load test runs the reliable C
+worker in v3 mode through the kernel program: Scenario S (three workers,
+3e-6 at exponent 40, 20% loss) and Scenario S2 (1.0 at exponent 31, which
+exceeds `INT32_MAX / 3`: every chunk comes back `OVERFLOW` from the kernel and
+is retried at exponent 23). In run 44027074508 (PR head `ff27165`): S gave
+every worker its 32 correct results with 51 retransmissions, the kernel
+counting no `scale_mismatch`; in S2 the kernel completed 32 slots, 16 of them
+flagged overflow (the first attempt of each chunk), and every worker got its
+16 results exact at exponent 23.
+
 **Scope.** One small model, synchronous rounds, one exponent per 64-value
-chunk. On the kernel, v3 was exercised by the Python client; the C worker's
-`--frac-bits` mode is tested only through the userspace aggregator and PS,
-and it does not retry. Not shown: gradients that change scale by more than
-16x per step other than the forced spike, and any effect on throughput.
+chunk. Not shown: gradients that change scale by more than 16x per step
+other than the forced spike. Throughput of v3 against v2 is measured in the
+next section.
+
+## Wire v3 throughput cost
+
+**Source:** workflow `bench.yml`, run 44027074656, PR head `ff27165` (merge
+ref `bdb4efe`), second pass "wire v3 overhead". Data: `bench/v3/throughput.csv`,
+`bench/v3/environment.json`; tables: `bench/v3/summary_throughput.csv` and
+`bench/v3/v3_comparisons.csv`, from `python3 scripts/bench_analyze.py
+bench/v3 <out>` (the committed comparisons reproduce byte for byte).
+Environment: GitHub-hosted runner, AMD EPYC 7763, Linux `7.0.0-1019-azure`;
+same three-namespace closed-loop method as the v2 benchmark, 8 trials of
+4,000 rounds per cell, window 64.
+
+The workers send v3 at exponent 16, which carries exactly the same integers
+as Q16.16, so the comparison isolates the format (exponent check, version and
+exponent bookkeeping, the extra branches in the XDP program) from any change
+in the values:
+
+| workers | path | v2 values/s | v3 values/s | v3 / v2 [95% CI] | p (Holm) |
+|---:|---|---:|---:|---|---:|
+| 2 | userspace aggregator | 1,662,830 | 1,664,470 | 1.001 [0.995, 1.003] | 1 |
+| 2 | XDP generic | 2,736,890 | 2,730,350 | 0.998 [0.989, 1.008] | 1 |
+| 4 | userspace aggregator | 968,373 | 971,796 | 1.004 [0.994, 1.013] | 1 |
+| 4 | XDP generic | 1,450,110 | 1,450,880 | 1.001 [0.994, 1.009] | 1 |
+| 8 | userspace aggregator | 522,555 | 523,037 | 1.001 [0.982, 1.007] | 1 |
+| 8 | XDP generic | 730,726 | 729,918 | 0.999 [0.984, 1.013] | 1 |
+
+Every interval contains 1 and no difference is significant: within about
++/-1.5% on this runner, v3 costs no throughput. The XDP program's own cost per
+run is also unchanged (median 609 / 542 / 525 ns with v3 against 611 / 533 /
+535 ns with v2 at 2 / 4 / 8 workers). The extra verifier work (§6 of
+`docs/DESIGN_NOTES.md`) is a load-time cost, not a per-packet one. One runner
+type and one run; the earlier v2 benchmark shows that absolute numbers vary
+with the runner's CPU, so only the within-run ratio is the claim here.
 
 ## Benchmark-lite: first XDP measurements (open loop, two namespaces, `xdpgeneric`)
 

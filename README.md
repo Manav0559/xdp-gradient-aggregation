@@ -119,6 +119,8 @@ Ratios of medians with bootstrap 95% CIs; permutation tests, Holm-corrected
   Q16.16 training ends at 0.436 accuracy and v3 at 0.989 (float: 0.989),
   bit-identical across noagg, userspace and XDP, with and without 5% loss.
   A chunk that overflows is retried in the same step at a lower exponent.
+  At exponent 16 (the same integers as Q16.16) v3 costs no measurable
+  throughput: v3 / v2 between 0.998 and 1.004 on the userspace and XDP paths.
 
 Not shown: physical NICs, native XDP on hardware, multi-host topologies,
 line rate. The environment is a shared VM and veth is a software device.
