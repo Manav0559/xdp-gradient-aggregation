@@ -823,3 +823,18 @@ points, and what came of them:
   tiny-pool array test asserted no stuck slot without the reaper; a late
   lone RESEND after the ACK re-opens a key (same as the kernel, §8). Fixed
   in PR #9's branch; 24/24 emulated runs then passed.
+
+## 2026-11-17 21:45 IST — Final state of PR #10
+
+- Seven v2 benchmark runs on four CPU types and four pre-registered
+  baseline runs on three: batching the userspace aggregator was never
+  significant; generic XDP beat the batched aggregator in every cell except
+  2 workers on the Xeon 6975P-C. Headline: 1-11% on the 6975P-C (growing
+  with workers), 31-69% on the Xeon 8573C, AMD EPYC 7763 and EPYC 9V74.
+- Every run's XDP packet accounting balanced in every trial; the
+  sanitizers job is green after the worker leak fix.
+- The project deck and its PDFs live outside the repository
+  (~/Downloads/NetSum_XDP_Gradient_Aggregation*.pptx/.pdf, generator in
+  ~/Desktop/netsum-deck/); charts are embedded as images rendered from the
+  same data because Apple's importer drew the generator's native charts as
+  empty boxes.
