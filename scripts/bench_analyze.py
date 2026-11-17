@@ -277,6 +277,16 @@ def main():
     text = "\n".join(md) + "\n"
     open(os.path.join(out, "results.md"), "w").write(text)
     print(text)
+    if bad:
+        # Every packet the XDP program sees must end in exactly one outcome
+        # counter; a trial where they disagree means a lost or double-counted
+        # packet, so the run fails (the summary above is still written).
+        for row in acc_rows:
+            if not row[-1]:
+                print(f"ACCOUNTING IMBALANCE: {row[0]} {row[1]} workers={row[2]} trial={row[3]}: "
+                      f"rx {row[4]} != outcomes {row[5]}", file=sys.stderr)
+        print(f"FAIL: XDP packet accounting unbalanced in {bad}/{len(acc_rows)} trials", file=sys.stderr)
+        return 1
     return 0
 
 

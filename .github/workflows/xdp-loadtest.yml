@@ -384,6 +384,81 @@ jobs:
           python3 -c "import json; d=json.load(open('/tmp/slots_p.json')); assert all(s['state'] != 'accumulating' for s in d), d"
           ctl_json config $CFG
 
+      - name: "Scenario R (C13 on the kernel path): lost results are recovered through XDP"
+        run: |
+          set -euo pipefail
+          source ci/lib.sh
+          stats_to /tmp/r0.json
+          # Workers discard some of the results they receive (worker 0 every
+          # 3rd, worker 1 every 5th, worker 2 none), so only results are lost
+          # and mostly one worker at a time. A lone RESEND hits a COMPLETED
+          # slot (XDP re-sends the aggregate) or, after the ACK retired it,
+          # re-opens the key and is flushed to the PS as a PARTIAL on the next
+          # RESEND; the PS re-sends the stored result either way. A result
+          # lost by every worker is re-aggregated in full instead (the first
+          # CI run, with the same drop rate everywhere, recovered only so).
+          reliable_bg 998 0 3 8 256 --rto-ms 50 --window 16 --drop-result-every 3
+          reliable_bg 998 1 3 8 256 --rto-ms 50 --window 16 --drop-result-every 5
+          reliable_bg 998 2 3 8 256 --rto-ms 50 --window 16
+          wait
+          sleep 0.5
+          # A lone RESEND that arrives after the ACK re-opens the key; if that
+          # worker then gets the result anyway (the PS re-sends it to every
+          # registered worker when another worker recovers), nobody flushes
+          # the re-opened slot. The TTL sweeper is what reclaims it (as in J2).
+          slots_to /tmp/slots_r_before_sweep.json
+          echo "job 998 slots before sweeping:"; python3 -c "import json; print([s for s in json.load(open('/tmp/slots_r_before_sweep.json')) if s['job_id'] == 998])"
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 300
+          sleep 0.5
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 300
+          stats_to /tmp/r1.json; slots_to /tmp/slots_r.json
+          check_reliable 998 3 32
+          python3 ci/check_slot_present.py /tmp/slots_r.json 998 no-accumulating
+          python3 - <<'PY'
+          import json, re, sys
+          sys.path.insert(0, "ci"); import netsum_bpf_json as n
+          dropped = sum(json.loads(open(f"/tmp/rw-998-{w}.json").read().strip().splitlines()[-1])["dropped_rx"] for w in range(3))
+          assert dropped >= 3, f"expected lost results, got {dropped}"
+          a, b = n.stats("/tmp/r0.json"), n.stats("/tmp/r1.json")
+          d = {k: b[k] - a.get(k, 0) for k in b if b[k] != a.get(k, 0)}
+          lone = d.get("tx_result_resend", 0) + d.get("slot_flushed_partial", 0)
+          assert lone >= 1, f"no lone-worker recovery went through the XDP program: {d}"
+          assert d.get("slot_completed", 0) >= 32, d
+          done = re.findall(r"^\[complete\] job=998 round=(\d+) chunk=(\d+) ", open("/tmp/ps.log").read(), re.M)
+          assert len(done) == 32 and len(set(done)) == 32, f"each key must complete exactly once at the PS: {len(done)}"
+          print(f"PASS: {dropped} results lost, all recovered exactly; kernel deltas:", d)
+          PY
+
+      - name: "Scenario R2 (C13, array mode): lost results are recovered with the aggregator pool"
+        run: |
+          set -euo pipefail
+          source ci/lib.sh
+          stats_to /tmp/r2a.json
+          ctl_json config $CFG --slot-mode array
+          reliable_bg 999 0 3 8 256 --rto-ms 50 --window 16 --drop-result-every 3
+          reliable_bg 999 1 3 8 256 --rto-ms 50 --window 16 --drop-result-every 5
+          reliable_bg 999 2 3 8 256 --rto-ms 50 --window 16
+          wait
+          sleep 0.5
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 300   # re-opened keys, as in R
+          sleep 0.5
+          sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum sweep --once --ttl-ms 300
+          stats_to /tmp/r2b.json; ctl_json slots > /tmp/slots_r2.json
+          ctl_json config $CFG
+          check_reliable 999 3 32
+          python3 - <<'PY'
+          import json, sys
+          sys.path.insert(0, "ci"); import netsum_bpf_json as n
+          dropped = sum(json.loads(open(f"/tmp/rw-999-{w}.json").read().strip().splitlines()[-1])["dropped_rx"] for w in range(3))
+          assert dropped >= 3, f"expected lost results, got {dropped}"
+          a, b = n.stats("/tmp/r2a.json"), n.stats("/tmp/r2b.json")
+          d = {k: b[k] - a.get(k, 0) for k in b if b[k] != a.get(k, 0)}
+          assert d.get("tx_result_resend", 0) + d.get("slot_flushed_partial", 0) >= 1, d
+          s = json.load(open("/tmp/slots_r2.json"))
+          assert all(x["state"] != "accumulating" for x in s if x.get("job_id") == 999), s
+          print(f"PASS: array mode, {dropped} results lost, all recovered; kernel deltas:", d)
+          PY
+
       - name: "Scenario O (C1 hygiene): the TTL sweeper leaves no slot behind"
         run: |
           set -euo pipefail

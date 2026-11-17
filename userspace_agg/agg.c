@@ -5,6 +5,14 @@
  * Per (job, round, chunk) slot: EMPTY -> ACCUMULATING -> COMPLETED (tombstone)
  * -> EMPTY. The first accepted contribution fixes the fan-in and chunk_len;
  * disagreeing, duplicate and late contributions are counted and dropped.
+ *
+ * Two slot modes, as in the kernel (netsum-ctl config --slot-mode):
+ *  - hash (default): an open-addressing table keyed by (job, round, chunk);
+ *  - array (--array-slots-log2 N): ATP's fixed pool of 2^N aggregators,
+ *    indexed by netsum_slot_hash(key) & mask and tagged with the owning key.
+ *    A busy aggregator owned by another key means fallback to the PS, and the
+ *    key stays at the PS for its later contributions (fallback_keys). ACK and
+ *    tombstone expiry free the aggregator; the per-job quota does not apply.
  * Design: docs/DESIGN_NOTES.md §Admission, §Slot storage, §Reclamation. */
 #define _POSIX_C_SOURCE 200809L
 
@@ -22,6 +30,7 @@
 
 #include "../common/slot_table.h"
 #include "../protocol/grad_parse.h"
+#include "../protocol/netsum_maps.h"
 #include "../protocol/netsum_stats.h"
 
 #define JOB_TABLE_CAPACITY 256
@@ -51,7 +60,70 @@ static struct {
     long packets_out;
     int profile;
     uint64_t profile_ns, profile_pkts;
+    /* array mode */
+    int array_mode;
+    struct slot *pool;
+    uint32_t pool_mask;
+    struct slot_table fallback_keys; /* presence set: keys that live at the PS */
 } g;
+
+/* ---- array mode (ATP aggregator pool) ---------------------------------- */
+
+static struct slot *pool_slot(struct slot_key k)
+{
+    return &g.pool[netsum_slot_hash(k.job_id, k.round, k.chunk_id) & g.pool_mask];
+}
+
+static void pool_free(struct slot *s)
+{
+    memset(s, 0, sizeof(*s)); /* SLOT_EMPTY */
+}
+
+static int fallback_key_present(struct slot_key k)
+{
+    return st_find(&g.fallback_keys, k) != NULL;
+}
+
+/* A full set just does not record the key, like an LRU eviction in the
+ * kernel's fallback_keys: safe because the PS merges by contributor set. */
+static void fallback_key_add(struct slot_key k)
+{
+    if (!fallback_key_present(k))
+        (void)st_insert(&g.fallback_keys, k);
+}
+
+static void fallback_key_del(struct slot_key k)
+{
+    struct slot *s = st_find(&g.fallback_keys, k);
+    if (s)
+        st_delete(&g.fallback_keys, s);
+}
+
+/* Tombstone expiry for the pool: frees the aggregator only if it still holds
+ * the same key in the same completed/flushed state (it may have been freed
+ * by an ACK and claimed by another key since). */
+static int pool_tomb_pop(void)
+{
+    struct tomb_fifo *f = &g.tombs;
+    struct tomb_entry e = f->ring[f->head];
+    f->head = (f->head + 1) % f->cap;
+    f->len--;
+    struct slot *s = pool_slot(e.key);
+    if ((s->state == SLOT_COMPLETED || s->state == SLOT_FLUSHED) && st_key_eq(s->key, e.key) &&
+        s->completed_us == e.completed_us) {
+        pool_free(s);
+        return 1;
+    }
+    return 0;
+}
+
+static int pool_tomb_expire(int64_t now, int64_t ttl_us)
+{
+    int retired = 0;
+    while (g.tombs.len && now - g.tombs.ring[g.tombs.head].completed_us >= ttl_us)
+        retired += pool_tomb_pop();
+    return retired;
+}
 
 static volatile sig_atomic_t g_dump_requested, g_stop;
 
@@ -116,8 +188,10 @@ static void dump_stats(void)
                     j->job_id, j->accumulating, j->admitted, j->rejected);
     }
     size_t by_state[4] = {0};
-    for (size_t i = 0; i < g.table.cap; i++)
-        by_state[g.table.slots[i].state & 3]++;
+    struct slot *all = g.array_mode ? g.pool : g.table.slots;
+    size_t n_all = g.array_mode ? (size_t)g.pool_mask + 1 : g.table.cap;
+    for (size_t i = 0; i < n_all; i++)
+        by_state[all[i].state & 3]++;
     fprintf(stderr, "[stats-all] {");
     for (int i = 0; i < NS_STAT__COUNT; i++)
         fprintf(stderr, "\"%s\":%llu,", netsum_stat_names[i], (unsigned long long)g.stats[i]);
@@ -134,6 +208,19 @@ static void dump_stats(void)
 static void reap_expired(int64_t now)
 {
     int64_t ttl = (int64_t)g.slot_ttl_ms * 1000;
+    if (g.array_mode) {
+        for (uint32_t k = 0; k <= g.pool_mask; k++) {
+            struct slot *s = &g.pool[k];
+            if (s->state == SLOT_ACCUMULATING && now - s->touched_us >= ttl) {
+                fprintf(stderr, "[reaped] job=%u round=%u chunk=%u -- incomplete after %lldms, freeing aggregator %u\n",
+                        s->key.job_id, s->key.round, s->key.chunk_id,
+                        (long long)((now - s->touched_us) / 1000), k);
+                pool_free(s);
+                g.stats[NS_SLOT_REAPED]++;
+            }
+        }
+        return;
+    }
     size_t i = 0;
     while (i < g.table.cap) {
         struct slot *s = &g.table.slots[i];
@@ -188,10 +275,30 @@ static void forward_fallback(const uint8_t *pkt, const struct netsum_parsed *p)
         g.stats[NS_TX_FALLBACK]++;
 }
 
+/* Array-mode fallback, as in the kernel: v1 has no FALLBACK flag or
+ * contributor bitmap, so the PS could double count it; drop instead. */
+static void forward_fallback_v2(const uint8_t *pkt, const struct netsum_parsed *p)
+{
+    if (!p->has_trailer) {
+        g.stats[NS_LATE_DUPLICATE]++;
+        return;
+    }
+    forward_fallback(pkt, p);
+}
+
 static void retire_state(struct slot *s, int64_t now, uint8_t state)
 {
     s->state = state;
     s->completed_us = now;
+    if (g.array_mode) {
+        /* The ring has one entry per aggregator, so it can only be full of
+         * stale entries (freed by ACKs); expiring the oldest is enough. */
+        if (g.tombs.len == g.tombs.cap)
+            g.stats[NS_SLOT_RETIRED_TTL] += (uint64_t)pool_tomb_pop();
+        g.tombs.ring[(g.tombs.head + g.tombs.len) % g.tombs.cap] = (struct tomb_entry){s->key, now};
+        g.tombs.len++;
+        return;
+    }
     g.stats[NS_SLOT_RETIRED_TTL] += (uint64_t)tomb_push(&g.tombs, &g.table, s->key, now);
 }
 
@@ -201,6 +308,18 @@ static void retire_state(struct slot *s, int64_t now, uint8_t state)
 static void handle_ack(const struct netsum_parsed *p)
 {
     g.stats[NS_ACK_SEEN]++;
+    if (g.array_mode) {
+        struct slot_key k = {p->job_id, p->round, p->chunk_id};
+        fallback_key_del(k);
+        struct slot *a = pool_slot(k);
+        if (a->state == SLOT_EMPTY || !st_key_eq(a->key, k)) {
+            g.stats[NS_ACK_UNEXPECTED]++; /* the aggregator belongs to another key now */
+            return;
+        }
+        g.stats[a->state == SLOT_ACCUMULATING ? NS_ACK_UNEXPECTED : NS_SLOT_RETIRED_ACK]++;
+        pool_free(a);
+        return;
+    }
     struct slot *s = st_find(&g.table, (struct slot_key){p->job_id, p->round, p->chunk_id});
     if (!s) {
         g.stats[NS_ACK_UNEXPECTED]++;
@@ -229,7 +348,33 @@ static void admission_reject(const struct netsum_parsed *p, enum netsum_stat why
 static void handle_contribution(const uint8_t *pkt, const struct netsum_parsed *p, int64_t now)
 {
     struct slot_key key = {p->job_id, p->round, p->chunk_id};
-    struct slot *s = st_find(&g.table, key);
+    struct slot *s = NULL;
+
+    if (g.array_mode) {
+        if (fallback_key_present(key)) { /* this key already lives at the PS */
+            forward_fallback_v2(pkt, p);
+            return;
+        }
+        s = pool_slot(key);
+        if (s->state == SLOT_EMPTY) { /* claim a free aggregator */
+            memset(s, 0, sizeof(*s));
+            s->key = key;
+            s->state = SLOT_ACCUMULATING;
+            s->fanin = p->num_workers;
+            s->chunk_len = p->chunk_len;
+            s->frac_bits = p->frac_bits;
+            s->version = p->version;
+            s->first_us = now;
+            s->touched_us = now;
+        } else if (!st_key_eq(s->key, key)) { /* busy with another key */
+            fallback_key_add(key);
+            g.stats[NS_FALLBACK_COLLISION]++;
+            forward_fallback_v2(pkt, p);
+            return;
+        }
+    } else {
+        s = st_find(&g.table, key);
+    }
 
     if (!s) {
         struct job *j = job_get(p->job_id);
@@ -355,11 +500,13 @@ static void handle_contribution(const uint8_t *pkt, const struct netsum_parsed *
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s [--slot-capacity-log2 N] [--tombstone-ttl-ms N] [--quiet] [--profile]\n"
+            "usage: %s [--slot-capacity-log2 N | --array-slots-log2 N] [--tombstone-ttl-ms N] [--quiet] [--profile]\n"
             "          <listen_port> <downstream_ip> <downstream_port>\n"
             "          [max_packets=0] [max_slots_per_job=0] [slot_ttl_ms=0]\n"
             "  max_slots_per_job: per-job cap on ACCUMULATING slots (0 = none)\n"
             "  slot_ttl_ms:       drop ACCUMULATING slots idle this long (0 = never)\n"
+            "  --array-slots-log2: ATP-style pool of 2^N aggregators (N in [0, 16]);\n"
+            "                     a key whose aggregator is busy falls back to the PS\n"
             "  --tombstone-ttl-ms: keep completed rounds this long to absorb late\n"
             "                     duplicates (default 2000)\n"
             "  SIGUSR1 prints [stats] per job and one [stats-all] counter line.\n",
@@ -382,6 +529,14 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--slot-capacity-log2 must be in [4, 22]\n");
                 return 1;
             }
+        } else if (strcmp(argv[a], "--array-slots-log2") == 0 && a + 1 < argc) {
+            int n = atoi(argv[++a]);
+            if (n < 0 || n > 16) {
+                fprintf(stderr, "--array-slots-log2 must be in [0, 16]\n");
+                return 1;
+            }
+            g.array_mode = 1;
+            g.pool_mask = (1u << n) - 1;
         } else if (strcmp(argv[a], "--tombstone-ttl-ms") == 0 && a + 1 < argc) {
             g.tomb_ttl_ms = atol(argv[++a]);
         } else {
@@ -400,7 +555,15 @@ int main(int argc, char **argv)
     g.quota = argc - a > 4 ? atol(argv[a + 4]) : 0;
     g.slot_ttl_ms = argc - a > 5 ? atol(argv[a + 5]) : 0;
 
-    if (st_init(&g.table, cap_log2) != 0 || tomb_init(&g.tombs, g.table.cap) != 0) {
+    if (g.array_mode) {
+        g.pool = calloc((size_t)g.pool_mask + 1, sizeof(struct slot));
+        if (!g.pool || st_init(&g.fallback_keys, 16) != 0 || tomb_init(&g.tombs, (size_t)g.pool_mask + 1) != 0) {
+            fprintf(stderr, "out of memory for the aggregator pool\n");
+            return 1;
+        }
+        if (g.quota > 0)
+            fprintf(stderr, "note: max_slots_per_job does not apply in array mode (as in the kernel)\n");
+    } else if (st_init(&g.table, cap_log2) != 0 || tomb_init(&g.tombs, g.table.cap) != 0) {
         fprintf(stderr, "out of memory for slot table\n");
         return 1;
     }
@@ -451,8 +614,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "invalid downstream_ip: %s\n", downstream_ip);
         return 1;
     }
-    fprintf(stderr, "userspace aggregator listening on :%d, forwarding to %s:%d\n",
-            listen_port, downstream_ip, downstream_port);
+    fprintf(stderr, "userspace aggregator listening on :%d, forwarding to %s:%d (%s)\n",
+            listen_port, downstream_ip, downstream_port, g.array_mode ? "array mode" : "hash mode");
 
     uint8_t pkt[NETSUM_MAX_PACKET_SIZE + 1];
     long packets_in = 0;
@@ -463,8 +626,9 @@ int main(int argc, char **argv)
             reap_expired(now);
             last_reap = now;
         }
-        g.stats[NS_SLOT_RETIRED_TTL] += (uint64_t)tomb_expire(&g.tombs, &g.table, now,
-                                                             (int64_t)g.tomb_ttl_ms * 1000);
+        g.stats[NS_SLOT_RETIRED_TTL] += g.array_mode
+            ? (uint64_t)pool_tomb_expire(now, (int64_t)g.tomb_ttl_ms * 1000)
+            : (uint64_t)tomb_expire(&g.tombs, &g.table, now, (int64_t)g.tomb_ttl_ms * 1000);
         if (g_dump_requested) {
             g_dump_requested = 0;
             dump_stats();

@@ -35,7 +35,9 @@ result in every trial was checked to be the exact expected sum; the run would
 have failed otherwise.
 
 **XDP packet accounting balanced in 117/117 trials** (every packet the
-program saw ended in exactly one outcome counter).
+program saw ended in exactly one outcome counter). Since this result was
+recorded, `bench_analyze.py` exits non-zero on any unbalanced trial, so a
+benchmark run with a lost or double-counted packet now fails.
 
 ### Throughput (window 64, closed loop)
 
