@@ -34,3 +34,39 @@ jobs:
           MULTIARCH=$(gcc -print-multiarch)
           make bpf BPF_CC="clang -D__x86_64__ -idirafter /usr/include/${MULTIARCH}"
           llvm-objdump -h xdp_agg/xdp_agg.o
+
+  # Userspace binaries (agg, paramserver, worker, unit tests) under ASan +
+  # UBSan + LeakSanitizer while the full `make test` suite drives them. The
+  # Python harness captures the servers' stderr, so reports go to files and the
+  # job fails if any report file exists, not only on a test failure.
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc make python3
+
+      - name: Build with ASan + UBSan
+        run: |
+          make CFLAGS="-Wall -Wextra -Wpedantic -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+
+      - name: make test under the sanitizers
+        env:
+          ASAN_OPTIONS: log_path=/tmp/san/asan:halt_on_error=1:detect_leaks=1
+          UBSAN_OPTIONS: log_path=/tmp/san/ubsan:print_stacktrace=1:halt_on_error=1
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/san
+          make test
+
+      - name: Fail on any sanitizer report
+        if: always()
+        run: |
+          shopt -s nullglob
+          reports=(/tmp/san/*)
+          for f in "${reports[@]}"; do echo "::group::$f"; cat "$f"; echo "::endgroup::"; done
+          if [ ${#reports[@]} -gt 0 ]; then echo "::error::${#reports[@]} sanitizer report(s)"; exit 1; fi
+          echo "no sanitizer reports"

@@ -73,7 +73,7 @@ make bpf-unit                                                    # BPF_PROG_TEST
 |---|---|---|
 | `protocol/` | wire formats v2 and v3 (per-chunk exponent), one shared parser (`grad_parse.h`) for every path, counters, map layouts | unit tests, libFuzzer differential fuzzing, kernel corpus replay |
 | `xdp_agg/xdp_agg.c` | in-kernel aggregation: admission checks, tombstones, overflow detection, quota with fallback, ACK retirement, RESEND flush, FALLBACK, array-mode aggregators, source rewrite, redirect; `netsum_sweep` for TTL | `bpf-unit.yml` (79 cases), `xdp-loadtest.yml` (real kernel, real UDP) |
-| `userspace_agg/agg.c` | the same algorithm in a process: hash mode, or ATP's aggregator pool with collision fallback (`--array-slots-log2 N`) | `tests/test_reliability.py`, benchmark |
+| `userspace_agg/agg.c` | the same algorithm in a process: hash mode, or ATP's aggregator pool with collision fallback (`--array-slots-log2 N`); optional `recvmmsg`/`sendmmsg` batching on Linux (`--batch N`) | `tests/test_reliability.py`, sanitizer CI job, benchmark (including a batched and an array-mode baseline) |
 | `paramserver/` | final summing node, merges raw/fallback/partial/aggregate packets by contributor set, sends results | `tests/test_fallback.py`, `tests/test_reliability.py` |
 | `worker/` | one-shot sender and a reliable windowed worker with retransmission | `tests/test_reliability.py`, Scenarios H2/I2/J2 |
 | `ctl/netsum_ctl.c` | libbpf control plane: attach (reports the real mode), config, stats, slots, jobs, sweep, verify | `ci/test_netsum_ctl.sh` |
@@ -102,9 +102,12 @@ Ratios of medians with bootstrap 95% CIs; permutation tests, Holm-corrected
   21-34% lower round time, because the userspace aggregator was far slower
   there. The direction held in all three runs; the size depends on the machine.
 * **In-kernel aggregation helps: by 2-11% on one runner type, by 37-69% on
-  another, never by multiples of the work it removes.** The XDP
-  program costs 191-316 ns per packet; the userspace aggregator spends
-  2.0-2.3 us of CPU per packet. On veth the XDP work runs on the sending CPU.
+  another, never by multiples of the work it removes.** Like for like, the
+  XDP program body costs 218-275 ns per packet against 540-1,669 ns for the
+  userspace aggregator's algorithm (2.5-6x, generic mode, 8 down to 2
+  workers); neither figure includes receive-path overhead (generic XDP still
+  allocates an skb; the userspace process spends 2.0-2.3 us of CPU per packet
+  including its system calls). On veth the XDP work runs on the sending CPU.
 * **Native XDP on veth is slower than generic** (veth's native path adds a
   ring and NAPI hop); native numbers on veth say nothing about hardware NICs.
 * **Multi-tenancy:** a drop-based per-job quota starves greedy jobs (Jain's

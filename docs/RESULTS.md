@@ -403,6 +403,33 @@ run is also unchanged (median 609 / 542 / 525 ns with v3 against 611 / 533 /
 type and one run; the earlier v2 benchmark shows that absolute numbers vary
 with the runner's CPU, so only the within-run ratio is the claim here.
 
+## Stronger userspace baselines (pre-registered)
+
+**Registered 2026-11-17, before the first run.** The headline compares XDP
+with a userspace aggregator that makes one `recvfrom` and one `sendto` per
+packet. A fairer baseline batches system calls, and the XDP array mode has
+had no userspace twin in the benchmark. This pass asks whether either closes
+the gap; whatever it shows is reported here, and the v2 comparisons above
+stay as they are.
+
+* **Configs:** `useragg` (as before), `useragg-batch` (`agg --batch 64`:
+  `recvmmsg` with `MSG_WAITFORONE`, so it never waits for a batch to fill,
+  then one `sendmmsg` for everything the batch produced), `useragg-array`
+  (`agg --array-slots-log2 16`, the same 65,536-aggregator pool as
+  `xdp-array`), `xdp-generic`, `xdp-array` (best attach mode, as above).
+* **Fixed in advance:** batch size 64 = the workers' window, chosen before
+  any measurement and never tuned; same closed loop, topology, CPU pinning,
+  8 throughput trials of 4,000 rounds and 5 latency trials of 2,000 rounds.
+* **Comparisons** (`baseline_comparisons.csv`, two families, throughput and
+  median round time, each Holm-corrected on its own): `useragg-batch` vs
+  `useragg`; `xdp-generic` vs `useragg-batch`; `useragg-array` vs
+  `useragg`; `xdp-array` vs `useragg-array`.
+* **Reading:** if `xdp-generic` / `useragg-batch` throughput has a 95% CI
+  containing 1, the 2-11% advantage is a system-call artefact and the
+  headline changes to say so.
+
+Results: pending the first `bench.yml` run with this pass.
+
 ## Benchmark-lite: first XDP measurements (open loop, two namespaces, `xdpgeneric`)
 
 **Source:** workflow `bench-lite.yml`, run 43759600920, on PR head `29acb78`

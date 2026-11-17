@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from netsum_stats import (RNG_SEED, bootstrap_ci, holm, median, percentile,  # noqa: E402
                           permutation_test, ratio_of_medians_ci)
 
-CONFIG_ORDER = ["noagg", "useragg", "useragg-v3", "xdp-generic", "xdp-generic-v3", "xdp-native", "xdp-array"]
+CONFIG_ORDER = ["noagg", "useragg", "useragg-v3", "useragg-batch", "useragg-array", "xdp-generic", "xdp-generic-v3",
+                "xdp-native", "xdp-array"]
 
 
 def read(path):
@@ -196,6 +197,40 @@ def main():
             for c in v3comps:
                 w.writerow({k: (f"{v:.6g}" if isinstance(v, float) else v) for k, v in c.items()})
 
+    # ---- stronger userspace baselines (pre-registered, docs/RESULTS.md) ----
+    # Does batching (recvmmsg/sendmmsg, N = 64) or the array pool close the gap?
+    # Each family is Holm-corrected on its own; the v2 comparisons are untouched.
+    bcomps = []
+    pairs = (("useragg-batch", "useragg"), ("xdp-generic", "useragg-batch"),
+             ("useragg-array", "useragg"), ("xdp-array", "useragg-array"))
+    for fam, metric in (("B_throughput", "values_per_s"), ("B_round_p50", "round_p50_us")):
+        for n in sorted({int(k[1]) for k in cells}):
+            for cfg, base in pairs:
+                if fam == "B_throughput":
+                    a = [f(r["values_per_s"]) for r in cells.get((cfg, str(n)), [])]
+                    b = [f(r["values_per_s"]) for r in cells.get((base, str(n)), [])]
+                else:
+                    a = [percentile(sorted(v), 50) for v in samples.get((cfg, str(n)), {}).values()]
+                    b = [percentile(sorted(v), 50) for v in samples.get((base, str(n)), {}).values()]
+                if len(a) < 2 or len(b) < 2:
+                    continue
+                delta, p = permutation_test(a, b, rng)
+                lo, hi = ratio_of_medians_ci(a, b, rng)
+                bcomps.append({"family": fam, "workers": n, "config": cfg, "baseline": base, "metric": metric,
+                               "config_median": median(a), "baseline_median": median(b),
+                               "ratio": median(a) / median(b) if median(b) else None, "ratio_ci_lo": lo,
+                               "ratio_ci_hi": hi, "cliffs_delta": delta, "p": p, "n": f"{len(a)} vs {len(b)}"})
+    for fam in {c["family"] for c in bcomps}:
+        idx = [i for i, c in enumerate(bcomps) if c["family"] == fam]
+        for i, adj in zip(idx, holm([bcomps[i]["p"] for i in idx])):
+            bcomps[i]["p_holm"] = adj
+    if bcomps:
+        with open(os.path.join(out, "baseline_comparisons.csv"), "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(bcomps[0].keys()))
+            w.writeheader()
+            for c in bcomps:
+                w.writerow({k: (f"{v:.6g}" if isinstance(v, float) else v) for k, v in c.items()})
+
     # ---- fairness ----
     fsum = []
     by_policy = defaultdict(lambda: defaultdict(list))
@@ -263,6 +298,14 @@ def main():
                "|---:|---|---|---:|---:|---|---:|---:|---:|---|"]
         for c in v3comps:
             md.append(f"| {c['workers']} | {c['config']} | {c['baseline']} | {fmt(c['config_median'])} | "
+                      f"{fmt(c['baseline_median'])} | {fmt(c['ratio'], 3)} [{fmt(c['ratio_ci_lo'], 3)}, "
+                      f"{fmt(c['ratio_ci_hi'], 3)}] | {c['cliffs_delta']:.3f} | {c['p']:.4f} | {c['p_holm']:.4f} | {c['n']} |")
+    if bcomps:
+        md += ["\n### Stronger userspace baselines (pre-registered): batching (N = 64) and the array pool\n",
+               "| family | workers | config | baseline | config median | baseline median | ratio [95% CI] | Cliff's delta | p | p (Holm) | n |",
+               "|---|---:|---|---|---:|---:|---|---:|---:|---:|---|"]
+        for c in bcomps:
+            md.append(f"| {c['family']} | {c['workers']} | {c['config']} | {c['baseline']} | {fmt(c['config_median'])} | "
                       f"{fmt(c['baseline_median'])} | {fmt(c['ratio'], 3)} [{fmt(c['ratio_ci_lo'], 3)}, "
                       f"{fmt(c['ratio_ci_hi'], 3)}] | {c['cliffs_delta']:.3f} | {c['p']:.4f} | {c['p_holm']:.4f} | {c['n']} |")
     if fsum:

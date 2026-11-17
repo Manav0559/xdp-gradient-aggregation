@@ -28,7 +28,7 @@ permissions:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -58,6 +58,13 @@ jobs:
             TP_TRIALS=8 TP_ROUNDS=4000 LAT_TRIALS=0 FAIR_TRIALS=0 bash scripts/bench_v2.sh
           sudo chown -R "$(id -u):$(id -g)" bench-out
 
+      - name: Run the stronger-baseline benchmark (batched and array-mode userspace aggregator)
+        run: |
+          # Pre-registered in docs/RESULTS.md: --batch 64 (= the window), fixed before any run.
+          sudo -E env "PATH=$PATH" OUT=bench-out/baseline CONFIGS="useragg useragg-batch useragg-array xdp-generic xdp-array" \
+            TP_TRIALS=8 TP_ROUNDS=4000 LAT_TRIALS=5 LAT_ROUNDS=2000 FAIR_TRIALS=0 bash scripts/bench_v2.sh
+          sudo chown -R "$(id -u):$(id -g)" bench-out
+
       - name: Analyse
         if: always()
         run: |
@@ -67,6 +74,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" bench-out || true
           python3 scripts/bench_analyze.py bench-out/v2 bench-out/v2/summary | tee -a "$GITHUB_STEP_SUMMARY"
           if [ -d bench-out/v3 ]; then python3 scripts/bench_analyze.py bench-out/v3 bench-out/v3/summary | tee -a "$GITHUB_STEP_SUMMARY"; fi
+          if [ -d bench-out/baseline ]; then python3 scripts/bench_analyze.py bench-out/baseline bench-out/baseline/summary | tee -a "$GITHUB_STEP_SUMMARY"; fi
 
       - name: Upload results
         if: always()
@@ -80,3 +88,6 @@ jobs:
             bench-out/v3/*.csv
             bench-out/v3/environment.json
             bench-out/v3/summary/
+            bench-out/baseline/*.csv
+            bench-out/baseline/environment.json
+            bench-out/baseline/summary/
