@@ -163,6 +163,19 @@ static void test_add_overflow(void)
     CHECK(o == 1, "2 x 20000.0 overflows Q16.16");
 }
 
+static void test_scaled(void)
+{
+    int sat;
+    CHECK(netsum_to_scaled(1e-6, 40, &sat) == 1099512 && !sat, "1e-6 at e=40");
+    CHECK(netsum_to_scaled(1.0, 31, &sat) == 2147483647 && sat, "1.0 at e=31 saturates");
+    CHECK(netsum_to_scaled(-1.0, 31, &sat) == -2147483647 - 1 && sat, "-1.0 at e=31 saturates");
+    CHECK(netsum_to_scaled(0.75, 0, &sat) == 1 && !sat, "e=0 rounds");
+    CHECK(netsum_from_scaled(1099512, 40) > 0.99999e-6 && netsum_from_scaled(1099512, 40) < 1.00001e-6, "back");
+    CHECK(netsum_pow2(63) == 9223372036854775808.0 && netsum_pow2(-3) == 0.125, "pow2 exact");
+    CHECK(netsum_wire_flags(NETSUM_VERSION_V3, 37, NETSUM_F_ACK) == 0x3942, "v3 flags layout");
+    CHECK(netsum_wire_flags(NETSUM_VERSION_V2, 37, NETSUM_F_ACK) == 0x2002, "v2 ignores e");
+}
+
 static void test_to_fixed(void)
 {
     const double ulp = 1.0 / 65536.0;
@@ -216,8 +229,12 @@ static void test_parse(void)
     CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_REJ_FLAG_COMBO, "ACK|RESEND");
     h->flags = netsum_htons(NETSUM_FLAGS_V2 | 0x0040);
     CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_REJ_RESERVED_FLAGS, "reserved");
-    h->flags = netsum_htons(0x3000);
-    CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_REJ_VERSION, "version 3");
+    h->flags = netsum_htons(0x4000);
+    CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_REJ_VERSION, "version 4");
+    h->flags = netsum_htons(netsum_wire_flags(NETSUM_VERSION_V3, 40, 0));
+    CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_OK && p.frac_bits == 40 && p.has_trailer, "v3 e=40");
+    h->flags = netsum_htons(netsum_wire_flags(NETSUM_VERSION_V3, 63, NETSUM_F_ACK));
+    CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_OK && p.frac_bits == 63, "v3 ACK e=63");
     h->flags = 0;
     CHECK(netsum_parse(buf, buf + 60, &p) == NETSUM_REJ_WORKER_ID, "v1 cannot be aggregate");
     h->worker_id = 0;
@@ -241,6 +258,7 @@ int main(void)
     test_add_overflow();
     test_bitmap();
     test_to_fixed();
+    test_scaled();
     test_parse();
     if (failures) {
         fprintf(stderr, "test_slot_table: %d failure(s)\n", failures);

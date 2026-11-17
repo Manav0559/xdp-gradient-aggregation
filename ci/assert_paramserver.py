@@ -13,7 +13,7 @@ Q16_16_ULP = 1.0 / 65536.0
 
 COMPLETE_RE = re.compile(
     r"\[complete\] job=(\d+) round=(\d+) chunk=(\d+) contributions=(\d+) "
-    r"sum\[0\]=([\-0-9.]+) latency_us=(\d+)"
+    r"sum\[0\]=([-+0-9.eE]+) latency_us=(\d+)"
 )
 
 

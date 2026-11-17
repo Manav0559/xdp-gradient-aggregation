@@ -35,6 +35,8 @@ struct netsum_parsed {
     uint16_t worker_id, num_workers, chunk_len, flags;
     uint8_t version;
     uint8_t kind;          /* enum netsum_kind */
+    uint8_t frac_bits;     /* exponent e: values are round(x * 2^e); 16 for v1/v2 */
+    uint8_t has_trailer;   /* v2 and v3 carry the 32-byte contributor bitmap */
     uint16_t payload_len;  /* bytes after the header: values (+ trailer on v2) */
 };
 
@@ -65,13 +67,20 @@ netsum_parse(const void *data, const void *data_end, struct netsum_parsed *out)
     out->version = (uint8_t)(out->flags >> NETSUM_VERSION_SHIFT);
     out->kind = NETSUM_KIND_RAW;
     out->payload_len = 0;
+    out->frac_bits = NETSUM_Q_FRAC_BITS;
+    out->has_trailer = 0;
 
     uint16_t f = out->flags & NETSUM_F_KNOWN;
-    int v2 = out->version == NETSUM_VERSION_V2;
+    int v3 = out->version == NETSUM_VERSION_V3;
+    int v2 = out->version == NETSUM_VERSION_V2 || v3; /* v3 is v2 plus an exponent */
     if (out->version != 0 && !v2)
         return NETSUM_REJ_VERSION;
-    if ((!v2 && out->flags != 0) || (out->flags & NETSUM_F_RESERVED))
+    if ((out->version == 0 && out->flags != 0) ||
+        (out->version == NETSUM_VERSION_V2 && (out->flags & NETSUM_F_RESERVED)))
         return NETSUM_REJ_RESERVED_FLAGS;
+    if (v3)
+        out->frac_bits = (uint8_t)((out->flags & NETSUM_FRAC_MASK) >> NETSUM_FRAC_SHIFT);
+    out->has_trailer = (uint8_t)v2;
 
     if (out->num_workers == 0 || out->num_workers > NETSUM_MAX_FANIN)
         return NETSUM_REJ_NUM_WORKERS;
@@ -92,7 +101,8 @@ netsum_parse(const void *data, const void *data_end, struct netsum_parsed *out)
             return NETSUM_REJ_FLAG_COMBO;
         out->kind = (f & NETSUM_F_PARTIAL) ? NETSUM_KIND_PARTIAL : NETSUM_KIND_AGGREGATE;
     } else {
-        if (f & (NETSUM_F_PARTIAL | NETSUM_F_OVERFLOW))
+        /* a v3 worker marks OVERFLOW when its own value saturated */
+        if ((f & NETSUM_F_PARTIAL) || ((f & NETSUM_F_OVERFLOW) && !v3))
             return NETSUM_REJ_FLAG_COMBO;
         if (out->worker_id >= out->num_workers)
             return NETSUM_REJ_WORKER_ID;

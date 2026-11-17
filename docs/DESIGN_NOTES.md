@@ -37,19 +37,24 @@ All multi-byte fields are big-endian.
 | 12 | 2 | `worker_id` | `0..num_workers-1` for a raw contribution; `0xFFFF` on packets an aggregator or the PS produces |
 | 14 | 2 | `num_workers` | fan-in of the round (1..256) |
 | 16 | 2 | `chunk_len` | int32 values that follow (1..64; 0 only on REGISTER) |
-| 18 | 2 | `flags` | bits 15-12 version, bits 0-5 `NETSUM_F_*`, bits 6-11 reserved |
-| 20 | 4 x `chunk_len` | values | Q16.16 fixed point |
-| 20 + 4 x `chunk_len` | 32 | contributor bitmap (v2 only) | bit *w* set iff worker *w* is included |
+| 18 | 2 | `flags` | bits 15-12 version, bits 0-5 `NETSUM_F_*`, bits 6-11 reserved on v2, the exponent *e* on v3 |
+| 20 | 4 x `chunk_len` | values | Q16.16 on v1/v2; `round(x * 2^e)` on v3 (§2) |
+| 20 + 4 x `chunk_len` | 32 | contributor bitmap (v2 and v3) | bit *w* set iff worker *w* is included |
 
 Version 0 is the legacy v1 format: `flags == 0` and no bitmap trailer. It is
 still accepted as a raw contribution, so old senders and the current kernel
 path keep working.
 
+Version 3 is v2 plus a per-chunk exponent *e* (0-63) in flags bits 6-11
+(§2). Everything else, including the trailer and every flag, is v2's; the
+code gates the trailer, RESEND and FALLBACK on "has a trailer" (v2 or v3),
+not on version 2. A v2 packet is treated as exponent 16.
+
 | Flag | Bit | Set by | Meaning |
 |---|---|---|---|
 | `RESEND` | 0 | worker | retransmitted contribution (ATP's resend bit) |
 | `ACK` | 1 | PS | result packet; carries the aggregated values |
-| `OVERFLOW` | 2 | aggregator / PS | the accumulation overflowed; values are not trustworthy |
+| `OVERFLOW` | 2 | aggregator / PS; a v3 worker | the accumulation overflowed, or (v3 raw contribution) the worker's own value saturated; values are not trustworthy |
 | `FALLBACK` | 3 | aggregator | raw contribution forwarded un-aggregated (best-effort fallback) |
 | `PARTIAL` | 4 | aggregator | incomplete aggregate flushed on resend or TTL |
 | `REGISTER` | 5 | worker | registration with the PS (job, worker id, fan-in) |
@@ -142,6 +147,56 @@ compiles to a few ALU instructions in BPF. Overflow sets a sticky per-slot
 flag; the round still completes, but it is reported as `[overflow]` (and the
 forwarded aggregate carries `OVERFLOW`) instead of a sum.
 
+**Per-chunk exponent (wire v3).** Q16.16 has a fixed resolution of 2^-16, so
+gradients below about 1e-5 round to zero (`docs/RESULTS.md` §Quantization).
+A v3 packet carries values as `round(x * 2^e)` with the chunk's exponent *e*
+(0-63) in the header; `netsum_to_scaled()` converts (exact powers of two, no
+libm), and the aggregators only add integers, so nothing on the data path
+changes except bookkeeping:
+
+* every slot records the exponent and version of its first contribution;
+  a contribution at another exponent is dropped and counted
+  (`scale_mismatch`), like a fan-in or length disagreement (§3);
+* aggregates, PARTIAL flushes (forward tail and the TTL sweeper), results
+  and ACKs are emitted at the slot's version and exponent, so the sweeper,
+  which has no incoming packet, still produces the right header (a slot a
+  legacy v1 packet opened emits v2, never flags 0);
+* a worker whose own value saturates at *e* sets `OVERFLOW` on its raw
+  contribution instead of sending a clipped value; the slot's sticky flag
+  picks it up, so the result is flagged rather than wrong. (A v2 raw
+  contribution with `OVERFLOW` is still rejected.)
+
+*Agreement without a message.* All workers must use the same *e* for a
+chunk. Every worker receives the identical summed result each round, so the
+next exponent is a function of that result: `examples/train_mlp/scale_rule.py`
+computes, in integers only so that any reimplementation (another language,
+another float library) gives the same answer at a boundary,
+`e' = e + (30 - 4 - bitlen(max |sum|))`, clamped to 0-63: the previous sum
+lands near 2^26, leaving 4 bits (16x) of growth before overflow. An all-zero
+sum raises *e* by 8 (otherwise underflow would be permanent); an `OVERFLOW`
+result lowers it by 8. The rule needs every worker to have round *r-1*'s
+result before it quantizes round *r*, i.e. synchronous rounds; the pipelined
+C worker therefore takes a fixed exponent (`--frac-bits`). The rule is
+offline-checked against an oracle that sees the current step's data
+(`scripts/quant_study.py`, table in `docs/RESULTS.md`).
+
+*Overflow is decided by the workers, and retried in the same step.* With N
+workers each v3 value is bounded by `INT32_MAX / N` (`scale_rule.worker_limit`),
+so no order of adding N values can overflow an int32 accumulator, and the
+aggregators' own overflow check cannot fire on such traffic. A chunk
+overflows exactly when some worker saturates (a sum that grew more than 16x,
+or one worker's value large while the sum is small, +1 and -0.9999); that
+worker marks its contribution `OVERFLOW`, the result comes back flagged, and
+every worker, having computed the same thing, retries the chunk in the same
+step at `e - 8` under the key `chunk_id | attempt << 24`. A fresh key means no
+slot, tombstone, fallback entry or stored result of the failed attempt can
+match the retry; the failed attempt's slots retire by ACK like any other. Up
+to 9 attempts reach exponent 0; overflow there stops the job. Because the
+decision depends only on each worker's own values, the local reference
+(`adapt`) makes exactly the same retries, and the network path must match it
+bit for bit at every attempt. The C worker uses a fixed exponent and does not
+retry.
+
 ## 3. Admission and validation
 
 `protocol/grad_parse.h` is the single definition of a valid packet; agg,
@@ -149,22 +204,24 @@ paramserver, the fuzzer and the XDP program call `netsum_parse()`. Checks run
 in this order and the first failure is the verdict:
 
 1. at least 20 bytes (`REJ_SHORT_HDR`);
-2. version nibble 0 or 2 (`REJ_VERSION`);
-3. v1 has `flags == 0`; v2 has no reserved bit (`REJ_RESERVED_FLAGS`);
+2. version nibble 0, 2 or 3 (`REJ_VERSION`);
+3. v1 has `flags == 0`; v2 has no reserved bit; on v3 bits 6-11 are the exponent (`REJ_RESERVED_FLAGS`);
 4. `1 <= num_workers <= 256` (`REJ_NUM_WORKERS`);
 5. `worker_id 0xFFFF` only on v2 (`REJ_WORKER_ID`);
 6. kind and flag combination: REGISTER alone and from a worker; ACK alone
    and from `0xFFFF`; `0xFFFF` without RESEND/FALLBACK (AGGREGATE, or PARTIAL
-   if flagged); a raw contribution without PARTIAL/OVERFLOW and with
-   `worker_id < num_workers` (`REJ_FLAG_COMBO`, `REJ_WORKER_ID`);
+   if flagged); a raw contribution without PARTIAL, without OVERFLOW unless
+   v3, and with `worker_id < num_workers` (`REJ_FLAG_COMBO`, `REJ_WORKER_ID`);
 7. `chunk_len <= 64` (`REJ_CHUNK_LEN_MAX`) and `> 0` except REGISTER (`REJ_CHUNK_LEN_ZERO`);
-8. the datagram holds `chunk_len` values plus, on v2, the 32-byte bitmap (`REJ_TRUNCATED`).
+8. the datagram holds `chunk_len` values plus, on v2 and v3, the 32-byte bitmap (`REJ_TRUNCATED`).
 
 Stateful rules, identical in agg, paramserver and the kernel:
 
 * **The first accepted contribution fixes the round's fan-in and chunk
   length.** Later contributions that disagree are rejected and counted
   (`num_workers_mismatch`, `chunk_len_mismatch`); the slot is untouched.
+  The same holds for the exponent on v3 (`scale_mismatch`; a v2 packet
+  counts as exponent 16).
 * A worker already in the slot's bitmap is a `duplicate` (`resend_duplicate`
   if RESEND is set).
 * A contribution for a round that already completed is absorbed by the
@@ -219,6 +276,7 @@ Measured with `bpftool prog load` in the XDP load-test workflow (`-mcpu=v3`):
 | v1 (base `f7ea415`) | 6.17 x86_64 | 352 bytes | 110,791 | 38114728912 |
 | v2 before array mode (`96548ae`) | 7.0.0-1017-azure x86_64 | 200 bytes | 158,454 | 43758934811 |
 | v2 with array mode (`38ec27d`) | CI runner x86_64 | 208 bytes | 335,067 | 43784550947 |
+| v3 per-chunk exponent (`8212e91`) | CI runner x86_64 | 224 bytes | 422,645 | 43816639927 |
 
 Adding array mode roughly doubled the instructions the verifier processes:
 the hash-map and array paths reach the shared slot-update code with pointers
@@ -234,6 +292,11 @@ CI run 43784550947, x86_64; the local 7.0.11 aarch64 kernel gives 332,972 /
 | 64 (default) | 335,067 | 5,132 | accepted |
 | 128 | 663,811 | 7,713 | accepted |
 | 256 | > 1,000,000 | - | rejected: verifier complexity limit |
+
+With the v3 exponent check (`8212e91`, run 43816639927): 64 values 422,645
+(sweep 6,748), 128 values 840,360 (sweep 7,799), 256 rejected. The extra
+outcome and the per-slot version/exponent bookkeeping cost about 26% at 64
+values and take 128 to 84% of the 1,000,000 limit.
 
 The default stays 64: 128 fits but leaves little room for future features,
 and larger packets would need `bpf_loop()` or splitting the lane loops into
@@ -570,4 +633,7 @@ aggregation (no ATP rack hierarchy); no ECN/AIMD congestion control; results
 are unicast, not multicast; the userspace aggregator has no array mode; the
 parameter server cannot separate partially overlapping aggregates (it waits
 for the remaining workers' fallbacks instead of subtracting per-worker values);
-Q16.16 loses gradients below ~1e-5 (see `docs/RESULTS.md` §Quantization).
+Q16.16 loses gradients below ~1e-5 (see `docs/RESULTS.md` §Quantization);
+wire v3's per-chunk exponent addresses that for synchronous training (the
+Python client retries an overflowed chunk in the same step, §2; the
+pipelined C worker uses a fixed exponent and does not).

@@ -145,7 +145,7 @@ trial() { # config workers rate trial
         read -r xdp_rx xdp_acc xdp_tx xdp_done xdp_other < <(python3 -c "
 import sys; sys.path.insert(0, 'ci'); import netsum_bpf_json as n
 s = n.stats('$OUT/stats/xdp-$tag.json')
-other = sum(v for k, v in s.items() if k.startswith('rej_') or k in ('duplicate', 'resend_duplicate', 'late_duplicate', 'num_workers_mismatch', 'chunk_len_mismatch', 'pass_control', 'drop_quota', 'drop_map_full', 'drop_job_table_full'))
+other = sum(v for k, v in s.items() if k.startswith('rej_') or k in ('duplicate', 'resend_duplicate', 'late_duplicate', 'num_workers_mismatch', 'chunk_len_mismatch', 'scale_mismatch', 'pass_control', 'drop_quota', 'drop_map_full', 'drop_job_table_full'))
 print(s['rx_total'], s['accepted'], s['tx_aggregate'], s['slot_completed'], other)")
         xdp_down
     fi

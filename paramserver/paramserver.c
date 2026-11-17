@@ -114,7 +114,8 @@ static void send_result(const struct slot *s)
     h->worker_id = htons(NETSUM_WORKER_AGGREGATE);
     h->num_workers = htons(s->fanin);
     h->chunk_len = htons(s->chunk_len);
-    h->flags = htons((uint16_t)(NETSUM_FLAGS_V2 | NETSUM_F_ACK | (s->overflowed ? NETSUM_F_OVERFLOW : 0)));
+    h->flags = htons(netsum_wire_flags(s->version == NETSUM_VERSION_V3 ? NETSUM_VERSION_V3 : NETSUM_VERSION_V2,
+                                       s->frac_bits, (uint16_t)(NETSUM_F_ACK | (s->overflowed ? NETSUM_F_OVERFLOW : 0))));
     for (int i = 0; i < s->chunk_len; i++) {
         uint32_t be = htonl((uint32_t)s->sum[i]);
         memcpy(out + NETSUM_HDR_SIZE + 4 * i, &be, 4);
@@ -143,9 +144,9 @@ static void complete(struct slot *s, int64_t now)
             g.first_complete_us = now;
         g.last_complete_us = now;
         if (!g.quiet)
-            fprintf(stderr, "[complete] job=%u round=%u chunk=%u contributions=%u sum[0]=%.6f latency_us=%lld\n",
+            fprintf(stderr, "[complete] job=%u round=%u chunk=%u contributions=%u sum[0]=%.9g latency_us=%lld\n",
                     s->key.job_id, s->key.round, s->key.chunk_id, s->contributions,
-                    netsum_to_double(s->sum[0]), (long long)(now - s->first_us));
+                    netsum_from_scaled(s->sum[0], s->frac_bits), (long long)(now - s->first_us));
     }
     s->state = SLOT_COMPLETED;
     s->completed_us = now;
@@ -202,6 +203,8 @@ static void handle(const uint8_t *pkt, const struct netsum_parsed *p, int64_t no
         }
         s->fanin = p->num_workers;
         s->chunk_len = p->chunk_len;
+        s->frac_bits = p->frac_bits;
+        s->version = p->version;
         s->first_us = now;
         g.stats[NS_SLOT_CREATED]++;
     }
@@ -218,6 +221,13 @@ static void handle(const uint8_t *pkt, const struct netsum_parsed *p, int64_t no
         if (!g.quiet)
             fprintf(stderr, "[chunk_len mismatch] job=%u round=%u chunk=%u sent chunk_len=%u, slot expects %u -- dropping\n",
                     p->job_id, p->round, p->chunk_id, p->chunk_len, s->chunk_len);
+        return;
+    }
+    if (p->frac_bits != s->frac_bits) {
+        g.stats[NS_SCALE_MISMATCH]++;
+        if (!g.quiet)
+            fprintf(stderr, "[scale mismatch] job=%u round=%u chunk=%u sent e=%u, slot expects %u -- dropping\n",
+                    p->job_id, p->round, p->chunk_id, p->frac_bits, s->frac_bits);
         return;
     }
     if (s->state == SLOT_COMPLETED) {
@@ -264,7 +274,7 @@ static void handle(const uint8_t *pkt, const struct netsum_parsed *p, int64_t no
         s->overflowed = 0;
     }
 
-    if (is_agg && (p->flags & NETSUM_F_OVERFLOW))
+    if (p->flags & NETSUM_F_OVERFLOW) /* overflowed aggregate, or a v3 worker that saturated */
         s->overflowed = 1;
     const uint8_t *v = pkt + NETSUM_HDR_SIZE;
     for (int i = 0; i < p->chunk_len; i++) {

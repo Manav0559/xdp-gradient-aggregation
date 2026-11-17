@@ -29,6 +29,8 @@ struct slot {
     struct slot_key key;
     uint8_t state;
     uint8_t overflowed;
+    uint8_t frac_bits;          /* exponent every contribution must share */
+    uint8_t version;            /* wire version of the first contribution */
     uint16_t fanin;
     uint16_t chunk_len;
     uint16_t contributions;     /* packets merged into this slot */

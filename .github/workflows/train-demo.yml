@@ -42,27 +42,10 @@ jobs:
           set -euo pipefail
           OUT=examples/train_mlp/results/curves.csv
           rm -f "$OUT"
-          CTL="sudo ./bin/netsum-ctl --pin /sys/fs/bpf/netsum_train"
-          PSMAC=$(sudo bash scripts/topo.sh mac ns_ps veth_p1); AGGMAC=$(sudo bash scripts/topo.sh mac "" veth_p0)
-          ps_up() { sudo ip netns exec ns_ps ./bin/paramserver --quiet --ack-to 10.10.2.1:9876 9000 agg > /tmp/ps.log 2>&1 & sleep 0.5; }
-          ps_down() { sudo pkill -f bin/paramserver || true; sleep 0.3; }
-          train() { # label paths to [extra]
-            sudo ip netns exec ns_w python3 examples/train_mlp/train.py --steps 200 --paths "$2" \
-              --to "$3" --ps 10.10.2.2:9000 --label "$1" --job $((RANDOM % 60000 + 1000)) --out "$OUT" | tee "/tmp/train-$1.txt"
-          }
+          . scripts/train_paths.sh
           # local reference curves (no network)
           python3 examples/train_mlp/train.py --steps 200 --paths float,quant --out "$OUT"
-          ps_up; train noagg net 10.10.2.2:9000; ps_down
-          ps_up; sudo ./bin/agg --quiet 9876 10.10.2.2 9000 > /tmp/agg.log 2>&1 & sleep 0.3
-          train useragg net 10.10.1.1:9876; sudo pkill -f bin/agg || true; ps_down
-          $CTL attach --ifname veth_w0 --ifname veth_p0 --mode generic --obj xdp_agg/xdp_agg.o
-          $CTL config --ps-mac "$PSMAC" --ps-ip 10.10.2.2 --ps-port 9000 --agg-mac "$AGGMAC" --agg-ip 10.10.2.1 --egress-ifname veth_p0
-          ps_up; train xdp net 10.10.1.1:9876; ps_down
-          sudo ip netns exec ns_w tc qdisc add dev veth_w1 root netem loss 5%
-          ps_up; train xdp-loss5 net 10.10.1.1:9876; ps_down
-          sudo ip netns exec ns_w tc qdisc del dev veth_w1 root
-          $CTL --json stats | python3 -c "import json,sys; d=json.load(sys.stdin); print({k: v for k, v in d.items() if v})"
-          $CTL detach --ifname veth_w0 --ifname veth_p0 --unpin
+          all_paths ""
           grep -h "steps whose summed gradient" /tmp/train-*.txt
           python3 - "$OUT" <<'PY'
           import csv, sys
@@ -78,9 +61,59 @@ jobs:
           print("PASS: every network path is bit-identical to the local quantized all-reduce; loss decreased")
           PY
 
+      - name: Train with small gradients (x1e-4) at a per-chunk exponent (wire v3)
+        run: |
+          set -euo pipefail
+          OUT=examples/train_mlp/results/curves_scale1e-4.csv
+          rm -f "$OUT"
+          . scripts/train_paths.sh
+          python3 examples/train_mlp/train.py --steps 200 --paths float,quant,adapt --grad-scale 1e-4 --out "$OUT"
+          all_paths -v3 --grad-scale 1e-4 --net-format v3
+          python3 -c "import json; assert json.load(open('/tmp/xdp-stats.json')).get('scale_mismatch') == 0"
+          grep -h "steps whose summed gradient" /tmp/train-*-v3.txt
+          python3 - "$OUT" <<'PY'
+          import csv, sys
+          rows = list(csv.DictReader(open(sys.argv[1])))
+          final = {r["config"]: r for r in rows if r["step"] == "200"}
+          print({k: (v["loss"], v["accuracy"], v["retransmissions"]) for k, v in final.items()})
+          net = [r for r in rows if r["bit_identical_to_quant"] != ""]
+          assert net and all(r["bit_identical_to_quant"] == "1" for r in net), "a network path diverged from the local adaptive sum"
+          for cfg in ("noagg-v3", "useragg-v3", "xdp-v3", "xdp-loss5-v3"):
+              assert final[cfg]["loss"] == final["adapt"]["loss"], (cfg, final[cfg], final["adapt"])
+          assert int(final["xdp-loss5-v3"]["retransmissions"]) > 0, "5% loss but no retransmissions"
+          fl, q, ad = (float(final[k]["accuracy"]) for k in ("float", "quant", "adapt"))
+          assert ad >= fl - 0.01 and q < fl - 0.3, (fl, q, ad)
+          print(f"PASS: gradients x1e-4: float {fl}, Q16.16 {q}, per-chunk exponent {ad}; every v3 network path bit-identical to it")
+          PY
+
+      - name: Retry after OVERFLOW (gradients x1000 at step 50, wire v3)
+        run: |
+          set -euo pipefail
+          OUT=examples/train_mlp/results/curves_spike.csv
+          rm -f "$OUT"
+          . scripts/train_paths.sh
+          SPIKE="--grad-scale 1e-4 --spike-step 50 --spike-factor 1000"
+          python3 examples/train_mlp/train.py --steps 200 --paths float,adapt $SPIKE --out "$OUT" | tee /tmp/train-local-spike.txt
+          all_paths -spike $SPIKE --net-format v3
+          python3 -c "import json; d=json.load(open('/tmp/xdp-stats.json')); assert d.get('scale_mismatch') == 0 and d.get('overflow', 0) >= 3, d"
+          grep -h "chunks retried after OVERFLOW" /tmp/train-*spike.txt
+          for f in /tmp/train-*spike.txt; do grep -q "chunks retried after OVERFLOW: 3" "$f" || { echo "no in-step retry in $f"; exit 1; }; done
+          python3 - "$OUT" <<'PY'
+          import csv, sys
+          rows = list(csv.DictReader(open(sys.argv[1])))
+          final = {r["config"]: r for r in rows if r["step"] == "200"}
+          print({k: (v["loss"], v["accuracy"], v["retransmissions"]) for k, v in final.items()})
+          net = [r for r in rows if r["bit_identical_to_quant"] != ""]
+          assert net and all(r["bit_identical_to_quant"] == "1" for r in net), "a network path diverged from the local adaptive sum"
+          for cfg in ("noagg-spike", "useragg-spike", "xdp-spike", "xdp-loss5-spike"):
+              assert final[cfg]["loss"] == final["adapt"]["loss"], (cfg, final[cfg], final["adapt"])
+          assert float(final["adapt"]["accuracy"]) >= float(final["float"]["accuracy"]) - 0.01
+          print("PASS: every chunk that overflowed at the spike was retried in-step; every path bit-identical to local adapt")
+          PY
+
       - name: Upload curves
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: train-demo-${{ github.run_id }}
-          path: examples/train_mlp/results/curves.csv
+          path: examples/train_mlp/results/curves*.csv

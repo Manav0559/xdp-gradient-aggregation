@@ -561,3 +561,127 @@ checks on deb3d6b: all success (see PR body for run IDs)
 - Linux: `sudo scripts/topo.sh up && make bpf all ctl && sudo ./bin/netsum-ctl attach --ifname veth_w0 --ifname veth_p0 --mode auto && …` (README Quick start)
 - CI: workflows on this PR. Artifacts: `xdp-loadtest-evidence`, `netsum-bench-<id>`, `train-demo-<id>`.
 
+
+## 2026-11-16 11:47 IST — Next step: per-chunk shared exponent (wire v3)
+
+Branch `feature/shared-exponent` from `main` (`795339b`), worktree
+`../netsum-scaled`. Chosen because docs/RESULTS.md names it as the top next
+step: Q16.16 rounds gradients below ~1e-5 to zero.
+
+- Design (docs follow with the code): v3 packets carry e (0-63) in flags bits
+  6-11 and values as round(x * 2^e). Every path sums only equal e, keeps e on
+  what it emits, and propagates a worker's own saturation (OVERFLOW on a raw
+  v3 contribution). Workers agree on e with no extra message: each round's
+  summed result is identical at every worker, and an integer-only rule
+  (examples/train_mlp/scale_rule.py) maps the previous int32 sum and e to the
+  next e: put the previous max near 2^26 (4 bits of headroom), +8 after an
+  all-zero sum, -8 after an overflow. Adaptive mode needs synchronous rounds.
+- Offline check of that exact rule before any protocol code (200 steps of the
+  demo MLP, gradients scaled by s and the learning rate by 1/s, so float
+  training is unchanged): s = 1e-4: Q16.16 underflows 99.9% of values and
+  ends at accuracy 0.4361 / loss 1.090; the lagged rule ends at 0.9889 /
+  0.3560 (float 0.9889 / 0.3551), zero overflowing chunks. s = 1e-5: Q16.16
+  does not train (0.3333); the rule 0.9889 / 0.3567.
+- Plan: (1) format + scale consistency at a fixed e on every path,
+  (2) adaptive client + demo, (3) retry under a distinct key after OVERFLOW.
+  Benchmarks stay on v2 so committed results remain comparable.
+- tests/test_scaled.py: 5 tests, XFAIL(S1) on main for the right reason (v3 is
+  an unknown version today).
+
+Next step: stage 1 in protocol/grad_parse.h, agg, paramserver, xdp_agg (with
+bpf-unit cases), worker --frac-bits.
+
+## 2026-11-16 12:03 IST — Wire v3 implemented (stages 1 and 2)
+
+- `f48b926` v3 on every path (parser, PS, userspace aggregator, XDP state
+  machine, forward tail, sweeper); slot records version and exponent in the
+  former padding; `scale_mismatch` counter; v3 raw OVERFLOW. Version 3 is
+  no longer the unknown-version example (now 4) in the unit test, bpf-unit,
+  `bad_version.bin` and the fuzz reference; corpus regenerated (36 seeds).
+  Mistake: I put the new BPF cases above the `sweep()` they call; CI
+  failed to compile the harness; fixed in `6612ef9`. Also a test of mine
+  captured a loop variable late (all packets from worker 2); fixed before
+  commit.
+- `8212e91` reliable C worker `--frac-bits`. bpf-unit run 43816639927:
+  77 cases pass on both builds. Verifier at 64 values 422,645 insns / stack
+  224 (was 335,067 / 208); 128 values 840,360 (was 663,811); 256 rejected.
+- `ec7eeaf` Python client v3 + train.py `adapt` path, `--net-format v3`,
+  `--grad-scale`. train-demo run 43817130916: at S = 1e-4 every v3 path
+  (noagg, useragg, XDP, XDP + 5% loss with 428 retransmissions) is
+  bit-identical to local adapt (0.356032 / 0.9889); Q16.16 1.090061 /
+  0.4361; float 0.355124 / 0.9889. The v2 step at S = 1 is unchanged.
+- `scripts/quant_study.py` now has the shipping lagged rule next to the
+  oracle (`bench/v2/quant_scaled_training.csv`); it reproduces the earlier
+  scratch simulation digit for digit, so every number quoted in the 11:47
+  entry now has a committed source. Existing quant CSVs byte-identical.
+- Docs: DESIGN_NOTES §1-§3, §6, §16; RESULTS new section; README. Removed
+  the RESULTS parenthetical describing how SwitchML picks its exponent: I
+  could not verify it, so the text now describes only NetSum's own rule.
+
+Next step: commit docs, wait for bench/bench-lite on the PR (they run the
+new program with v2 traffic), then stage 3 (retry under a new key after
+OVERFLOW) only if time allows; otherwise record it as open.
+
+## 2026-11-16 12:18 IST — Regression found in review: v1-opened slots
+
+Review of the branch found that the XDP forward tail emitted at the slot's
+stored version without clamping it, so a slot opened by a legacy v1 packet
+(version 0) and completed or flushed by a v2 packet produced a 0xFFFF
+aggregate with flags 0, which the PS rejects. main hard-coded v2 there; the
+sweeper, agg and PS on this branch already clamped. No case covered mixed
+v1/v2 slots. Red first: `9b4d5e8` added two BPF cases; bpf-unit run
+43819068199 failed them on the kernel (flags 0x0000, 3 failures of 79).
+Fix: clamp in the forward tail as everywhere else. Also reworded the
+exponent-rule remark in DESIGN_NOTES (the rule exists only in Python),
+corrected the quant study's runtime, and stated that the C worker's v3
+mode is not exercised on the kernel.
+
+Next step: CI green on the fix; then stop. Stage 3 (retry after OVERFLOW)
+stays open.
+
+CI on `b35240e`: all eight workflows green; bpf-unit 79 cases, 0 failures;
+verifier at 64 values 425,243 insns (stack 224) with the fix, up from
+422,645 at `8212e91`.
+
+## 2026-11-16 (afternoon; time per commit) — Stage 3: in-step retry after OVERFLOW
+
+On the user's "continue on xdp project".
+
+- Order-independence first: with N workers each v3 value is now bounded by
+  INT32_MAX // N (`scale_rule.worker_limit`), so no order of adding N
+  values overflows an int32 accumulator. Overflow is therefore decided only
+  by each worker's own saturation, which the local `adapt` reference
+  computes identically; without the bound, an aggregator could flag an
+  intermediate overflow whose final sum fits, depending on arrival order.
+- Retry: an overflowed chunk is re-sent in the same step at e - 8 under the
+  key `chunk_id | attempt << 24` (`netsum_client.retry_chunk_id`), so no
+  slot, tombstone or stored result of the failed attempt can match. The
+  client's loop moved into `exchange()` (explicit chunk ids);
+  `allreduce()` is the v2 wrapper over it.
+- `train.py --spike-step K --spike-factor F` forces it. Locally, 200 steps
+  at S = 1e-4 with a x1000 spike at step 50 through agg + PS: 3 chunks
+  retried in both `adapt` and the network path, bit-identical, final
+  0.3560 / 0.989; agg and PS each counted 3 overflows, 0 scale_mismatch.
+  Without a spike the S = 1e-4 local result is unchanged (0.3560 / 0.989,
+  0 retries).
+- Red check: the new test run against the previous commit's train.py fails,
+  but only on the unknown `--spike-step` option, so it is not a meaningful
+  red; the previous code's behaviour is in its source (it raised
+  OverflowError, "retrying under a new key is not implemented").
+- New CI step "Retry after OVERFLOW" in train-demo.yml: noagg, userspace,
+  XDP and XDP + 5% loss with the spike; asserts 3 retried chunks per run,
+  every step bit-identical to local adapt, kernel overflow >= 3.
+
+Next step: push, read the new step's numbers into RESULTS, then stop.
+
+Pushed as `15a9bcd` (the push waited on a permission check that kept
+erroring). CI on it: all eight workflows green. train-demo run 43825247951,
+"Retry after OVERFLOW": every path (noagg, userspace, XDP, XDP + 5% loss
+with 520 retransmissions) retried exactly 3 chunks and ended 0.356033 /
+0.9889, bit-identical to local adapt; kernel overflow 5, scale_mismatch 0.
+The earlier steps in the same run reproduce their committed results
+(v2 0.355125; v3 at S = 1e-4 0.356032). Curves committed as
+`examples/train_mlp/results/curves_spike.csv`.
+
+Remaining open (not started): the C worker has no retry and its v3 mode is
+not exercised on the kernel; benchmarks still send v2; one small model only.

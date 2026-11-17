@@ -9,9 +9,19 @@ summed gradient is applied by every worker: w -= lr * sum / workers.
 Aggregation paths (--paths, comma separated):
   float   sum of float gradients computed locally (the reference curve)
   quant   quantize -> exact int32 sum -> dequantize, computed locally
-  net     the same quantized gradients sent through NetSum (--to / --ps);
-          the summed int32 vector must be bit-identical to `quant` at every
+  adapt   the same with a per-chunk exponent (wire v3): each chunk's
+          exponent follows the previous step's summed int32 values
+          (scale_rule.py), so small gradients keep their precision
+  net     the same quantized gradients sent through NetSum (--to / --ps),
+          as v2 Q16.16 (`quant`) or, with --net-format v3, as `adapt`; the
+          summed int32 vector must be bit-identical to the local sum at every
           step, whatever the path (noagg, userspace or XDP aggregation)
+
+--grad-scale S multiplies every gradient by S and divides the learning rate
+by S, so the float curve is unchanged while the values on the wire shrink.
+--spike-step K --spike-factor F multiplies the gradients sent at step K by F
+and divides the summed result by F (training is unchanged; on the v3 paths
+it forces chunks to overflow, so the in-step retry is exercised).
 
 Writes one CSV row per (step, path): loss, accuracy, max |w - w_float|,
 and for `net` the number of retransmissions so far.
@@ -28,6 +38,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import netsum_client  # noqa: E402
+import scale_rule  # noqa: E402
 
 Q = 1 << 16
 WORKERS = 4
@@ -134,6 +145,57 @@ def parse_hostport(s):
     return host, int(port)
 
 
+def adaptive_step(name, step, grads, e, workers, stats, recompute=False):
+    """One all-reduce at per-chunk exponents `e` (updated in place for the
+    next step). Each worker's values are bounded by INT32_MAX // N, so a
+    chunk overflows only when some worker saturates; it is then retried in
+    this step at e - 8 under a fresh key (scale_rule.py). Local for `adapt`;
+    through NetSum for `net`, where every attempt's result must equal the
+    local one. Returns the dequantized sum, or None if the network differed
+    (the caller then counts it and recomputes locally)."""
+    ch = netsum_client.MAX_CHUNK
+    n = len(grads[0])
+    limit = scale_rule.worker_limit(len(grads))
+    cur = list(e)
+    done = {}
+    pending = list(range(len(e)))
+    for attempt in range(scale_rule.MAX_ATTEMPTS):
+        if not pending:
+            break
+        local, items = {}, []
+        for c in pending:
+            lanes = range(c * ch, min(n, (c + 1) * ch))
+            q, sat = [], []
+            for g in grads:
+                row = [scale_rule.quantize(g[j], cur[c], limit) for j in lanes]
+                q.append([v for v, _ in row])
+                sat.append(any(s for _, s in row))
+            local[c] = ([sum(col) for col in zip(*q)], any(sat))
+            items.append((netsum_client.retry_chunk_id(c, attempt), q, cur[c], sat))
+        if name == "net" and not recompute:
+            res = netsum_client.exchange(workers, step, items)
+            for c in pending:
+                got, over = res[netsum_client.retry_chunk_id(c, attempt)]
+                if over != local[c][1] or (not over and got != local[c][0]):
+                    return None
+        retry = []
+        for c in pending:
+            ints, over = local[c]
+            if not over:
+                done[c] = ints
+            elif cur[c] == scale_rule.E_MIN:
+                raise OverflowError(f"{name}: step {step} chunk {c} overflows even at exponent 0")
+            else:
+                cur[c] = scale_rule.clamp_e(cur[c] - scale_rule.OVERFLOW_STEP)
+                retry.append(c)
+                stats["retried_chunks"] = stats.get("retried_chunks", 0) + 1
+        pending = retry
+    agg = [scale_rule.dequantize(v, cur[j // ch]) for j, v in enumerate(sum((done[c] for c in range(len(e))), []))]
+    for c in range(len(e)):
+        e[c] = scale_rule.next_exponent(done[c], cur[c])
+    return agg
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--steps", type=int, default=200)
@@ -145,6 +207,10 @@ def main():
     ap.add_argument("--label", default="net")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "curves.csv"))
     ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--grad-scale", type=float, default=1.0)
+    ap.add_argument("--net-format", choices=("v2", "v3"), default="v2")
+    ap.add_argument("--spike-step", type=int, default=-1)
+    ap.add_argument("--spike-factor", type=float, default=1.0)
     args = ap.parse_args()
     paths = args.paths.split(",")
     if "net" in paths and not (args.to and args.ps):
@@ -154,6 +220,10 @@ def main():
     shards = [data[i::WORKERS] for i in range(WORKERS)]
     p0 = init_params()
     params = {name: [list(p0) for _ in range(WORKERS)] for name in paths}
+    n_chunks = (len(p0) + netsum_client.MAX_CHUNK - 1) // netsum_client.MAX_CHUNK
+    exps = {name: [scale_rule.Q16] * n_chunks for name in paths}
+    adaptive = {name for name in paths if name == "adapt" or (name == "net" and args.net_format == "v3")}
+    stats = {name: {} for name in paths}
     workers = []
     if "net" in paths:
         workers = [netsum_client.Worker(i, WORKERS, args.job, parse_hostport(args.to), parse_hostport(args.ps))
@@ -183,9 +253,17 @@ def main():
             break
         for name in paths:
             ps = params[name]
-            grads = [gradient(ps[i], shards[i]) for i in range(WORKERS)]
+            spike = args.spike_factor if step == args.spike_step else 1.0
+            grads = [[v * args.grad_scale * spike for v in gradient(ps[i], shards[i])] for i in range(WORKERS)]
             if name == "float":
                 agg = [sum(col) for col in zip(*grads)]
+            elif name in adaptive:
+                before = (list(exps[name]), dict(stats[name]))
+                agg = adaptive_step(name, step, grads, exps[name], workers, stats[name])
+                if agg is None:
+                    mismatched_steps += 1
+                    exps[name][:], stats[name] = before
+                    agg = adaptive_step(name, step, grads, exps[name], None, stats[name], recompute=True)
             else:
                 q = [[quantize(v) for v in g] for g in grads]
                 ints = [sum(col) for col in zip(*q)]
@@ -196,10 +274,11 @@ def main():
                     ints = ints_net
                 agg = [v / Q for v in ints]
             for i in range(WORKERS):
-                ps[i] = [w - args.lr * a / WORKERS for w, a in zip(ps[i], agg)]
-    if "net" in params and "quant" in params:
-        same = params["net"][0] == params["quant"][0]
-        print(f"network-path weights identical to local quantized weights after {args.steps} steps: {same}")
+                ps[i] = [w - (args.lr / args.grad_scale) * (a / spike) / WORKERS for w, a in zip(ps[i], agg)]
+    ref_path = "adapt" if args.net_format == "v3" else "quant"
+    if "net" in params and ref_path in params:
+        same = params["net"][0] == params[ref_path][0]
+        print(f"network-path weights identical to local {ref_path} weights after {args.steps} steps: {same}")
         if not same:
             mismatched_steps += 1
     out.close()
@@ -208,6 +287,8 @@ def main():
     summary = {name: loss_acc(params[name][0], data) for name in paths}
     print(f"{args.steps} steps in {time.time() - t0:.1f} s; final (loss, accuracy): "
           + ", ".join(f"{(args.label if n == 'net' else n)}={v[0]:.4f}/{v[1]:.3f}" for n, v in summary.items()))
+    for name in sorted(adaptive):
+        print(f"{args.label if name == 'net' else name}: chunks retried after OVERFLOW: {stats[name].get('retried_chunks', 0)}")
     if workers:
         print(f"network path: {sum(w.resent for w in workers)} retransmissions; "
               f"steps whose summed gradient differed from the local quantized sum: {mismatched_steps}")
