@@ -313,10 +313,10 @@ jobs:
           source ci/lib.sh
           stats_to /tmp/s-before.json
           in_ns1 tc qdisc add dev veth1 root netem loss 20%
-          for w in 0 1 2; do reliable_bg 990 "$w" 3 8 256 --rto-ms 50 --window 16 --fixed 3e-6 --frac-bits 40; done
+          for w in 0 1 2; do reliable_bg 996 "$w" 3 8 256 --rto-ms 50 --window 16 --fixed 3e-6 --frac-bits 40; done
           wait
           in_ns1 tc qdisc del dev veth1 root
-          check_reliable 990 3 32
+          check_reliable 996 3 32
           stats_to /tmp/s-after.json
           python3 - <<'PY'
           import json
@@ -331,14 +331,14 @@ jobs:
           set -euo pipefail
           source ci/lib.sh
           stats_to /tmp/s2-before.json
-          for w in 0 1 2; do reliable_bg 991 "$w" 3 4 256 --rto-ms 50 --window 16 --fixed 1.0 --frac-bits 31; done
+          for w in 0 1 2; do reliable_bg 997 "$w" 3 4 256 --rto-ms 50 --window 16 --fixed 1.0 --frac-bits 31; done
           wait
-          check_reliable 991 3 16
+          check_reliable 997 3 16
           stats_to /tmp/s2-after.json
           python3 - <<'PY'
           import json
           for w in range(3):
-              r = json.loads(open(f"/tmp/rw-991-{w}.json").read().strip().splitlines()[-1])
+              r = json.loads(open(f"/tmp/rw-997-{w}.json").read().strip().splitlines()[-1])
               assert r["retried_chunks"] == 16 and r["overflow_results"] == 16, r
           b, a = json.load(open("/tmp/s2-before.json")), json.load(open("/tmp/s2-after.json"))
           d = {k: a.get(k, 0) - b.get(k, 0) for k in a if isinstance(a[k], int)}
