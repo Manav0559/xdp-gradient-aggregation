@@ -385,7 +385,13 @@ slot idle past the TTL is flushed to the PS as a PARTIAL and becomes FLUSHED;
 an expired COMPLETED or FLUSHED slot is retired. Retiring on ACK means a
 plain duplicate arriving after the ACK opens a fresh slot, which the sweeper
 reclaims; ATP's switch behaves the same way (it frees aggregators on the
-parameter packet and reclaims stale ones by timestamp).
+parameter packet and reclaims stale ones by timestamp). The same holds for a
+lone RESEND after a lost result: it re-opens the key with one contributor,
+and if that worker then receives the result anyway (the PS re-sends it to
+every registered worker when another worker recovers), no second RESEND
+arrives to flush it, so only the sweeper reclaims the slot. Kernel
+deployments therefore need the sweeper running for slot hygiene, not only
+for crashed workers (Scenarios R and R2 assert this).
 
 ## 9. Reliability
 
