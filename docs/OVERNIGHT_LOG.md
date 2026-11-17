@@ -772,11 +772,17 @@ Branch `feature/finish-open-items` from main (`92ddd73`). On the owner's
   `set -euo pipefail`. Checked: the committed v2 (117/117) and v3 data exit
   0 with byte-identical output to the old analyzer; one corrupted row exits 1.
 - **Lost results on the kernel path.** Scenario R (hash mode, job 998) and
-  R2 (array mode, job 999): reliable workers discard every 4th result they
-  receive, so only results are lost; every result must still be exact, each
+  R2 (array mode, job 999): reliable workers discard results they receive
+  (worker 0 every 3rd, worker 1 every 5th, worker 2 none), so only results
+  are lost, mostly one worker at a time; every result must still be exact, each
   key complete exactly once at the PS, the recovery must pass through the XDP
   program (`tx_result_resend` or `slot_flushed_partial`), and no slot may be
-  left ACCUMULATING.
+  left ACCUMULATING. The first CI run used every 4th result on every
+  worker and failed my assertion, not the protocol: workers see results in
+  the same order, so all three lost the same 10 results, re-sent together,
+  and XDP re-aggregated each key in full (42 completions for 32 keys) with
+  every result exact. That never exercised a lone RESEND, hence the uneven
+  drop rates.
 - **Docs.** README: wire v2 -> v2 and v3, 79 BPF unit cases (was "69"), 24
   kernel scenarios (was "20"), userspace array mode, overflow handling moved
   from "not reproduced" to "adapted" (v3 retries in the same step).
