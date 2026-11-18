@@ -1,7 +1,7 @@
 # NetSum: in-network gradient aggregation on commodity Linux with XDP/eBPF
 
 [![CI](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/ci.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/ci.yml)
-[![XDP real-kernel load test](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/xdp-loadtest.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/xdp-loadtest.yml)
+[![XDP real-kernel load  test](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/xdp-loadtest.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/xdp-loadtest.yml)
 [![BPF unit tests](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/bpf-unit.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/bpf-unit.yml)
 [![Fuzz](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/fuzz.yml/badge.svg)](https://github.com/Manav0559/xdp-gradient-aggregation/actions/workflows/fuzz.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
